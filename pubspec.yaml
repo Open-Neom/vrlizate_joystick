@@ -1,0 +1,36 @@
+name: vrlizate_joystick
+description: Modular dual-analog joystick, 3D VR smartphone controller, and low-latency WebSocket service for Flutter & VRlizate.
+version: 0.1.0
+homepage: https://github.com/Open-Neom/vrlizate_joystick
+repository: https://github.com/Open-Neom/vrlizate_joystick
+issue_tracker: https://github.com/Open-Neom/vrlizate_joystick/issues
+topics:
+  - vr
+  - virtual-reality
+  - joystick
+  - gamepad
+  - controller
+
+environment:
+  sdk: ^3.10.0
+  flutter: ">=3.44.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  vrlizate: ^1.11.0
+  vector_math: ^2.1.4
+  sensors_plus: ^7.0.0
+  shared_preferences: ^2.5.5
+  qr_flutter: ^4.1.0
+
+dependency_overrides:
+  vrlizate:
+    path: ../vrlizate
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
