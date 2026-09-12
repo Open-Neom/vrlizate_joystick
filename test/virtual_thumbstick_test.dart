@@ -82,4 +82,37 @@ void main() {
     expect(lastX, 0.0);
     expect(lastY, 0.0);
   });
+
+  testWidgets('VirtualThumbstick works with hapticsEnabled set to false', (
+    tester,
+  ) async {
+    double lastX = 0.0;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: VirtualThumbstick(
+              size: 150,
+              hapticsEnabled: false,
+              onChanged: (x, y) {
+                lastX = x;
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final center = tester.getCenter(find.byType(VirtualThumbstick));
+    final gesture = await tester.startGesture(center);
+    // Drag beyond boundary
+    await gesture.moveBy(const Offset(100, 0));
+    await tester.pump();
+
+    expect(lastX, 1.0);
+    await gesture.up();
+    await tester.pumpAndSettle();
+    expect(lastX, 0.0);
+  });
 }

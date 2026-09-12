@@ -30,12 +30,16 @@ class VirtualThumbstick extends StatefulWidget {
   /// Optional accent color for borders and highlights (defaults to neon cyan).
   final Color accentColor;
 
+  /// Whether tactile haptic feedback / vibration is enabled for touch, boundary, and release.
+  final bool hapticsEnabled;
+
   const VirtualThumbstick({
     super.key,
     this.size = 150.0,
     this.knobRadius = 28.0,
     this.deadzone = 0.08,
     this.accentColor = const Color(0xFF00E5FF),
+    this.hapticsEnabled = true,
     required this.onChanged,
     this.onRelease,
   });
@@ -48,6 +52,7 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
     with SingleTickerProviderStateMixin {
   Offset _dragOffset = Offset.zero;
   bool _isDragging = false;
+  bool _hasHitBoundary = false;
 
   late AnimationController _recenterController;
   late Animation<Offset> _recenterAnimation;
@@ -76,8 +81,11 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
   void _onPanStart(DragStartDetails details) {
     _recenterController.stop();
     _isDragging = true;
+    _hasHitBoundary = false;
     _updateOffset(details.localPosition);
-    HapticFeedback.selectionClick();
+    if (widget.hapticsEnabled) {
+      HapticFeedback.selectionClick();
+    }
   }
 
   void _onPanUpdate(DragUpdateDetails details) {
@@ -100,8 +108,18 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
     Offset clampedOffset;
     if (dist <= _maxRadius) {
       clampedOffset = delta;
+      // Reset boundary tripwire when user moves back towards the center
+      if (dist < _maxRadius * 0.85) {
+        _hasHitBoundary = false;
+      }
     } else {
       clampedOffset = (delta / dist) * _maxRadius;
+      if (!_hasHitBoundary) {
+        _hasHitBoundary = true;
+        if (widget.hapticsEnabled) {
+          HapticFeedback.lightImpact();
+        }
+      }
     }
 
     setState(() {
@@ -123,6 +141,7 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
 
   void _releaseStick() {
     _isDragging = false;
+    _hasHitBoundary = false;
     _recenterAnimation = Tween<Offset>(
       begin: _dragOffset,
       end: Offset.zero,
@@ -134,7 +153,9 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
 
     widget.onChanged(0.0, 0.0);
     widget.onRelease?.call();
-    HapticFeedback.lightImpact();
+    if (widget.hapticsEnabled) {
+      HapticFeedback.lightImpact();
+    }
   }
 
   @override

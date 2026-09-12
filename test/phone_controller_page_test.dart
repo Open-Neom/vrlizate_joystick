@@ -170,6 +170,11 @@ void main() {
     expect(find.text('JOYSTICK DUAL'), findsOneWidget);
     expect(find.text('PUNTERO LÁSER'), findsOneWidget);
     expect(find.text('Recentrar con sacudida del celular'), findsOneWidget);
+    expect(find.text('Vibración háptica del mando'), findsOneWidget);
+
+    // Toggle vibration switch off and on
+    await tester.tap(find.text('Vibración háptica del mando'));
+    await tester.pumpAndSettle();
 
     // Close settings modal
     await tester.tap(find.byIcon(Icons.close_rounded));

@@ -86,6 +86,30 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   double _laserPitch = 0.0;
   bool _recenterTriggered = false;
 
+  // Haptic feedback / vibration state
+  bool _hapticsEnabled = true;
+
+  void _hapticClick() {
+    if (_hapticsEnabled) HapticFeedback.selectionClick();
+  }
+
+  void _hapticLight() {
+    if (_hapticsEnabled) HapticFeedback.lightImpact();
+  }
+
+  void _hapticMedium() {
+    if (_hapticsEnabled) HapticFeedback.mediumImpact();
+  }
+
+  void _hapticDoublePulse() {
+    if (_hapticsEnabled) {
+      HapticFeedback.heavyImpact();
+      Future.delayed(const Duration(milliseconds: 140), () {
+        HapticFeedback.heavyImpact();
+      });
+    }
+  }
+
   // Shake detection state
   bool _shakeToRecenterEnabled = true;
   StreamSubscription<AccelerometerEvent>? _accelSub;
@@ -110,6 +134,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     WidgetsBinding.instance.addObserver(this);
     _activeMode = widget.initialMode;
     _targetPort = widget.targetPort;
+    _loadSavedHaptics();
     if (widget.targetHost != null && widget.targetHost!.isNotEmpty) {
       _ipController.text = widget.targetHost!;
     } else {
@@ -160,13 +185,30 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   void _onShakeDetected() {
-    HapticFeedback.heavyImpact();
+    _hapticDoublePulse();
     _recenterController();
     if (mounted) {
       setState(() {
         _status = '¡Sacudida detectada! Ejes recentrados al frente';
       });
     }
+  }
+
+  Future<void> _loadSavedHaptics() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final savedHaptics = prefs.getBool('vrlizate_haptics_enabled');
+      if (mounted && savedHaptics != null) {
+        setState(() => _hapticsEnabled = savedHaptics);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _persistHaptics(bool enabled) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('vrlizate_haptics_enabled', enabled);
+    } catch (_) {}
   }
 
   Future<void> _loadSavedIp() async {
@@ -349,7 +391,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             : '⚡ CONECTADO AL VISOR';
       });
       unawaited(_rememberHost(target.host));
-      HapticFeedback.heavyImpact();
+      _hapticDoublePulse();
       socket.listen(
         (data) {},
         onDone: () => _onDisconnected(socket),
@@ -529,7 +571,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _lastGyroTime = null;
       _recenterTriggered = true;
     });
-    HapticFeedback.mediumImpact();
+    _hapticMedium();
     _sendState(force: true);
     _recenterResetTimer?.cancel();
     _recenterResetTimer = Timer(const Duration(milliseconds: 150), () {
@@ -646,7 +688,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                               onTap: () {
                                 setState(() => _activeMode = RemoteControllerMode.joystick);
                                 setModalState(() {});
-                                HapticFeedback.selectionClick();
+                                _hapticClick();
                                 _sendState();
                               },
                             ),
@@ -661,7 +703,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                               onTap: () {
                                 setState(() => _activeMode = RemoteControllerMode.laser);
                                 setModalState(() {});
-                                HapticFeedback.selectionClick();
+                                _hapticClick();
                                 _sendState();
                               },
                             ),
@@ -769,6 +811,28 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                         onChanged: (val) {
                           setState(() => _shakeToRecenterEnabled = val);
                           setModalState(() {});
+                        },
+                      ),
+                      const SizedBox(height: 4),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        value: _hapticsEnabled,
+                        activeThumbColor: const Color(0xFF00E5FF),
+                        title: const Text(
+                          'Vibración háptica del mando',
+                          style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+                        ),
+                        subtitle: const Text(
+                          'Respuesta táctil al pulsar botones, límites del joystick, sacudir o recentrar.',
+                          style: TextStyle(color: Colors.white60, fontSize: 10),
+                        ),
+                        onChanged: (val) {
+                          setState(() => _hapticsEnabled = val);
+                          setModalState(() {});
+                          _persistHaptics(val);
+                          if (val) {
+                            _hapticLight();
+                          }
                         },
                       ),
                       const SizedBox(height: 6),
@@ -1156,6 +1220,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                             size: stickSize,
                             knobRadius: 18.0,
                             accentColor: const Color(0xFF00E5FF),
+                            hapticsEnabled: _hapticsEnabled,
                             onChanged: (x, y) {
                               _stickX = x;
                               _stickY = y;
@@ -1239,6 +1304,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                             size: stickSize,
                             knobRadius: 18.0,
                             accentColor: const Color(0xFFFF9100),
+                            hapticsEnabled: _hapticsEnabled,
                             onChanged: (x, y) {
                               _lookX = x;
                               _lookY = y;
@@ -1338,6 +1404,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                             size: stickSize,
                             knobRadius: 18.0,
                             accentColor: const Color(0xFF10B981),
+                            hapticsEnabled: _hapticsEnabled,
                             onChanged: (x, y) {
                               _laserStickX = x;
                               _laserStickY = y;
@@ -1387,11 +1454,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     return GestureDetector(
       onTapDown: (_) {
         onDown();
-        HapticFeedback.mediumImpact();
+        _hapticMedium();
         _sendState();
       },
       onTapUp: (_) {
         onUp();
+        _hapticLight();
         _sendState();
       },
       onTapCancel: () {
@@ -1571,12 +1639,15 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   Widget _buildTelemetryBar() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-      decoration: BoxDecoration(
-        color: const Color(0xFF101528),
-        borderRadius: BorderRadius.circular(8),
-      ),
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onDoubleTap: _recenterController,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: const Color(0xFF101528),
+          borderRadius: BorderRadius.circular(8),
+        ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
@@ -1625,6 +1696,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           ),
         ],
       ),
+    ),
     );
   }
 }
