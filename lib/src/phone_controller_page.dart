@@ -925,20 +925,25 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         backgroundColor: const Color(0xFF101528),
         toolbarHeight: 40,
         titleSpacing: 10,
-        title: const Row(
-          children: [
-            Icon(Icons.sports_esports_rounded, color: Color(0xFF00E5FF), size: 18),
-            SizedBox(width: 8),
-            Text(
-              'MANDO 3DoF VRLIZATE',
-              style: TextStyle(
-                color: Color(0xFF00E5FF),
-                fontSize: 13,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 1.0,
+        title: const FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: Alignment.centerLeft,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.sports_esports_rounded, color: Color(0xFF00E5FF), size: 18),
+              SizedBox(width: 8),
+              Text(
+                'MANDO 3DoF VRLIZATE',
+                style: TextStyle(
+                  color: Color(0xFF00E5FF),
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.0,
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
         actions: [
           _buildConnectionPill(),
