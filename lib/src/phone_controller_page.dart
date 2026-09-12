@@ -123,7 +123,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   bool _actionActive = false;
   bool _btnAActive = false;
   bool _btnBActive = false;
+  bool _btnXActive = false;
+  bool _btnYActive = false;
+  bool _btnLActive = false;
+  bool _btnRActive = false;
   bool _btnGripActive = false;
+  Timer? _gripHoldTimer;
 
   // Gyroscope 3DoF state
   vm.Quaternion _orientation = vm.Quaternion.identity();
@@ -511,7 +516,13 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _actionActive = false;
     _btnAActive = false;
     _btnBActive = false;
+    _btnXActive = false;
+    _btnYActive = false;
+    _btnLActive = false;
+    _btnRActive = false;
     _btnGripActive = false;
+    _gripHoldTimer?.cancel();
+    _gripHoldTimer = null;
     _angularVelocity.setZero();
     _lastGyroTime = null;
     if (send) _sendState(force: true);
@@ -563,10 +574,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         'aimY': _laserStickY,
         'recenter': _recenterTriggered,
         'rangeMeters': 0.55,
-        'trigger': _triggerActive,
-        'action': _actionActive,
+        'trigger': _triggerActive || _btnLActive || _btnRActive,
+        'action': _actionActive || _btnBActive,
         'btnA': _btnAActive,
         'btnB': _btnBActive,
+        'btnX': _btnXActive,
+        'btnY': _btnYActive,
+        'btnL': _btnLActive,
+        'btnR': _btnRActive,
         'btnGrip': _btnGripActive,
         'mode': _activeMode == RemoteControllerMode.laser ? 'laser' : 'joystick',
       });
@@ -600,8 +615,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         setState(() {
           _recenterTriggered = false;
         });
-      } else {
-        _recenterTriggered = false;
+        _sendState();
       }
     });
   }
@@ -617,6 +631,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _accelSub?.cancel();
     _streamTimer?.cancel();
     _recenterResetTimer?.cancel();
+    _gripHoldTimer?.cancel();
     final socket = _socket;
     _socket = null;
     if (socket != null) {
@@ -1182,14 +1197,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     return LayoutBuilder(
       builder: (context, constraints) {
         final double stickSize =
-            (constraints.maxHeight * 0.48).clamp(95.0, 118.0);
+            (constraints.maxHeight * 0.35).clamp(88.0, 108.0);
         final double btnHeight =
-            (constraints.maxHeight * 0.25).clamp(48.0, 56.0);
+            (constraints.maxHeight * 0.18).clamp(44.0, 52.0);
 
         return Row(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // ── 1. Columna Izquierda: Botones Superiores (RT & Grip) + Joystick Navegación 3D ──
+            // ── 1. Columna Izquierda: L (Arriba) + Y (Sobre Stick) + Stick Locomoción + X (Bajo Stick) ──
             Expanded(
               flex: 5,
               child: Container(
@@ -1204,59 +1219,56 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    // Top Buttons: RT Gatillo & Grip (Grandes)
-                    SizedBox(
-                      height: btnHeight,
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: _buildButton(
-                              title: 'RT · GATILLO',
-                              subtitle: 'Clic / Disparo',
-                              icon: Icons.touch_app_rounded,
-                              isActive: _triggerActive,
-                              colors: const [
-                                Color(0xFF00E5FF),
-                                Color(0xFF7C4DFF),
-                              ],
-                              onDown: () =>
-                                  setState(() => _triggerActive = true),
-                              onUp: () =>
-                                  setState(() => _triggerActive = false),
-                            ),
-                          ),
-                          const SizedBox(width: 5),
-                          Expanded(
-                            child: _buildButton(
-                              title: 'GRIP',
-                              subtitle: 'Agarre',
-                              icon: Icons.pan_tool_alt_rounded,
-                              isActive: _btnGripActive,
-                              colors: const [
-                                Color(0xFF334155),
-                                Color(0xFF1E293B),
-                              ],
-                              textColor: const Color(0xFF00E5FF),
-                              onDown: () =>
-                                  setState(() => _btnGripActive = true),
-                              onUp: () =>
-                                  setState(() => _btnGripActive = false),
-                            ),
-                          ),
-                        ],
+                    // Botón Superior: L (Gatillo Izquierdo)
+                    Expanded(
+                      flex: 2,
+                      child: _buildButton(
+                        title: 'L',
+                        subtitle: 'Gatillo Izquierdo',
+                        icon: Icons.touch_app_rounded,
+                        isActive: _btnLActive,
+                        colors: const [Color(0xFF00E5FF), Color(0xFF7C4DFF)],
+                        onDown: () => setState(() {
+                          _btnLActive = true;
+                          _triggerActive = true;
+                        }),
+                        onUp: () => setState(() {
+                          _btnLActive = false;
+                          _triggerActive = _btnRActive;
+                        }),
                       ),
                     ),
+                    const SizedBox(height: 4),
 
-                    const Spacer(),
+                    // Botón Superior al Stick: Y
+                    Expanded(
+                      flex: 2,
+                      child: _buildButton(
+                        title: 'Y',
+                        subtitle: 'Secundario',
+                        icon: Icons.change_circle_outlined,
+                        isActive: _btnYActive,
+                        borderRadius: const BorderRadius.only(
+                          topLeft: Radius.circular(14),
+                          topRight: Radius.circular(14),
+                          bottomLeft: Radius.circular(26),
+                          bottomRight: Radius.circular(26),
+                        ),
+                        colors: const [Color(0xFF6366F1), Color(0xFF3B82F6)],
+                        onDown: () => setState(() => _btnYActive = true),
+                        onUp: () => setState(() => _btnYActive = false),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
 
-                    // Center: Navigation Thumbstick (Walk/Strafe 3D)
+                    // Centro: Thumbstick Navegación 3D
                     Center(
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           VirtualThumbstick(
                             size: stickSize,
-                            knobRadius: 18.0,
+                            knobRadius: 16.0,
                             accentColor: const Color(0xFF00E5FF),
                             hapticsEnabled: _hapticsEnabled,
                             onChanged: (x, y) {
@@ -1275,16 +1287,35 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                             'NAVEGACIÓN 3D (DESPLAZAMIENTO)',
                             style: TextStyle(
                               color: Color(0xFF00E5FF),
-                              fontSize: 8.5,
+                              fontSize: 8.0,
                               fontWeight: FontWeight.bold,
-                              letterSpacing: 0.6,
+                              letterSpacing: 0.5,
                             ),
                           ),
                         ],
                       ),
                     ),
+                    const SizedBox(height: 4),
 
-                    const Spacer(),
+                    // Botón Inferior al Stick: X
+                    Expanded(
+                      flex: 2,
+                      child: _buildButton(
+                        title: 'X',
+                        subtitle: 'Principal',
+                        icon: Icons.radio_button_checked_rounded,
+                        isActive: _btnXActive,
+                        borderRadius: const BorderRadius.only(
+                          bottomLeft: Radius.circular(14),
+                          bottomRight: Radius.circular(14),
+                          topLeft: Radius.circular(26),
+                          topRight: Radius.circular(26),
+                        ),
+                        colors: const [Color(0xFF0EA5E9), Color(0xFF06B6D4)],
+                        onDown: () => setState(() => _btnXActive = true),
+                        onUp: () => setState(() => _btnXActive = false),
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -1300,7 +1331,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               ),
             ),
 
-            // ── 2. Columna Central: Botón Superior (Recentrar) + Espacio Slide Láser 180° ──
+            // ── 2. Columna Central: Botón Superior (Recentrar) + Espacio Slide Láser 180° + onHold Grip ──
             Expanded(
               flex: 5,
               child: Container(
@@ -1309,13 +1340,15 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   color: const Color(0xFF101528).withValues(alpha: 0.7),
                   borderRadius: BorderRadius.circular(14),
                   border: Border.all(
-                    color: const Color(0xFF10B981).withValues(alpha: 0.3),
+                    color: _btnGripActive
+                        ? const Color(0xFFFF9100).withValues(alpha: 0.6)
+                        : const Color(0xFF10B981).withValues(alpha: 0.3),
                   ),
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    // Top Button: Recentrar Vista (Grande)
+                    // Top Button: Recentrar Vista
                     SizedBox(
                       height: btnHeight,
                       child: _buildButton(
@@ -1331,17 +1364,21 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
                     const SizedBox(height: 4),
 
-                    // Center: Laser Slide Space (Slide táctil libre, 180° frontal estricto)
+                    // Center: Laser Slide Space (Slide táctil libre, 180° frontal estricto + onHold Grip)
                     Expanded(
                       child: _buildLaserSlidePad(),
                     ),
 
                     const SizedBox(height: 2),
-                    const Center(
+                    Center(
                       child: Text(
-                        'PUNTERO LÁSER (SLIDE 180°)',
+                        _btnGripActive
+                            ? '✊ GRIP (AGARRE) ACTIVO'
+                            : 'PUNTERO LÁSER (SLIDE 180° · HOLD GRIP)',
                         style: TextStyle(
-                          color: Color(0xFF10B981),
+                          color: _btnGripActive
+                              ? const Color(0xFFFF9100)
+                              : const Color(0xFF10B981),
                           fontSize: 8.5,
                           fontWeight: FontWeight.bold,
                           letterSpacing: 0.6,
@@ -1363,7 +1400,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               ),
             ),
 
-            // ── 3. Columna Derecha: Botones Superiores (A & B) + Joystick Vista y Giro 360°/180° ──
+            // ── 3. Columna Derecha: R (Arriba) + B (Sobre Stick) + Stick Giro/Vista + A (Bajo Stick) ──
             Expanded(
               flex: 5,
               child: Container(
@@ -1378,54 +1415,56 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    // Top 2 Buttons: A & B (Grandes)
-                    SizedBox(
-                      height: btnHeight,
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: _buildButton(
-                              title: 'A',
-                              subtitle: 'Seleccionar',
-                              icon: Icons.check_circle_outline_rounded,
-                              isActive: _btnAActive,
-                              colors: const [
-                                Color(0xFF10B981),
-                                Color(0xFF00E5FF),
-                              ],
-                              onDown: () => setState(() => _btnAActive = true),
-                              onUp: () => setState(() => _btnAActive = false),
-                            ),
-                          ),
-                          const SizedBox(width: 5),
-                          Expanded(
-                            child: _buildButton(
-                              title: 'B',
-                              subtitle: 'Atrás / Home',
-                              icon: Icons.navigation_rounded,
-                              isActive: _btnBActive,
-                              colors: const [
-                                Color(0xFFFF007F),
-                                Color(0xFFFF9100),
-                              ],
-                              onDown: () => setState(() => _btnBActive = true),
-                              onUp: () => setState(() => _btnBActive = false),
-                            ),
-                          ),
-                        ],
+                    // Botón Superior: R (Gatillo Derecho)
+                    Expanded(
+                      flex: 2,
+                      child: _buildButton(
+                        title: 'R',
+                        subtitle: 'Gatillo Derecho',
+                        icon: Icons.touch_app_rounded,
+                        isActive: _btnRActive,
+                        colors: const [Color(0xFFFF9100), Color(0xFFFF007F)],
+                        onDown: () => setState(() {
+                          _btnRActive = true;
+                          _triggerActive = true;
+                        }),
+                        onUp: () => setState(() {
+                          _btnRActive = false;
+                          _triggerActive = _btnLActive;
+                        }),
                       ),
                     ),
+                    const SizedBox(height: 4),
 
-                    const Spacer(),
+                    // Botón Superior al Stick: B
+                    Expanded(
+                      flex: 2,
+                      child: _buildButton(
+                        title: 'B',
+                        subtitle: 'Atrás / Home',
+                        icon: Icons.navigation_rounded,
+                        isActive: _btnBActive,
+                        borderRadius: const BorderRadius.only(
+                          topLeft: Radius.circular(14),
+                          topRight: Radius.circular(14),
+                          bottomLeft: Radius.circular(26),
+                          bottomRight: Radius.circular(26),
+                        ),
+                        colors: const [Color(0xFFFF007F), Color(0xFFFF5252)],
+                        onDown: () => setState(() => _btnBActive = true),
+                        onUp: () => setState(() => _btnBActive = false),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
 
-                    // Center: Look/Turn Thumbstick (360° Horizontal & 180° Vertical)
+                    // Centro: Thumbstick de Vista y Giro 360°/180°
                     Center(
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           VirtualThumbstick(
                             size: stickSize,
-                            knobRadius: 18.0,
+                            knobRadius: 16.0,
                             accentColor: const Color(0xFFFF9100),
                             hapticsEnabled: _hapticsEnabled,
                             onChanged: (x, y) {
@@ -1444,16 +1483,35 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                             'VISTA & GIRO (360° HORIZ / 180° VERT)',
                             style: TextStyle(
                               color: Color(0xFFFF9100),
-                              fontSize: 8.5,
+                              fontSize: 8.0,
                               fontWeight: FontWeight.bold,
-                              letterSpacing: 0.6,
+                              letterSpacing: 0.5,
                             ),
                           ),
                         ],
                       ),
                     ),
+                    const SizedBox(height: 4),
 
-                    const Spacer(),
+                    // Botón Inferior al Stick: A
+                    Expanded(
+                      flex: 2,
+                      child: _buildButton(
+                        title: 'A',
+                        subtitle: 'Seleccionar',
+                        icon: Icons.check_circle_outline_rounded,
+                        isActive: _btnAActive,
+                        borderRadius: const BorderRadius.only(
+                          bottomLeft: Radius.circular(14),
+                          bottomRight: Radius.circular(14),
+                          topLeft: Radius.circular(26),
+                          topRight: Radius.circular(26),
+                        ),
+                        colors: const [Color(0xFF10B981), Color(0xFF00E5FF)],
+                        onDown: () => setState(() => _btnAActive = true),
+                        onUp: () => setState(() => _btnAActive = false),
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -1480,28 +1538,57 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           _updateLaserSlide(nx, ny);
         }
 
-        return GestureDetector(
+        void startTouch(Offset localPos) {
+          setState(() => _isLaserSlideActive = true);
+          if (_hapticsEnabled) HapticFeedback.selectionClick();
+          handleTouch(localPos);
+          _gripHoldTimer?.cancel();
+          _gripHoldTimer = Timer(const Duration(milliseconds: 280), () {
+            if (mounted && _isLaserSlideActive) {
+              setState(() => _btnGripActive = true);
+              if (_hapticsEnabled) HapticFeedback.heavyImpact();
+              _sendState();
+            }
+          });
+        }
+
+        void updateTouch(Offset localPos) {
+          handleTouch(localPos);
+        }
+
+        void endTouch() {
+          _gripHoldTimer?.cancel();
+          _gripHoldTimer = null;
+          final hadGrip = _btnGripActive;
+          setState(() {
+            _isLaserSlideActive = false;
+            _btnGripActive = false;
+          });
+          if (hadGrip && _hapticsEnabled) {
+            HapticFeedback.mediumImpact();
+          } else if (_hapticsEnabled) {
+            HapticFeedback.lightImpact();
+          }
+          _sendState();
+        }
+
+        return Listener(
+          key: const ValueKey('laser_slide_pad'),
           behavior: HitTestBehavior.opaque,
-          onPanStart: (details) {
-            setState(() => _isLaserSlideActive = true);
-            if (_hapticsEnabled) HapticFeedback.selectionClick();
-            handleTouch(details.localPosition);
-          },
-          onPanUpdate: (details) {
-            handleTouch(details.localPosition);
-          },
-          onPanEnd: (_) {
-            setState(() => _isLaserSlideActive = false);
-            if (_hapticsEnabled) HapticFeedback.lightImpact();
-          },
-          onPanCancel: () {
-            setState(() => _isLaserSlideActive = false);
-          },
-          onDoubleTap: () {
-            _updateLaserSlide(0.0, 0.0);
-            if (_hapticsEnabled) HapticFeedback.mediumImpact();
-          },
-          child: Container(
+          onPointerDown: (event) => startTouch(event.localPosition),
+          onPointerMove: (event) => updateTouch(event.localPosition),
+          onPointerUp: (_) => endTouch(),
+          onPointerCancel: (_) => endTouch(),
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onDoubleTap: () {
+              _gripHoldTimer?.cancel();
+              _gripHoldTimer = null;
+              _btnGripActive = false;
+              _updateLaserSlide(0.0, 0.0);
+              if (_hapticsEnabled) HapticFeedback.mediumImpact();
+            },
+            child: Container(
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 begin: Alignment.topCenter,
@@ -1513,17 +1600,24 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               ),
               borderRadius: BorderRadius.circular(14),
               border: Border.all(
-                color: _isLaserSlideActive
-                    ? const Color(0xFF10B981)
-                    : const Color(0xFF10B981).withValues(alpha: 0.4),
-                width: _isLaserSlideActive ? 1.8 : 1.2,
+                color: _btnGripActive
+                    ? const Color(0xFFFF9100)
+                    : (_isLaserSlideActive
+                        ? const Color(0xFF10B981)
+                        : const Color(0xFF10B981).withValues(alpha: 0.4)),
+                width: _btnGripActive ? 2.5 : (_isLaserSlideActive ? 1.8 : 1.2),
               ),
               boxShadow: [
                 BoxShadow(
-                  color: const Color(0xFF10B981).withValues(
-                    alpha: _isLaserSlideActive ? 0.25 : 0.08,
+                  color: (_btnGripActive
+                          ? const Color(0xFFFF9100)
+                          : const Color(0xFF10B981))
+                      .withValues(
+                    alpha: _btnGripActive
+                        ? 0.40
+                        : (_isLaserSlideActive ? 0.25 : 0.08),
                   ),
-                  blurRadius: _isLaserSlideActive ? 14 : 6,
+                  blurRadius: _btnGripActive ? 20 : (_isLaserSlideActive ? 14 : 6),
                   offset: const Offset(0, 2),
                 ),
               ],
@@ -1537,6 +1631,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       normX: _laserSlideNormX,
                       normY: _laserSlideNormY,
                       isActive: _isLaserSlideActive,
+                      isGrip: _btnGripActive,
                     ),
                   ),
                 ),
@@ -1553,25 +1648,33 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                         vertical: 2,
                       ),
                       decoration: BoxDecoration(
-                        color: Colors.black45,
+                        color: Colors.black54,
                         borderRadius: BorderRadius.circular(6),
                         border: Border.all(
-                          color: const Color(0xFF10B981).withValues(alpha: 0.3),
+                          color: _btnGripActive
+                              ? const Color(0xFFFF9100).withValues(alpha: 0.5)
+                              : const Color(0xFF10B981).withValues(alpha: 0.3),
                         ),
                       ),
-                      child: const Row(
+                      child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Icon(
-                            Icons.radar_rounded,
+                            _btnGripActive
+                                ? Icons.pan_tool_alt_rounded
+                                : Icons.radar_rounded,
                             size: 11,
-                            color: Color(0xFF10B981),
+                            color: _btnGripActive
+                                ? const Color(0xFFFF9100)
+                                : const Color(0xFF10B981),
                           ),
-                          SizedBox(width: 4),
+                          const SizedBox(width: 4),
                           Text(
-                            '180° FRONTAL',
+                            _btnGripActive ? '✊ GRIP ACTIVO' : '180° FRONTAL',
                             style: TextStyle(
-                              color: Color(0xFF10B981),
+                              color: _btnGripActive
+                                  ? const Color(0xFFFF9100)
+                                  : const Color(0xFF10B981),
                               fontSize: 9.0,
                               fontWeight: FontWeight.bold,
                               letterSpacing: 0.6,
@@ -1590,13 +1693,17 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   right: 0,
                   child: Center(
                     child: Text(
-                      _isLaserSlideActive
-                          ? 'APUNTANDO: (${(_laserSlideNormX * 90).toStringAsFixed(0)}°, ${(-_laserSlideNormY * 71).toStringAsFixed(0)}°)'
-                          : 'DESLIZA PARA MOVER EL LÁSER',
+                      _btnGripActive
+                          ? '✊ GRIP (AGARRE) ACTIVO · ARRASTRA PARA MOVER'
+                          : (_isLaserSlideActive
+                              ? 'APUNTANDO: (${(_laserSlideNormX * 90).toStringAsFixed(0)}°, ${(-_laserSlideNormY * 71).toStringAsFixed(0)}°)'
+                              : 'DESLIZA LÁSER · MANTÉN PRESIONADO PARA GRIP'),
                       style: TextStyle(
-                        color: _isLaserSlideActive
-                            ? const Color(0xFF10B981)
-                            : Colors.white60,
+                        color: _btnGripActive
+                            ? const Color(0xFFFF9100)
+                            : (_isLaserSlideActive
+                                ? const Color(0xFF10B981)
+                                : Colors.white60),
                         fontSize: 8.5,
                         fontWeight: FontWeight.bold,
                         letterSpacing: 0.5,
@@ -1607,9 +1714,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               ],
             ),
           ),
-        );
-      },
-    );
+        ),
+      );
+    },
+  );
   }
 
   Widget _buildButton({
@@ -1619,6 +1727,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     required bool isActive,
     required List<Color> colors,
     Color textColor = Colors.white,
+    BorderRadius? borderRadius,
     required VoidCallback onDown,
     required VoidCallback onUp,
   }) {
@@ -1645,7 +1754,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
           ),
-          borderRadius: BorderRadius.circular(14),
+          borderRadius: borderRadius ?? BorderRadius.circular(14),
           border: isActive
               ? Border.all(color: Colors.white, width: 2.2)
               : Border.all(color: Colors.white12, width: 1.2),
@@ -1878,19 +1987,26 @@ class _LaserSlidePadPainter extends CustomPainter {
     required this.normX,
     required this.normY,
     required this.isActive,
+    this.isGrip = false,
   });
 
   final double normX;
   final double normY;
   final bool isActive;
+  final bool isGrip;
 
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
     final radius = math.min(size.width, size.height) * 0.42;
 
+    final baseColor = isGrip
+        ? const Color(0xFFFF9100)
+        : (isActive ? const Color(0xFF10B981) : const Color(0xFF00E5FF));
+
     final gridPaint = Paint()
-      ..color = const Color(0xFF10B981).withValues(alpha: 0.15)
+      ..color = (isGrip ? const Color(0xFFFF9100) : const Color(0xFF10B981))
+          .withValues(alpha: isGrip ? 0.25 : 0.15)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.0;
 
@@ -1919,31 +2035,29 @@ class _LaserSlidePadPainter extends CustomPainter {
     // Aiming beam line from center to touch point
     if (isActive || normX.abs() > 0.01 || normY.abs() > 0.01) {
       final beamPaint = Paint()
-        ..color = (isActive ? const Color(0xFF10B981) : const Color(0xFF00E5FF))
-            .withValues(alpha: isActive ? 0.6 : 0.25)
-        ..strokeWidth = 2.0
+        ..color = baseColor.withValues(alpha: isActive ? 0.7 : 0.25)
+        ..strokeWidth = isGrip ? 3.0 : 2.0
         ..style = PaintingStyle.stroke;
       canvas.drawLine(center, targetOffset, beamPaint);
 
       // Glow halo around reticle
       final glowPaint = Paint()
-        ..color = (isActive ? const Color(0xFF10B981) : const Color(0xFF00E5FF))
-            .withValues(alpha: isActive ? 0.35 : 0.15)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8);
-      canvas.drawCircle(targetOffset, 14, glowPaint);
+        ..color = baseColor.withValues(alpha: isGrip ? 0.5 : (isActive ? 0.35 : 0.15))
+        ..maskFilter = MaskFilter.blur(BlurStyle.normal, isGrip ? 12 : 8);
+      canvas.drawCircle(targetOffset, isGrip ? 18 : 14, glowPaint);
 
       // Reticle circle
       final reticlePaint = Paint()
-        ..color = isActive ? const Color(0xFF10B981) : const Color(0xFF00E5FF)
+        ..color = baseColor
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.5;
-      canvas.drawCircle(targetOffset, 8, reticlePaint);
+        ..strokeWidth = isGrip ? 3.2 : 2.5;
+      canvas.drawCircle(targetOffset, isGrip ? 10 : 8, reticlePaint);
 
       // Reticle center dot
       final dotPaint = Paint()
         ..color = Colors.white
         ..style = PaintingStyle.fill;
-      canvas.drawCircle(targetOffset, 3, dotPaint);
+      canvas.drawCircle(targetOffset, isGrip ? 4 : 3, dotPaint);
     } else {
       // Resting center dot
       final restPaint = Paint()
@@ -1957,6 +2071,7 @@ class _LaserSlidePadPainter extends CustomPainter {
   bool shouldRepaint(covariant _LaserSlidePadPainter oldDelegate) {
     return oldDelegate.normX != normX ||
         oldDelegate.normY != normY ||
-        oldDelegate.isActive != isActive;
+        oldDelegate.isActive != isActive ||
+        oldDelegate.isGrip != isGrip;
   }
 }

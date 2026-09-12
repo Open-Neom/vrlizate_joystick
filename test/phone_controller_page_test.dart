@@ -148,18 +148,20 @@ void main() {
     );
     await tester.pump();
 
-    // Verify left column: RT Gatillo & Grip buttons + Navegación 3D stick
-    expect(find.text('RT · GATILLO'), findsOneWidget);
-    expect(find.text('GRIP'), findsOneWidget);
+    // Verify left column: L, Y, stick, X
+    expect(find.text('L'), findsOneWidget);
+    expect(find.text('Y'), findsOneWidget);
+    expect(find.text('X'), findsOneWidget);
     expect(find.text('NAVEGACIÓN 3D (DESPLAZAMIENTO)'), findsOneWidget);
 
-    // Verify center column: Recentrar Vista button + Puntero Láser (Slide 180°)
+    // Verify center column: Recentrar Vista button + Puntero Láser (Slide 180° · Hold Grip)
     expect(find.text('RECENTRAR VISTA'), findsOneWidget);
-    expect(find.text('PUNTERO LÁSER (SLIDE 180°)'), findsOneWidget);
+    expect(find.text('PUNTERO LÁSER (SLIDE 180° · HOLD GRIP)'), findsOneWidget);
 
-    // Verify right column: A & B buttons + Vista & Giro stick
-    expect(find.text('A'), findsOneWidget);
+    // Verify right column: R, B, stick, A
+    expect(find.text('R'), findsOneWidget);
     expect(find.text('B'), findsOneWidget);
+    expect(find.text('A'), findsOneWidget);
     expect(find.text('VISTA & GIRO (360° HORIZ / 180° VERT)'), findsOneWidget);
 
     // Open settings modal via gear icon
@@ -182,5 +184,52 @@ void main() {
 
     await tester.pumpWidget(const SizedBox.shrink());
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('laser slide pad onHold triggers grip and releasing clears it', (
+    tester,
+  ) async {
+    final service = VrRemoteControllerService();
+    addTearDown(service.dispose);
+    await tester.runAsync(() => service.startServer(port: 0));
+    await HttpOverrides.runWithHttpOverrides(() async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: PhoneControllerPage(
+            initialMode: RemoteControllerMode.joystick,
+            targetHost: '127.0.0.1',
+            targetPort: service.serverPort!,
+            sessionToken: service.sessionToken,
+            autoConnect: true,
+          ),
+        ),
+      );
+      await _pumpUntil(tester, () => service.isConnected);
+      await tester.pump();
+
+      // Find center laser slide pad
+      final padFinder = find.byKey(const ValueKey('laser_slide_pad'));
+      final gesture = await tester.startGesture(tester.getCenter(padFinder));
+      await tester.pump(const Duration(milliseconds: 100));
+      // Prior to 280ms threshold, grip is false
+      expect(service.latestState.btnGrip, isFalse);
+
+      // Wait past 280ms onHold threshold (100ms + 250ms = 350ms > 280ms)
+      await tester.pump(const Duration(milliseconds: 250));
+      await _pumpUntil(tester, () => service.latestState.btnGrip);
+      expect(service.latestState.btnGrip, isTrue);
+      expect(find.text('✊ GRIP (AGARRE) ACTIVO'), findsOneWidget);
+
+      // Release gesture
+      await gesture.up();
+      await tester.pump(const Duration(milliseconds: 50));
+      await _pumpUntil(tester, () => !service.latestState.btnGrip);
+      expect(service.latestState.btnGrip, isFalse);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _pumpUntil(tester, () => !service.isConnected);
+      service.dispose();
+      expect(tester.takeException(), isNull);
+    }, _RealHttpOverrides());
   });
 }

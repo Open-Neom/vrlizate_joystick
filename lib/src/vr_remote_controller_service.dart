@@ -23,6 +23,10 @@ class RemoteControllerState {
   final bool isActionPressed;
   final bool btnA;
   final bool btnB;
+  final bool btnX;
+  final bool btnY;
+  final bool btnL;
+  final bool btnR;
   final bool btnGrip;
   final bool stickClick;
   final double stickX;
@@ -45,6 +49,10 @@ class RemoteControllerState {
     this.isActionPressed = false,
     this.btnA = false,
     this.btnB = false,
+    this.btnX = false,
+    this.btnY = false,
+    this.btnL = false,
+    this.btnR = false,
     this.btnGrip = false,
     this.stickClick = false,
     this.stickX = 0.0,
@@ -73,7 +81,7 @@ class RemoteControllerState {
   String toString() =>
       'RemoteControllerState(mode: ${mode.name}, stick: ($stickX, $stickY), '
       'turn: $turnRate, pitch: $pitchRate, laser: ($laserX, $laserY), recenter: $recenter, range: $rangeMeters, '
-      'btnA: $btnA, btnB: $btnB, trigger: $isTriggerPressed, grip: $btnGrip)';
+      'btnA: $btnA, btnB: $btnB, btnX: $btnX, btnY: $btnY, btnL: $btnL, btnR: $btnR, trigger: $isTriggerPressed, grip: $btnGrip)';
 }
 
 /// Server running inside VRlizate that turns any 2nd smartphone into a full VR Gamepad / 3DoF Controller.
@@ -467,6 +475,10 @@ class VrRemoteControllerService {
           final bool action = json['action'] == true;
           final bool btnA = json['btnA'] == true || trigger;
           final bool btnB = json['btnB'] == true || action;
+          final bool btnX = json['btnX'] == true;
+          final bool btnY = json['btnY'] == true;
+          final bool btnL = json['btnL'] == true;
+          final bool btnR = json['btnR'] == true;
           final bool btnGrip = json['btnGrip'] == true;
           final bool stickClick = json['stickClick'] == true;
 
@@ -514,10 +526,14 @@ class VrRemoteControllerService {
           _latestState = RemoteControllerState(
             orientation: _predictedOrientation.clone(),
             angularVelocity: angularVelocity,
-            isTriggerPressed: trigger || btnA,
+            isTriggerPressed: trigger || btnA || btnL || btnR,
             isActionPressed: action || btnB,
             btnA: btnA,
             btnB: btnB,
+            btnX: btnX,
+            btnY: btnY,
+            btnL: btnL,
+            btnR: btnR,
             btnGrip: btnGrip,
             stickClick: stickClick,
             stickX: stickX.clamp(-1.0, 1.0),
