@@ -232,4 +232,46 @@ void main() {
       expect(tester.takeException(), isNull);
     }, _RealHttpOverrides());
   });
+
+  testWidgets('laser slide gestures produce correct directional orientation and laser coordinates', (
+    tester,
+  ) async {
+    final service = VrRemoteControllerService();
+    addTearDown(service.dispose);
+    await tester.runAsync(() => service.startServer(port: 0));
+    await HttpOverrides.runWithHttpOverrides(() async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: PhoneControllerPage(
+            initialMode: RemoteControllerMode.joystick,
+            targetHost: '127.0.0.1',
+            targetPort: service.serverPort!,
+            sessionToken: service.sessionToken,
+            autoConnect: true,
+          ),
+        ),
+      );
+      await _pumpUntil(tester, () => service.isConnected);
+      await tester.pump();
+
+      final padFinder = find.byKey(const ValueKey('laser_slide_pad'));
+      final padCenter = tester.getCenter(padFinder);
+      final padTop = tester.getTopLeft(padFinder) + const Offset(20, 5);
+
+      // Drag towards top of the pad (swipe UP)
+      final gesture = await tester.startGesture(padCenter);
+      await gesture.moveTo(padTop);
+      await tester.pump(const Duration(milliseconds: 50));
+      await _pumpUntil(tester, () => service.latestState.laserY > 0.5);
+
+      // laserY > 0 means pointing upwards in cartesian coordinates
+      expect(service.latestState.laserY, greaterThan(0.5));
+      await gesture.up();
+      await tester.pump(const Duration(milliseconds: 200));
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _pumpUntil(tester, () => !service.isConnected);
+      service.dispose();
+      expect(tester.takeException(), isNull);
+    }, _RealHttpOverrides());
+  });
 }

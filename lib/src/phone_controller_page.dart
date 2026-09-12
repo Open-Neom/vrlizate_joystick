@@ -341,8 +341,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       // Vertical pitch clamped to [-1.25, 1.25] (~ -71° to +71°)
       _laserPitch = (-_laserSlideNormY * 1.25).clamp(-1.25, 1.25);
 
-      final qYaw = vm.Quaternion.axisAngle(vm.Vector3(0, 1, 0), _laserYaw);
-      final qPitch = vm.Quaternion.axisAngle(vm.Vector3(1, 0, 0), -_laserPitch);
+      // In VR coordinate system, positive elevation requires positive pitch around X,
+      // and rightward heading requires negative yaw around Y.
+      final qYaw = vm.Quaternion.axisAngle(vm.Vector3(0, 1, 0), -_laserYaw);
+      final qPitch = vm.Quaternion.axisAngle(vm.Vector3(1, 0, 0), _laserPitch);
       _orientation = (qYaw * qPitch).normalized();
     });
     _sendState();
