@@ -153,14 +153,14 @@ void main() {
     expect(find.text('GRIP'), findsOneWidget);
     expect(find.text('NAVEGACIÓN 3D (DESPLAZAMIENTO)'), findsOneWidget);
 
-    // Verify center column: Recentrar Vista button + Vista 360°/180° stick
+    // Verify center column: Recentrar Vista button + Puntero Láser (Slide 180°)
     expect(find.text('RECENTRAR VISTA'), findsOneWidget);
-    expect(find.text('VISTA & GIRO (360° HORIZ / 180° VERT)'), findsOneWidget);
+    expect(find.text('PUNTERO LÁSER (SLIDE 180°)'), findsOneWidget);
 
-    // Verify right column: A & B buttons + Puntero Láser 3D stick
+    // Verify right column: A & B buttons + Vista & Giro stick
     expect(find.text('A'), findsOneWidget);
     expect(find.text('B'), findsOneWidget);
-    expect(find.text('PUNTERO LÁSER 3D (SELECCIONAR)'), findsOneWidget);
+    expect(find.text('VISTA & GIRO (360° HORIZ / 180° VERT)'), findsOneWidget);
 
     // Open settings modal via gear icon
     await tester.tap(find.byIcon(Icons.settings_rounded));

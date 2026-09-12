@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -84,6 +84,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   double _laserStickY = 0.0; // Laser pointer vertical steering
   double _laserYaw = 0.0;
   double _laserPitch = 0.0;
+  bool _isLaserSlideActive = false;
+  double _laserSlideNormX = 0.0;
+  double _laserSlideNormY = 0.0;
   bool _recenterTriggered = false;
 
   // Haptic feedback / vibration state
@@ -168,7 +171,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _accelSub = accelerometerEventStream().listen(
         (AccelerometerEvent event) {
           if (!mounted || !_isForeground || !_shakeToRecenterEnabled) return;
-          final mag = sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
+          final mag = math.sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
           final now = DateTime.now();
           // Shake requires vigorous acceleration (> 20 m/s^2, well above 1g = 9.8 m/s^2)
           if (mag > 20.0) {
@@ -317,16 +320,27 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
     // Send state periodically at 60 FPS
     _streamTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
-      if (_laserStickX.abs() > 0.04 || _laserStickY.abs() > 0.04) {
-        const dt = 0.016;
-        _laserYaw -= _laserStickX * 2.2 * dt;
-        _laserPitch = (_laserPitch + _laserStickY * 1.8 * dt).clamp(-1.3, 1.3);
-        final qYaw = vm.Quaternion.axisAngle(vm.Vector3(0, 1, 0), _laserYaw);
-        final qPitch = vm.Quaternion.axisAngle(vm.Vector3(1, 0, 0), -_laserPitch);
-        _orientation = (qYaw * qPitch).normalized();
-      }
       _sendState();
     });
+  }
+
+  void _updateLaserSlide(double nx, double ny) {
+    setState(() {
+      _laserSlideNormX = nx.clamp(-1.0, 1.0);
+      _laserSlideNormY = ny.clamp(-1.0, 1.0);
+      _laserStickX = _laserSlideNormX;
+      _laserStickY = -_laserSlideNormY;
+
+      // 180° frontal hemisphere: horizontal yaw clamped to [-pi/2, +pi/2] (-90° to +90°)
+      _laserYaw = (_laserSlideNormX * (math.pi / 2)).clamp(-math.pi / 2, math.pi / 2);
+      // Vertical pitch clamped to [-1.25, 1.25] (~ -71° to +71°)
+      _laserPitch = (-_laserSlideNormY * 1.25).clamp(-1.25, 1.25);
+
+      final qYaw = vm.Quaternion.axisAngle(vm.Vector3(0, 1, 0), _laserYaw);
+      final qPitch = vm.Quaternion.axisAngle(vm.Vector3(1, 0, 0), -_laserPitch);
+      _orientation = (qYaw * qPitch).normalized();
+    });
+    _sendState();
   }
 
   String get _transportLabel {
@@ -489,6 +503,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _lookY = 0;
     _laserStickX = 0;
     _laserStickY = 0;
+    _isLaserSlideActive = false;
+    _laserSlideNormX = 0;
+    _laserSlideNormY = 0;
     _recenterTriggered = false;
     _triggerActive = false;
     _actionActive = false;
@@ -568,6 +585,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _angularVelocity.setZero();
       _laserYaw = 0.0;
       _laserPitch = 0.0;
+      _laserStickX = 0.0;
+      _laserStickY = 0.0;
+      _laserSlideNormX = 0.0;
+      _laserSlideNormY = 0.0;
       _lastGyroTime = null;
       _recenterTriggered = true;
     });
@@ -1160,15 +1181,17 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   Widget _buildJoystickLayout() {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final double stickSize = min(constraints.maxHeight * 0.54, 122.0);
-        final double btnHeight = min(constraints.maxHeight * 0.20, 38.0);
+        final double stickSize =
+            (constraints.maxHeight * 0.48).clamp(95.0, 118.0);
+        final double btnHeight =
+            (constraints.maxHeight * 0.25).clamp(48.0, 56.0);
 
         return Row(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             // ── 1. Columna Izquierda: Botones Superiores (RT & Grip) + Joystick Navegación 3D ──
             Expanded(
-              flex: 4,
+              flex: 5,
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                 decoration: BoxDecoration(
@@ -1181,7 +1204,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    // Top Buttons: RT Gatillo & Grip
+                    // Top Buttons: RT Gatillo & Grip (Grandes)
                     SizedBox(
                       height: btnHeight,
                       child: Row(
@@ -1189,25 +1212,35 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                           Expanded(
                             child: _buildButton(
                               title: 'RT · GATILLO',
-                              subtitle: 'Clic',
+                              subtitle: 'Clic / Disparo',
                               icon: Icons.touch_app_rounded,
                               isActive: _triggerActive,
-                              colors: const [Color(0xFF00E5FF), Color(0xFF7C4DFF)],
-                              onDown: () => setState(() => _triggerActive = true),
-                              onUp: () => setState(() => _triggerActive = false),
+                              colors: const [
+                                Color(0xFF00E5FF),
+                                Color(0xFF7C4DFF),
+                              ],
+                              onDown: () =>
+                                  setState(() => _triggerActive = true),
+                              onUp: () =>
+                                  setState(() => _triggerActive = false),
                             ),
                           ),
-                          const SizedBox(width: 4),
+                          const SizedBox(width: 5),
                           Expanded(
                             child: _buildButton(
                               title: 'GRIP',
                               subtitle: 'Agarre',
                               icon: Icons.pan_tool_alt_rounded,
                               isActive: _btnGripActive,
-                              colors: const [Color(0xFF334155), Color(0xFF1E293B)],
+                              colors: const [
+                                Color(0xFF334155),
+                                Color(0xFF1E293B),
+                              ],
                               textColor: const Color(0xFF00E5FF),
-                              onDown: () => setState(() => _btnGripActive = true),
-                              onUp: () => setState(() => _btnGripActive = false),
+                              onDown: () =>
+                                  setState(() => _btnGripActive = true),
+                              onUp: () =>
+                                  setState(() => _btnGripActive = false),
                             ),
                           ),
                         ],
@@ -1267,9 +1300,72 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               ),
             ),
 
-            // ── 2. Columna Central: Botón Superior (Recentrar) + Joystick Vista & Giro 360°/180° ──
+            // ── 2. Columna Central: Botón Superior (Recentrar) + Espacio Slide Láser 180° ──
             Expanded(
-              flex: 4,
+              flex: 5,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF101528).withValues(alpha: 0.7),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: const Color(0xFF10B981).withValues(alpha: 0.3),
+                  ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // Top Button: Recentrar Vista (Grande)
+                    SizedBox(
+                      height: btnHeight,
+                      child: _buildButton(
+                        title: 'RECENTRAR VISTA',
+                        subtitle: 'Centrar horizonte y mira',
+                        icon: Icons.filter_center_focus_rounded,
+                        isActive: _recenterTriggered,
+                        colors: const [Color(0xFFFF9100), Color(0xFFFF007F)],
+                        onDown: _recenterController,
+                        onUp: () {},
+                      ),
+                    ),
+
+                    const SizedBox(height: 4),
+
+                    // Center: Laser Slide Space (Slide táctil libre, 180° frontal estricto)
+                    Expanded(
+                      child: _buildLaserSlidePad(),
+                    ),
+
+                    const SizedBox(height: 2),
+                    const Center(
+                      child: Text(
+                        'PUNTERO LÁSER (SLIDE 180°)',
+                        style: TextStyle(
+                          color: Color(0xFF10B981),
+                          fontSize: 8.5,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 0.6,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            // Separator 2
+            Container(
+              width: 1.0,
+              margin: const EdgeInsets.symmetric(horizontal: 3, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFF9100).withValues(alpha: 0.2),
+                borderRadius: BorderRadius.circular(1),
+              ),
+            ),
+
+            // ── 3. Columna Derecha: Botones Superiores (A & B) + Joystick Vista y Giro 360°/180° ──
+            Expanded(
+              flex: 5,
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                 decoration: BoxDecoration(
@@ -1282,19 +1378,41 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    // Top Button: Recentrar Vista
+                    // Top 2 Buttons: A & B (Grandes)
                     SizedBox(
                       height: btnHeight,
-                      child: _buildButton(
-                        title: 'RECENTRAR VISTA',
-                        subtitle: 'Centrar horizonte y mira',
-                        icon: Icons.filter_center_focus_rounded,
-                        isActive: _recenterTriggered,
-                        colors: const [Color(0xFFFF9100), Color(0xFFFF007F)],
-                        onDown: () {
-                          _recenterController();
-                        },
-                        onUp: () {},
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: _buildButton(
+                              title: 'A',
+                              subtitle: 'Seleccionar',
+                              icon: Icons.check_circle_outline_rounded,
+                              isActive: _btnAActive,
+                              colors: const [
+                                Color(0xFF10B981),
+                                Color(0xFF00E5FF),
+                              ],
+                              onDown: () => setState(() => _btnAActive = true),
+                              onUp: () => setState(() => _btnAActive = false),
+                            ),
+                          ),
+                          const SizedBox(width: 5),
+                          Expanded(
+                            child: _buildButton(
+                              title: 'B',
+                              subtitle: 'Atrás / Home',
+                              icon: Icons.navigation_rounded,
+                              isActive: _btnBActive,
+                              colors: const [
+                                Color(0xFFFF007F),
+                                Color(0xFFFF9100),
+                              ],
+                              onDown: () => setState(() => _btnBActive = true),
+                              onUp: () => setState(() => _btnBActive = false),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
 
@@ -1340,93 +1458,121 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 ),
               ),
             ),
+          ],
+        );
+      },
+    );
+  }
 
-            // Separator 2
-            Container(
-              width: 1.0,
-              margin: const EdgeInsets.symmetric(horizontal: 3, vertical: 8),
-              decoration: BoxDecoration(
-                color: const Color(0xFF10B981).withValues(alpha: 0.2),
-                borderRadius: BorderRadius.circular(1),
+  Widget _buildLaserSlidePad() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final padWidth = constraints.maxWidth;
+        final padHeight = constraints.maxHeight;
+
+        void handleTouch(Offset localPos) {
+          final nx =
+              ((localPos.dx - padWidth / 2) / (padWidth / 2)).clamp(-1.0, 1.0);
+          final ny = ((localPos.dy - padHeight / 2) / (padHeight / 2)).clamp(
+            -1.0,
+            1.0,
+          );
+          _updateLaserSlide(nx, ny);
+        }
+
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onPanStart: (details) {
+            setState(() => _isLaserSlideActive = true);
+            if (_hapticsEnabled) HapticFeedback.selectionClick();
+            handleTouch(details.localPosition);
+          },
+          onPanUpdate: (details) {
+            handleTouch(details.localPosition);
+          },
+          onPanEnd: (_) {
+            setState(() => _isLaserSlideActive = false);
+            if (_hapticsEnabled) HapticFeedback.lightImpact();
+          },
+          onPanCancel: () {
+            setState(() => _isLaserSlideActive = false);
+          },
+          onDoubleTap: () {
+            _updateLaserSlide(0.0, 0.0);
+            if (_hapticsEnabled) HapticFeedback.mediumImpact();
+          },
+          child: Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  const Color(0xFF101E2E).withValues(alpha: 0.85),
+                  const Color(0xFF080D1A).withValues(alpha: 0.95),
+                ],
               ),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: _isLaserSlideActive
+                    ? const Color(0xFF10B981)
+                    : const Color(0xFF10B981).withValues(alpha: 0.4),
+                width: _isLaserSlideActive ? 1.8 : 1.2,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: const Color(0xFF10B981).withValues(
+                    alpha: _isLaserSlideActive ? 0.25 : 0.08,
+                  ),
+                  blurRadius: _isLaserSlideActive ? 14 : 6,
+                  offset: const Offset(0, 2),
+                ),
+              ],
             ),
-
-            // ── 3. Columna Derecha: Botones Superiores (A & B) + Joystick Puntero Láser 3D ──
-            Expanded(
-              flex: 4,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF101528).withValues(alpha: 0.7),
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(
-                    color: const Color(0xFF10B981).withValues(alpha: 0.3),
+            child: Stack(
+              children: [
+                // Custom radar / 180° grid painter
+                Positioned.fill(
+                  child: CustomPaint(
+                    painter: _LaserSlidePadPainter(
+                      normX: _laserSlideNormX,
+                      normY: _laserSlideNormY,
+                      isActive: _isLaserSlideActive,
+                    ),
                   ),
                 ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    // Top 2 Buttons: A & B
-                    SizedBox(
-                      height: btnHeight,
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: _buildButton(
-                              title: 'A',
-                              subtitle: 'Seleccionar',
-                              icon: Icons.check_circle_outline_rounded,
-                              isActive: _btnAActive,
-                              colors: const [Color(0xFF10B981), Color(0xFF00E5FF)],
-                              onDown: () => setState(() => _btnAActive = true),
-                              onUp: () => setState(() => _btnAActive = false),
-                            ),
-                          ),
-                          const SizedBox(width: 4),
-                          Expanded(
-                            child: _buildButton(
-                              title: 'B',
-                              subtitle: 'Atrás / Home',
-                              icon: Icons.navigation_rounded,
-                              isActive: _btnBActive,
-                              colors: const [Color(0xFFFF007F), Color(0xFFFF9100)],
-                              onDown: () => setState(() => _btnBActive = true),
-                              onUp: () => setState(() => _btnBActive = false),
-                            ),
-                          ),
-                        ],
+
+                // Center forward indicator
+                Positioned(
+                  top: 5,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 2,
                       ),
-                    ),
-
-                    const Spacer(),
-
-                    // Center: Laser Pointer Thumbstick (Aim & Select in 3D)
-                    Center(
-                      child: Column(
+                      decoration: BoxDecoration(
+                        color: Colors.black45,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(
+                          color: const Color(0xFF10B981).withValues(alpha: 0.3),
+                        ),
+                      ),
+                      child: const Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          VirtualThumbstick(
-                            size: stickSize,
-                            knobRadius: 18.0,
-                            accentColor: const Color(0xFF10B981),
-                            hapticsEnabled: _hapticsEnabled,
-                            onChanged: (x, y) {
-                              _laserStickX = x;
-                              _laserStickY = y;
-                              _sendState();
-                            },
-                            onRelease: () {
-                              _laserStickX = 0.0;
-                              _laserStickY = 0.0;
-                              _sendState();
-                            },
+                          Icon(
+                            Icons.radar_rounded,
+                            size: 11,
+                            color: Color(0xFF10B981),
                           ),
-                          const SizedBox(height: 2),
-                          const Text(
-                            'PUNTERO LÁSER 3D (SELECCIONAR)',
+                          SizedBox(width: 4),
+                          Text(
+                            '180° FRONTAL',
                             style: TextStyle(
                               color: Color(0xFF10B981),
-                              fontSize: 8.5,
+                              fontSize: 9.0,
                               fontWeight: FontWeight.bold,
                               letterSpacing: 0.6,
                             ),
@@ -1434,13 +1580,33 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                         ],
                       ),
                     ),
-
-                    const Spacer(),
-                  ],
+                  ),
                 ),
-              ),
+
+                // Bottom label
+                Positioned(
+                  bottom: 5,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: Text(
+                      _isLaserSlideActive
+                          ? 'APUNTANDO: (${(_laserSlideNormX * 90).toStringAsFixed(0)}°, ${(-_laserSlideNormY * 71).toStringAsFixed(0)}°)'
+                          : 'DESLIZA PARA MOVER EL LÁSER',
+                      style: TextStyle(
+                        color: _isLaserSlideActive
+                            ? const Color(0xFF10B981)
+                            : Colors.white60,
+                        fontSize: 8.5,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 0.5,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
-          ],
+          ),
         );
       },
     );
@@ -1479,14 +1645,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
           ),
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(14),
           border: isActive
-              ? Border.all(color: Colors.white, width: 2)
-              : Border.all(color: Colors.white10),
+              ? Border.all(color: Colors.white, width: 2.2)
+              : Border.all(color: Colors.white12, width: 1.2),
           boxShadow: [
             BoxShadow(
-              color: colors.first.withValues(alpha: isActive ? 0.6 : 0.25),
-              blurRadius: isActive ? 14 : 6,
+              color: colors.first.withValues(alpha: isActive ? 0.65 : 0.28),
+              blurRadius: isActive ? 16 : 8,
               offset: const Offset(0, 2),
             ),
           ],
@@ -1495,27 +1661,28 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           child: FittedBox(
             fit: BoxFit.scaleDown,
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Icon(icon, color: textColor, size: 20),
-                  const SizedBox(height: 2),
+                  Icon(icon, color: textColor, size: 22),
+                  const SizedBox(height: 3),
                   Text(
                     title,
                     style: TextStyle(
                       color: textColor,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 12,
+                      fontWeight: FontWeight.w900,
+                      fontSize: 13,
                       letterSpacing: 0.8,
                     ),
                   ),
                   Text(
                     subtitle,
                     style: TextStyle(
-                      color: textColor.withValues(alpha: 0.7),
-                      fontSize: 8.5,
+                      color: textColor.withValues(alpha: 0.8),
+                      fontSize: 9.5,
+                      fontWeight: FontWeight.w500,
                     ),
                   ),
                 ],
@@ -1703,5 +1870,93 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       ),
     ),
     );
+  }
+}
+
+class _LaserSlidePadPainter extends CustomPainter {
+  const _LaserSlidePadPainter({
+    required this.normX,
+    required this.normY,
+    required this.isActive,
+  });
+
+  final double normX;
+  final double normY;
+  final bool isActive;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = math.min(size.width, size.height) * 0.42;
+
+    final gridPaint = Paint()
+      ..color = const Color(0xFF10B981).withValues(alpha: 0.15)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.0;
+
+    // Concentric 180° / full radar circles
+    canvas.drawCircle(center, radius * 0.33, gridPaint);
+    canvas.drawCircle(center, radius * 0.66, gridPaint);
+    canvas.drawCircle(center, radius, gridPaint);
+
+    // Crosshairs
+    canvas.drawLine(
+      Offset(center.dx - radius, center.dy),
+      Offset(center.dx + radius, center.dy),
+      gridPaint,
+    );
+    canvas.drawLine(
+      Offset(center.dx, center.dy - radius),
+      Offset(center.dx, center.dy + radius),
+      gridPaint,
+    );
+
+    // Target reticle position
+    final targetX = center.dx + normX * (size.width * 0.45);
+    final targetY = center.dy + normY * (size.height * 0.45);
+    final targetOffset = Offset(targetX, targetY);
+
+    // Aiming beam line from center to touch point
+    if (isActive || normX.abs() > 0.01 || normY.abs() > 0.01) {
+      final beamPaint = Paint()
+        ..color = (isActive ? const Color(0xFF10B981) : const Color(0xFF00E5FF))
+            .withValues(alpha: isActive ? 0.6 : 0.25)
+        ..strokeWidth = 2.0
+        ..style = PaintingStyle.stroke;
+      canvas.drawLine(center, targetOffset, beamPaint);
+
+      // Glow halo around reticle
+      final glowPaint = Paint()
+        ..color = (isActive ? const Color(0xFF10B981) : const Color(0xFF00E5FF))
+            .withValues(alpha: isActive ? 0.35 : 0.15)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8);
+      canvas.drawCircle(targetOffset, 14, glowPaint);
+
+      // Reticle circle
+      final reticlePaint = Paint()
+        ..color = isActive ? const Color(0xFF10B981) : const Color(0xFF00E5FF)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.5;
+      canvas.drawCircle(targetOffset, 8, reticlePaint);
+
+      // Reticle center dot
+      final dotPaint = Paint()
+        ..color = Colors.white
+        ..style = PaintingStyle.fill;
+      canvas.drawCircle(targetOffset, 3, dotPaint);
+    } else {
+      // Resting center dot
+      final restPaint = Paint()
+        ..color = const Color(0xFF10B981).withValues(alpha: 0.5)
+        ..style = PaintingStyle.fill;
+      canvas.drawCircle(center, 4, restPaint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _LaserSlidePadPainter oldDelegate) {
+    return oldDelegate.normX != normX ||
+        oldDelegate.normY != normY ||
+        oldDelegate.isActive != isActive;
   }
 }
