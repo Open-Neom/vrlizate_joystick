@@ -846,7 +846,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             Icon(Icons.sports_esports_rounded, color: Color(0xFF00E5FF), size: 18),
             SizedBox(width: 8),
             Text(
-              'MANDO VRLIZATE',
+              'MANDO 3DoF VRLIZATE',
               style: TextStyle(
                 color: Color(0xFF00E5FF),
                 fontSize: 13,
@@ -878,6 +878,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              if (widget.isChildRole) ...[
+                _buildChildRoleBanner(),
+                const SizedBox(height: 4),
+              ],
+
               // Active Controller Surface (Dual Joystick vs Laser)
               Expanded(
                 child: _activeMode == RemoteControllerMode.joystick
@@ -892,6 +897,103 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildChildRoleBanner() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFF00E5FF).withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: const Color(0xFF00E5FF).withValues(alpha: 0.4),
+          width: 1.2,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFF00E5FF).withValues(alpha: 0.15),
+            blurRadius: 8,
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(5),
+            decoration: BoxDecoration(
+              color: const Color(0xFF00E5FF).withValues(alpha: 0.2),
+              shape: BoxShape.circle,
+            ),
+            child: const Icon(
+              Icons.link_rounded,
+              color: Color(0xFF00E5FF),
+              size: 16,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Row(
+                  children: [
+                    Text(
+                      'ROL: MANDO HIJO',
+                      style: TextStyle(
+                        color: Color(0xFF00E5FF),
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 0.8,
+                      ),
+                    ),
+                    SizedBox(width: 6),
+                    Text(
+                      '· ENLACE DIRECTO',
+                      style: TextStyle(
+                        color: Colors.white60,
+                        fontSize: 9,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+                Text(
+                  'Visor Padre: ${_lastTarget?.host ?? widget.targetHost ?? _discoveredHost ?? 'Sin vincular'}:$_targetPort ($_transportLabel)',
+                  style: const TextStyle(color: Colors.white70, fontSize: 9.5),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+            decoration: BoxDecoration(
+              color: _isConnected
+                  ? const Color(0xFF10B981).withValues(alpha: 0.2)
+                  : const Color(0xFFFF9100).withValues(alpha: 0.2),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                color: _isConnected
+                    ? const Color(0xFF10B981)
+                    : const Color(0xFFFF9100),
+              ),
+            ),
+            child: Text(
+              _isConnected
+                  ? 'SINCRONIZADO'
+                  : (_isConnecting ? 'CONECTANDO' : 'SIN VINCULAR'),
+              style: TextStyle(
+                color: _isConnected
+                    ? const Color(0xFF10B981)
+                    : const Color(0xFFFF9100),
+                fontSize: 8.5,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
