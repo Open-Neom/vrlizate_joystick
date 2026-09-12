@@ -80,6 +80,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   double _stickY = 0.0;
   double _lookX = 0.0; // 360° Horizontal turn (yaw)
   double _lookY = 0.0; // 180° Vertical tilt (pitch)
+  double _laserStickX = 0.0; // Laser pointer horizontal steering
+  double _laserStickY = 0.0; // Laser pointer vertical steering
+  double _laserYaw = 0.0;
+  double _laserPitch = 0.0;
   bool _recenterTriggered = false;
 
   // Shake detection state
@@ -271,6 +275,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
     // Send state periodically at 60 FPS
     _streamTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+      if (_laserStickX.abs() > 0.04 || _laserStickY.abs() > 0.04) {
+        const dt = 0.016;
+        _laserYaw -= _laserStickX * 2.2 * dt;
+        _laserPitch = (_laserPitch + _laserStickY * 1.8 * dt).clamp(-1.3, 1.3);
+        final qYaw = vm.Quaternion.axisAngle(vm.Vector3(0, 1, 0), _laserYaw);
+        final qPitch = vm.Quaternion.axisAngle(vm.Vector3(1, 0, 0), -_laserPitch);
+        _orientation = (qYaw * qPitch).normalized();
+      }
       _sendState();
     });
   }
@@ -433,6 +445,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _stickY = 0;
     _lookX = 0;
     _lookY = 0;
+    _laserStickX = 0;
+    _laserStickY = 0;
     _recenterTriggered = false;
     _triggerActive = false;
     _actionActive = false;
@@ -484,6 +498,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         'turnRate': _lookX,
         'pitchRate': _lookY,
         'lookPitch': _lookY,
+        'laserX': _laserStickX,
+        'laserY': _laserStickY,
+        'aimX': _laserStickX,
+        'aimY': _laserStickY,
         'recenter': _recenterTriggered,
         'rangeMeters': 0.55,
         'trigger': _triggerActive,
@@ -506,6 +524,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     setState(() {
       _orientation = vm.Quaternion.identity();
       _angularVelocity.setZero();
+      _laserYaw = 0.0;
+      _laserPitch = 0.0;
       _lastGyroTime = null;
       _recenterTriggered = true;
     });
@@ -1071,20 +1091,20 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   Widget _buildJoystickLayout() {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final double stickSize = min(constraints.maxHeight * 0.58, 142.0);
-        final double btnHeight = min(constraints.maxHeight * 0.22, 48.0);
+        final double stickSize = min(constraints.maxHeight * 0.54, 122.0);
+        final double btnHeight = min(constraints.maxHeight * 0.20, 38.0);
 
         return Row(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // Left Half: Top 2 Action Buttons (RT & Grip) + Navigation 3D Joystick
+            // ── 1. Columna Izquierda: Botones Superiores (RT & Grip) + Joystick Navegación 3D ──
             Expanded(
-              flex: 5,
+              flex: 4,
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                 decoration: BoxDecoration(
                   color: const Color(0xFF101528).withValues(alpha: 0.7),
-                  borderRadius: BorderRadius.circular(16),
+                  borderRadius: BorderRadius.circular(14),
                   border: Border.all(
                     color: const Color(0xFF00E5FF).withValues(alpha: 0.3),
                   ),
@@ -1092,7 +1112,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    // Top 2 Buttons: RT Gatillo & Grip
+                    // Top Buttons: RT Gatillo & Grip
                     SizedBox(
                       height: btnHeight,
                       child: Row(
@@ -1100,7 +1120,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                           Expanded(
                             child: _buildButton(
                               title: 'RT · GATILLO',
-                              subtitle: 'Interactuar / Clic',
+                              subtitle: 'Clic',
                               icon: Icons.touch_app_rounded,
                               isActive: _triggerActive,
                               colors: const [Color(0xFF00E5FF), Color(0xFF7C4DFF)],
@@ -1108,7 +1128,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                               onUp: () => setState(() => _triggerActive = false),
                             ),
                           ),
-                          const SizedBox(width: 8),
+                          const SizedBox(width: 4),
                           Expanded(
                             child: _buildButton(
                               title: 'GRIP',
@@ -1134,7 +1154,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                         children: [
                           VirtualThumbstick(
                             size: stickSize,
-                            knobRadius: 22.0,
+                            knobRadius: 18.0,
+                            accentColor: const Color(0xFF00E5FF),
                             onChanged: (x, y) {
                               _stickX = x;
                               _stickY = y;
@@ -1151,9 +1172,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                             'NAVEGACIÓN 3D (DESPLAZAMIENTO)',
                             style: TextStyle(
                               color: Color(0xFF00E5FF),
-                              fontSize: 9,
+                              fontSize: 8.5,
                               fontWeight: FontWeight.bold,
-                              letterSpacing: 0.8,
+                              letterSpacing: 0.6,
                             ),
                           ),
                         ],
@@ -1166,26 +1187,109 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               ),
             ),
 
-            // Center Separator
+            // Separator 1
             Container(
-              width: 1.2,
-              margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+              width: 1.0,
+              margin: const EdgeInsets.symmetric(horizontal: 3, vertical: 8),
               decoration: BoxDecoration(
-                color: const Color(0xFF00E5FF).withValues(alpha: 0.25),
+                color: const Color(0xFF00E5FF).withValues(alpha: 0.2),
                 borderRadius: BorderRadius.circular(1),
               ),
             ),
 
-            // Right Half: Top 2 Action Buttons (A & B) + Look/Turn Joystick (360° Yaw & 180° Pitch)
+            // ── 2. Columna Central: Botón Superior (Recentrar) + Joystick Vista & Giro 360°/180° ──
             Expanded(
-              flex: 5,
+              flex: 4,
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                 decoration: BoxDecoration(
                   color: const Color(0xFF101528).withValues(alpha: 0.7),
-                  borderRadius: BorderRadius.circular(16),
+                  borderRadius: BorderRadius.circular(14),
                   border: Border.all(
-                    color: const Color(0xFF00E5FF).withValues(alpha: 0.3),
+                    color: const Color(0xFFFF9100).withValues(alpha: 0.3),
+                  ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // Top Button: Recentrar Vista
+                    SizedBox(
+                      height: btnHeight,
+                      child: _buildButton(
+                        title: 'RECENTRAR VISTA',
+                        subtitle: 'Centrar horizonte y mira',
+                        icon: Icons.filter_center_focus_rounded,
+                        isActive: _recenterTriggered,
+                        colors: const [Color(0xFFFF9100), Color(0xFFFF007F)],
+                        onDown: () {
+                          _recenterController();
+                        },
+                        onUp: () {},
+                      ),
+                    ),
+
+                    const Spacer(),
+
+                    // Center: Look/Turn Thumbstick (360° Horizontal & 180° Vertical)
+                    Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          VirtualThumbstick(
+                            size: stickSize,
+                            knobRadius: 18.0,
+                            accentColor: const Color(0xFFFF9100),
+                            onChanged: (x, y) {
+                              _lookX = x;
+                              _lookY = y;
+                              _sendState();
+                            },
+                            onRelease: () {
+                              _lookX = 0.0;
+                              _lookY = 0.0;
+                              _sendState();
+                            },
+                          ),
+                          const SizedBox(height: 2),
+                          const Text(
+                            'VISTA & GIRO (360° HORIZ / 180° VERT)',
+                            style: TextStyle(
+                              color: Color(0xFFFF9100),
+                              fontSize: 8.5,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 0.6,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                    const Spacer(),
+                  ],
+                ),
+              ),
+            ),
+
+            // Separator 2
+            Container(
+              width: 1.0,
+              margin: const EdgeInsets.symmetric(horizontal: 3, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF10B981).withValues(alpha: 0.2),
+                borderRadius: BorderRadius.circular(1),
+              ),
+            ),
+
+            // ── 3. Columna Derecha: Botones Superiores (A & B) + Joystick Puntero Láser 3D ──
+            Expanded(
+              flex: 4,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF101528).withValues(alpha: 0.7),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: const Color(0xFF10B981).withValues(alpha: 0.3),
                   ),
                 ),
                 child: Column(
@@ -1199,7 +1303,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                           Expanded(
                             child: _buildButton(
                               title: 'A',
-                              subtitle: 'Confirmar',
+                              subtitle: 'Seleccionar',
                               icon: Icons.check_circle_outline_rounded,
                               isActive: _btnAActive,
                               colors: const [Color(0xFF10B981), Color(0xFF00E5FF)],
@@ -1207,7 +1311,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                               onUp: () => setState(() => _btnAActive = false),
                             ),
                           ),
-                          const SizedBox(width: 8),
+                          const SizedBox(width: 4),
                           Expanded(
                             child: _buildButton(
                               title: 'B',
@@ -1225,33 +1329,34 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
                     const Spacer(),
 
-                    // Center: Look/Turn Thumbstick (360° Horizontal & 180° Vertical)
+                    // Center: Laser Pointer Thumbstick (Aim & Select in 3D)
                     Center(
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           VirtualThumbstick(
                             size: stickSize,
-                            knobRadius: 22.0,
+                            knobRadius: 18.0,
+                            accentColor: const Color(0xFF10B981),
                             onChanged: (x, y) {
-                              _lookX = x;
-                              _lookY = y;
+                              _laserStickX = x;
+                              _laserStickY = y;
                               _sendState();
                             },
                             onRelease: () {
-                              _lookX = 0.0;
-                              _lookY = 0.0;
+                              _laserStickX = 0.0;
+                              _laserStickY = 0.0;
                               _sendState();
                             },
                           ),
                           const SizedBox(height: 2),
                           const Text(
-                            'VISTA & GIRO (360° HORIZ / 180° VERT)',
+                            'PUNTERO LÁSER 3D (SELECCIONAR)',
                             style: TextStyle(
-                              color: Color(0xFF00E5FF),
-                              fontSize: 9,
+                              color: Color(0xFF10B981),
+                              fontSize: 8.5,
                               fontWeight: FontWeight.bold,
-                              letterSpacing: 0.8,
+                              letterSpacing: 0.6,
                             ),
                           ),
                         ],
@@ -1510,7 +1615,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           Text(
             'NAV: (${_stickX.toStringAsFixed(1)}, ${_stickY.toStringAsFixed(1)}) | '
             'VISTA: (${_lookX.toStringAsFixed(1)}, ${_lookY.toStringAsFixed(1)}) | '
-            'SACUDIR: ${_shakeToRecenterEnabled ? "ON" : "OFF"}',
+            'LÁSER: (${_laserStickX.toStringAsFixed(1)}, ${_laserStickY.toStringAsFixed(1)})',
             style: const TextStyle(
               color: Color(0xFF00E5FF),
               fontSize: 8.5,

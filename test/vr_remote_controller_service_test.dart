@@ -250,6 +250,8 @@ void main() {
         'stickY': 0.8,
         'turnRate': 0.65,
         'pitchRate': -0.4,
+        'laserX': 0.35,
+        'laserY': -0.75,
         'recenter': true,
       }),
     );
@@ -258,20 +260,26 @@ void main() {
     expect(service.latestState.stickY, 0.8);
     expect(service.latestState.turnRate, 0.65);
     expect(service.latestState.pitchRate, -0.4);
+    expect(service.latestState.laserX, 0.35);
+    expect(service.latestState.laserY, -0.75);
     expect(service.latestState.recenter, isTrue);
 
-    // Alternative packet keys (lookX / lookY)
+    // Alternative packet keys (lookX / lookY / aimX / aimY)
     socket.add(
       jsonEncode({
         'sequence': 2,
         'lookX': 0.25,
         'lookY': 0.5,
+        'aimX': -0.15,
+        'aimY': 0.9,
         'recenter': false,
       }),
     );
     await waitUntil(() => service.latestState.turnRate == 0.25);
     expect(service.latestState.turnRate, 0.25);
     expect(service.latestState.pitchRate, 0.5);
+    expect(service.latestState.laserX, -0.15);
+    expect(service.latestState.laserY, 0.9);
     expect(service.latestState.recenter, isFalse);
   });
 }

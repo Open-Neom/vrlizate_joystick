@@ -27,11 +27,15 @@ class VirtualThumbstick extends StatefulWidget {
   /// Optional callback invoked when the stick returns to center.
   final VoidCallback? onRelease;
 
+  /// Optional accent color for borders and highlights (defaults to neon cyan).
+  final Color accentColor;
+
   const VirtualThumbstick({
     super.key,
     this.size = 150.0,
     this.knobRadius = 28.0,
     this.deadzone = 0.08,
+    this.accentColor = const Color(0xFF00E5FF),
     required this.onChanged,
     this.onRelease,
   });
@@ -151,13 +155,13 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
           color: const Color(0xFF101528),
           border: Border.all(
             color: _isDragging
-                ? const Color(0xFF00E5FF)
-                : const Color(0xFF00E5FF).withValues(alpha: 0.4),
+                ? widget.accentColor
+                : widget.accentColor.withValues(alpha: 0.4),
             width: 2.0,
           ),
           boxShadow: [
             BoxShadow(
-              color: const Color(0xFF00E5FF).withValues(
+              color: widget.accentColor.withValues(
                 alpha: _isDragging ? 0.35 : 0.15,
               ),
               blurRadius: _isDragging ? 20 : 12,
@@ -174,6 +178,7 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
                 maxRadius: _maxRadius,
                 deadzone: widget.deadzone,
                 isDragging: _isDragging,
+                accentColor: widget.accentColor,
               ),
             ),
 
@@ -188,8 +193,8 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
                   shape: BoxShape.circle,
                   gradient: LinearGradient(
                     colors: _isDragging
-                        ? const [Color(0xFF00E5FF), Color(0xFFFF007F)]
-                        : const [Color(0xFF00E5FF), Color(0xFF7C4DFF)],
+                        ? [widget.accentColor, const Color(0xFFFF007F)]
+                        : [widget.accentColor, widget.accentColor.withValues(alpha: 0.5)],
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                   ),
@@ -197,7 +202,7 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
                     BoxShadow(
                       color: (_isDragging
                               ? const Color(0xFFFF007F)
-                              : const Color(0xFF00E5FF))
+                              : widget.accentColor)
                           .withValues(alpha: 0.6),
                       blurRadius: 12,
                       offset: const Offset(0, 2),
@@ -227,11 +232,13 @@ class _ThumbstickBasePainter extends CustomPainter {
   final double maxRadius;
   final double deadzone;
   final bool isDragging;
+  final Color accentColor;
 
   _ThumbstickBasePainter({
     required this.maxRadius,
     required this.deadzone,
     required this.isDragging,
+    required this.accentColor,
   });
 
   @override
@@ -239,7 +246,7 @@ class _ThumbstickBasePainter extends CustomPainter {
     final center = Offset(size.width / 2, size.height / 2);
 
     final linePaint = Paint()
-      ..color = const Color(0xFF00E5FF).withValues(alpha: 0.25)
+      ..color = accentColor.withValues(alpha: 0.25)
       ..strokeWidth = 1.0;
 
     // Crosshairs
@@ -256,7 +263,7 @@ class _ThumbstickBasePainter extends CustomPainter {
 
     // Inner 50% radius guideline
     final midPaint = Paint()
-      ..color = const Color(0xFF00E5FF).withValues(alpha: 0.15)
+      ..color = accentColor.withValues(alpha: 0.15)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.0;
     canvas.drawCircle(center, maxRadius * 0.5, midPaint);
@@ -280,7 +287,7 @@ class _ThumbstickBasePainter extends CustomPainter {
       text: TextSpan(
         text: text,
         style: TextStyle(
-          color: const Color(0xFF00E5FF).withValues(alpha: 0.45),
+          color: accentColor.withValues(alpha: 0.45),
           fontSize: 9,
           fontWeight: FontWeight.bold,
         ),

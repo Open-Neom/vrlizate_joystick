@@ -31,6 +31,8 @@ class RemoteControllerState {
   final double touchY;
   final double turnRate;
   final double pitchRate;
+  final double laserX;
+  final double laserY;
   final bool recenter;
   final double? rangeMeters;
   final RemoteControllerMode mode;
@@ -51,6 +53,8 @@ class RemoteControllerState {
     this.touchY = 0.0,
     this.turnRate = 0.0,
     this.pitchRate = 0.0,
+    this.laserX = 0.0,
+    this.laserY = 0.0,
     this.recenter = false,
     this.rangeMeters,
     this.mode = RemoteControllerMode.joystick,
@@ -61,7 +65,7 @@ class RemoteControllerState {
   @override
   String toString() =>
       'RemoteControllerState(mode: ${mode.name}, stick: ($stickX, $stickY), '
-      'turn: $turnRate, pitch: $pitchRate, recenter: $recenter, range: $rangeMeters, '
+      'turn: $turnRate, pitch: $pitchRate, laser: ($laserX, $laserY), recenter: $recenter, range: $rangeMeters, '
       'btnA: $btnA, btnB: $btnB, trigger: $isTriggerPressed, grip: $btnGrip)';
 }
 
@@ -471,6 +475,12 @@ class VrRemoteControllerService {
               (json['lookPitch'] as num?)?.toDouble() ??
               (json['lookY'] as num?)?.toDouble() ??
               0.0;
+          final double laserX = (json['laserX'] as num?)?.toDouble() ??
+              (json['aimX'] as num?)?.toDouble() ??
+              0.0;
+          final double laserY = (json['laserY'] as num?)?.toDouble() ??
+              (json['aimY'] as num?)?.toDouble() ??
+              0.0;
           final bool recenter = json['recenter'] == true;
           final double? rangeMeters = (json['rangeMeters'] as num?)?.toDouble() ??
               (json['range'] as num?)?.toDouble();
@@ -509,6 +519,8 @@ class VrRemoteControllerService {
             touchY: ty.clamp(-1.0, 1.0),
             turnRate: turnRate.clamp(-1.0, 1.0),
             pitchRate: pitchRate.clamp(-1.0, 1.0),
+            laserX: laserX.clamp(-1.0, 1.0),
+            laserY: laserY.clamp(-1.0, 1.0),
             recenter: recenter,
             rangeMeters: rangeMeters,
             mode: mode,
