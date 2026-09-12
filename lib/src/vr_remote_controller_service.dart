@@ -51,16 +51,23 @@ class RemoteControllerState {
     this.stickY = 0.0,
     this.touchX = 0.0,
     this.touchY = 0.0,
-    this.turnRate = 0.0,
-    this.pitchRate = 0.0,
+    double turnRate = 0.0,
+    double pitchRate = 0.0,
+    double? lookX,
+    double? lookY,
     this.laserX = 0.0,
     this.laserY = 0.0,
     this.recenter = false,
     this.rangeMeters,
     this.mode = RemoteControllerMode.joystick,
     DateTime? timestamp,
-  }) : angularVelocity = angularVelocity ?? vm.Vector3.zero(),
+  }) : turnRate = lookX ?? turnRate,
+       pitchRate = lookY ?? pitchRate,
+       angularVelocity = angularVelocity ?? vm.Vector3.zero(),
        timestamp = timestamp ?? DateTime.now();
+
+  double get lookX => turnRate;
+  double get lookY => pitchRate;
 
   @override
   String toString() =>
