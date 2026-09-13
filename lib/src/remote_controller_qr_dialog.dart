@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -6,29 +8,73 @@ import 'package:vrlizate/vrlizate.dart';
 
 import 'vr_remote_controller_service.dart';
 
-/// Dedicated 2D setup page for a canonical pairing QR (`vrlizate://pair?...`).
+/// A single, non-stereoscopic QR for setting up the second phone.
 ///
-/// QR pairing intentionally leaves the stereoscopic world: a camera cannot
-/// fuse the two eye images and the physical visor obscures the display. The
-/// user removes the visor, scans one unduplicated code, then returns to VR.
+/// The app QR is intended for VRlizate's own scanner: external camera apps do
+/// not consistently open custom URI schemes. This route borrows [service];
+/// closing it leaves the connection and its owning visor running.
 class RemoteControllerQrDialog extends StatefulWidget {
   final VrRemoteControllerService service;
 
-  const RemoteControllerQrDialog({super.key, required this.service});
+  /// Explicit owner notification; embedded widgets never pop a host route.
+  ///
+  /// True means an authenticated controller is connected. False is an explicit
+  /// manual close, regardless of the connection state at that moment.
+  final ValueChanged<bool>? onCompleted;
 
-  static Future<void> show(
+  /// Whether an authenticated connection should complete this setup surface.
+  ///
+  /// Embedded instances default to staying visible. [show] defaults to closing,
+  /// including when the service was already connected when setup was opened.
+  final bool closeOnConnected;
+
+  const RemoteControllerQrDialog({
+    super.key,
+    required this.service,
+    this.onCompleted,
+    this.closeOnConnected = false,
+  });
+
+  /// Opens setup and returns true only for an authenticated connection.
+  ///
+  /// Back/manual dismissal returns false. Only the route created here is
+  /// removed: a later route opened above setup is never popped accidentally.
+  /// Closing setup does not dispose or disconnect the borrowed [service].
+  static Future<bool> show(
     BuildContext context, {
     required VrRemoteControllerService service,
+    bool closeOnConnected = true,
   }) {
-    return Navigator.of(context).push<void>(
-      MaterialPageRoute<void>(
-        fullscreenDialog: true,
-        builder: (_) => Scaffold(
-          backgroundColor: Colors.black,
-          body: SafeArea(child: RemoteControllerQrDialog(service: service)),
+    final navigator = Navigator.of(context);
+    late final MaterialPageRoute<bool> route;
+    var completed = false;
+    void complete(bool connected) {
+      if (completed || !navigator.mounted || !route.isActive) return;
+      completed = true;
+      if (route.isCurrent) {
+        navigator.pop<bool>(connected);
+      } else {
+        navigator.removeRoute<bool>(route, connected);
+      }
+    }
+
+    route = MaterialPageRoute<bool>(
+      fullscreenDialog: true,
+      builder: (_) => Scaffold(
+        backgroundColor: Colors.black,
+        body: SafeArea(
+          child: RemoteControllerQrDialog(
+            service: service,
+            onCompleted: complete,
+            closeOnConnected: closeOnConnected,
+          ),
         ),
       ),
     );
+    return navigator.push<bool>(route).then((connected) {
+      completed = true;
+      return connected ?? false;
+    });
   }
 
   @override
@@ -37,535 +83,364 @@ class RemoteControllerQrDialog extends StatefulWidget {
 }
 
 class _RemoteControllerQrDialogState extends State<RemoteControllerQrDialog> {
-  static const _selectedTransport = VrTransportType.localSocket;
+  static const _accent = Color(0xFF00E5FF);
   StreamSubscription<bool>? _connectionSubscription;
+  Timer? _copyFeedbackTimer;
   bool _webQr = false;
-
-  bool _copiedDeepLink = false;
-  bool _copiedWeb = false;
+  String? _copiedLink;
+  bool _completionScheduled = false;
+  bool _completed = false;
 
   @override
   void initState() {
     super.initState();
+    _listenToConnection();
+  }
+
+  @override
+  void didUpdateWidget(RemoteControllerQrDialog oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.service != widget.service) {
+      _connectionSubscription?.cancel();
+      _listenToConnection();
+    } else if (oldWidget.closeOnConnected != widget.closeOnConnected ||
+        oldWidget.onCompleted != widget.onCompleted) {
+      _completeWhenConnected();
+    }
+  }
+
+  void _listenToConnection() {
     _connectionSubscription = widget.service.onConnectionChanged.listen((_) {
-      if (mounted) setState(() {});
+      if (!mounted) return;
+      setState(() {});
+      _completeWhenConnected();
     });
+    _completeWhenConnected();
+  }
+
+  void _completeWhenConnected() {
+    if (_completed ||
+        _completionScheduled ||
+        !widget.closeOnConnected ||
+        widget.onCompleted == null ||
+        !widget.service.isConnected) {
+      return;
+    }
+    _completionScheduled = true;
+    // Connection delivery can happen during initial build or a route change.
+    // Recheck the current service after the frame; a stale/disconnected service
+    // must not complete a newly configured setup widget.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _completionScheduled = false;
+      if (!mounted || !widget.closeOnConnected || !widget.service.isConnected) {
+        return;
+      }
+      _complete(true);
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  void _complete(bool connected) {
+    final onCompleted = widget.onCompleted;
+    if (_completed || onCompleted == null) return;
+    _completed = true;
+    onCompleted(connected);
   }
 
   @override
   void dispose() {
     _connectionSubscription?.cancel();
+    _copyFeedbackTimer?.cancel();
     super.dispose();
   }
 
-  /// Canonical deep link that activates the Child Controller role on the scanning smartphone.
-  String get _deepLinkUrl {
+  String get _appLink {
     final endpoint = Uri.parse(widget.service.serverUrl!);
-    final payload = VrPairingPayload(
+    return VrPairingPayload(
       host: endpoint.host,
       port: endpoint.port,
       sessionToken: widget.service.sessionToken,
       role: VrDeviceRole.child,
-      transportType: _selectedTransport,
+      transportType: VrTransportType.localSocket,
       deviceName: 'VRlizate-Visor',
-    );
-    return payload.toUri().toString();
+    ).toUri().toString();
   }
 
-  String get _fallbackWebUrl => widget.service.serverUrl!;
+  Future<void> _copyLink(String link) async {
+    await Clipboard.setData(ClipboardData(text: link));
+    if (!mounted) return;
+    _copyFeedbackTimer?.cancel();
+    setState(() => _copiedLink = link);
+    _copyFeedbackTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _copiedLink = null);
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
-    if (widget.service.serverUrl == null) {
+    final webLink = widget.service.serverUrl;
+    if (webLink == null) {
       return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text(
-              'No hay un visor activo. Vuelve al Home e intenta de nuevo.',
-            ),
-            IconButton(
-              tooltip: 'Cerrar',
-              icon: const Icon(Icons.close),
-              onPressed: () => Navigator.of(context).pop(),
-            ),
-          ],
-        ),
-      );
-    }
-    final isConnected = widget.service.isConnected;
-    final deepLink = _deepLinkUrl;
-    final fallbackUrl = _fallbackWebUrl;
-
-    return Align(
-      alignment: Alignment.center,
-      child: Container(
-        constraints: const BoxConstraints(maxWidth: 420),
-        decoration: BoxDecoration(
-          color: const Color(0xFF0D1117),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-            color: const Color(0xFF00E5FF).withValues(alpha: 0.5),
-            width: 1.5,
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: const Color(0xFF00E5FF).withValues(alpha: 0.2),
-              blurRadius: 24,
-              spreadRadius: 2,
-            ),
-          ],
-        ),
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
-        child: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // Header
-              Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF00E5FF).withValues(alpha: 0.15),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: const Icon(
-                      Icons.qr_code_scanner_rounded,
-                      color: Color(0xFF00E5FF),
-                      size: 22,
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  const Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Vincular Mando VR (P2P)',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                            letterSpacing: 0.5,
-                          ),
-                        ),
-                        Text(
-                          'Visor Padre ↔ Smartphone Hijo (Control 3D)',
-                          style: TextStyle(
-                            color: Colors.white60,
-                            fontSize: 10.5,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(
-                      Icons.close_rounded,
-                      color: Colors.white54,
-                      size: 20,
-                    ),
-                    onPressed: () => Navigator.of(context).pop(),
-                    tooltip: 'Cerrar',
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 7,
-                ),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFFFB300).withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(9),
-                  border: Border.all(
-                    color: const Color(0xFFFFB300).withValues(alpha: 0.65),
-                  ),
-                ),
-                child: const Text(
-                  'MODO 2D · RETIRA EL VISOR PARA ESCANEAR',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: Color(0xFFFFD54F),
-                    fontSize: 10.5,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 0.6,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              // Transport Protocol Selector (Socket / Bluetooth / Wi-Fi Direct)
-              Container(
-                padding: const EdgeInsets.all(3),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.05),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: Colors.white12),
-                ),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: _buildTransportTab(
-                        type: VrTransportType.localSocket,
-                        title: 'Socket P2P',
-                        icon: Icons.hub_rounded,
-                      ),
-                    ),
-                    Expanded(
-                      child: _buildTransportTab(
-                        type: VrTransportType.bluetoothLe,
-                        title: 'BLE · pendiente',
-                        icon: Icons.bluetooth_rounded,
-                      ),
-                    ),
-                    Expanded(
-                      child: _buildTransportTab(
-                        type: VrTransportType.wifiDirect,
-                        title: 'Wi-Fi Direct · pendiente',
-                        icon: Icons.wifi_tethering_rounded,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              // Connection Status Indicator
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 5,
-                ),
-                decoration: BoxDecoration(
-                  color: isConnected
-                      ? const Color(0xFF00E676).withValues(alpha: 0.15)
-                      : Colors.white.withValues(alpha: 0.05),
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(
-                    color: isConnected
-                        ? const Color(0xFF00E676)
-                        : Colors.white24,
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.circle,
-                      size: 8,
-                      color: isConnected
-                          ? const Color(0xFF00E676)
-                          : Colors.amberAccent,
-                    ),
-                    const SizedBox(width: 6),
-                    Flexible(
-                      child: Text(
-                        isConnected
-                            ? '🎮 Mando Hijo vinculado y sincronizado'
-                            : 'Escanea el QR para activar Mando Hijo...',
-                        style: TextStyle(
-                          color: isConnected
-                              ? const Color(0xFF00E676)
-                              : Colors.white70,
-                          fontSize: 10.5,
-                          fontWeight: FontWeight.w600,
-                        ),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              // QR Code Box (Encodes the Canonical Deep Link vrlizate://pair?...)
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(14),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.4),
-                      blurRadius: 10,
-                    ),
-                  ],
-                ),
-                child: QrImageView(
-                  data: _webQr ? fallbackUrl : deepLink,
-                  semanticsLabel: _webQr ? 'QR para navegador' : 'QR para app VRlizate',
-                  version: QrVersions.auto,
-                  size: 160,
-                  backgroundColor: Colors.white,
-                  eyeStyle: const QrEyeStyle(
-                    eyeShape: QrEyeShape.square,
-                    color: Color(0xFF0D1117),
-                  ),
-                  dataModuleStyle: const QrDataModuleStyle(
-                    dataModuleShape: QrDataModuleShape.square,
-                    color: Color(0xFF0D1117),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              // Deep Link Pill with Copy Action
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 6,
-                ),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF00E5FF).withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: const Color(0xFF00E5FF).withValues(alpha: 0.3),
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(
-                      Icons.link_rounded,
-                      size: 15,
-                      color: Color(0xFF00E5FF),
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text(
-                            'Deep Link VRlizate (Apertura Automática):',
-                            style: TextStyle(
-                              color: Colors.white60,
-                              fontSize: 9,
-                              fontWeight: FontWeight.w500,
-                            ),
-                          ),
-                          Text(
-                            deepLink,
-                            style: const TextStyle(
-                              color: Color(0xFF00E5FF),
-                              fontFamily: 'monospace',
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.w600,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ],
-                      ),
-                    ),
-                    InkWell(
-                      borderRadius: BorderRadius.circular(6),
-                      onTap: () {
-                        Clipboard.setData(ClipboardData(text: deepLink));
-                        setState(() => _copiedDeepLink = true);
-                        Future.delayed(const Duration(seconds: 2), () {
-                          if (mounted) setState(() => _copiedDeepLink = false);
-                        });
-                      },
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        child: Text(
-                          _copiedDeepLink ? '¡Copiado!' : 'Copiar',
-                          style: TextStyle(
-                            color: _copiedDeepLink
-                                ? const Color(0xFF00E676)
-                                : Colors.white70,
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 6),
-
-              // Fallback Web Link Pill
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 5,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.04),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.white12),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(
-                      Icons.language_rounded,
-                      size: 13,
-                      color: Colors.white54,
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        'Web Fallback: $fallbackUrl',
-                        style: const TextStyle(
-                          color: Colors.white60,
-                          fontFamily: 'monospace',
-                          fontSize: 10,
-                        ),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    InkWell(
-                      borderRadius: BorderRadius.circular(6),
-                      onTap: () {
-                        Clipboard.setData(ClipboardData(text: fallbackUrl));
-                        setState(() => _copiedWeb = true);
-                        Future.delayed(const Duration(seconds: 2), () {
-                          if (mounted) setState(() => _copiedWeb = false);
-                        });
-                      },
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        child: Text(
-                          _copiedWeb ? '¡Copiado!' : 'Copiar',
-                          style: TextStyle(
-                            color: _copiedWeb
-                                ? const Color(0xFF00E676)
-                                : Colors.white54,
-                            fontSize: 9.5,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 10),
-
-              // 3-Step Quick Instructions
               Text(
-                '1. Conecta ambos teléfonos a la misma red Wi-Fi.\n'
-                '2. Escanea el QR con el segundo teléfono.\n'
-                '${_webQr ? '3. Abre el enlace en el navegador.' : '3. Abre VRlizate instalada en el segundo teléfono.'}',
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 10.5,
-                  height: 1.35,
-                ),
+                widget.service.isRunning
+                    ? 'Conecta este visor a Wi-Fi o activa un punto de acceso '
+                          'y vuelve a abrir el QR. Los datos móviles no sirven '
+                          'para emparejar los dos teléfonos en una red local.'
+                    : 'No hay un visor activo. Vuelve al Home e intenta de nuevo.',
                 textAlign: TextAlign.center,
               ),
-              const SizedBox(height: 14),
-
-              // Bottom Buttons
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: const Color(0xFFFF007F),
-                        side: const BorderSide(color: Color(0xFFFF007F)),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        padding: const EdgeInsets.symmetric(vertical: 8),
-                      ),
-                      icon: const Icon(Icons.swap_horiz_rounded, size: 15),
-                      label: Text(
-                        _webQr ? 'Usar app nativa' : 'Usar navegador',
-                        style: const TextStyle(
-                          fontSize: 10.5,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                      onPressed: () => setState(() => _webQr = !_webQr),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: ElevatedButton(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF00E5FF),
-                        foregroundColor: Colors.black,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        padding: const EdgeInsets.symmetric(vertical: 8),
-                      ),
-                      onPressed: () => Navigator.of(context).pop(),
-                      child: const Text(
-                        'Listo',
-                        style: TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
+              TextButton(
+                onPressed: widget.onCompleted == null
+                    ? null
+                    : () => _complete(false),
+                child: const Text('Cerrar'),
               ),
             ],
           ),
         ),
+      );
+    }
+    final appLink = _appLink;
+    final connected = widget.service.isConnected;
+
+    return Padding(
+      padding: const EdgeInsets.all(12),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final wide = constraints.maxWidth >= 560;
+          final qrSize = wide
+              ? (constraints.maxHeight - 140).clamp(200.0, 280.0)
+              : math.min(280.0, math.max(160.0, constraints.maxWidth - 40));
+          final qr = Center(
+            child: QrImageView(
+              key: ValueKey(_webQr ? webLink : appLink),
+              data: _webQr ? webLink : appLink,
+              version: QrVersions.auto,
+              size: qrSize,
+              padding: const EdgeInsets.all(20),
+              backgroundColor: Colors.white,
+              semanticsLabel: _webQr
+                  ? 'QR para navegador'
+                  : 'QR para app VRlizate',
+            ),
+          );
+          final instructions = _instructions(appLink, webLink, connected);
+
+          return Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 940),
+              child: Material(
+                color: const Color(0xFF0D1117),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                  side: BorderSide(color: _accent.withValues(alpha: 0.45)),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 4, 4, 0),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.phonelink, color: _accent),
+                          const SizedBox(width: 10),
+                          const Expanded(
+                            child: Text(
+                              'Conectar otro teléfono',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'Cerrar',
+                            icon: const Icon(
+                              Icons.close,
+                              color: Colors.white70,
+                            ),
+                            onPressed: widget.onCompleted == null
+                                ? null
+                                : () => _complete(false),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Flexible(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                        child: wide
+                            ? Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  SizedBox(width: qrSize, child: qr),
+                                  const SizedBox(width: 24),
+                                  Expanded(child: instructions),
+                                ],
+                              )
+                            : Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  qr,
+                                  const SizedBox(height: 16),
+                                  instructions,
+                                ],
+                              ),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+                      child: SizedBox(
+                        width: double.infinity,
+                        child: FilledButton.icon(
+                          onPressed: widget.onCompleted == null
+                              ? null
+                              : () => _complete(false),
+                          icon: Icon(
+                            connected ? Icons.check_circle : Icons.arrow_back,
+                          ),
+                          label: Text(
+                            connected
+                                ? 'Continuar al visor'
+                                : 'Volver al visor',
+                          ),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: connected
+                                ? _accent
+                                : Colors.white12,
+                            foregroundColor: connected
+                                ? Colors.black
+                                : Colors.white,
+                            minimumSize: const Size(48, 48),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
       ),
     );
   }
 
-  Widget _buildTransportTab({
-    required VrTransportType type,
-    required String title,
-    required IconData icon,
-  }) {
-    final isSelected = _selectedTransport == type;
-    return GestureDetector(
-      onTap: null,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 150),
-        padding: const EdgeInsets.symmetric(vertical: 6),
-        decoration: BoxDecoration(
-          color: isSelected
-              ? const Color(0xFF00E5FF).withValues(alpha: 0.2)
-              : Colors.transparent,
-          borderRadius: BorderRadius.circular(8),
-          border: isSelected
-              ? Border.all(color: const Color(0xFF00E5FF), width: 1)
-              : Border.all(color: Colors.transparent, width: 1),
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              icon,
-              size: 12,
-              color: isSelected ? const Color(0xFF00E5FF) : Colors.white60,
+  Widget _instructions(String appLink, String webLink, bool connected) {
+    return DefaultTextStyle(
+      style: const TextStyle(color: Colors.white70, fontSize: 14, height: 1.35),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              ChoiceChip(
+                label: const Text('Mando con app'),
+                selected: !_webQr,
+                onSelected: (_) => setState(() => _webQr = false),
+              ),
+              ChoiceChip(
+                label: const Text('Sin instalar app'),
+                selected: _webQr,
+                onSelected: (_) => setState(() => _webQr = true),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            connected ? 'Mando conectado' : 'En el teléfono que será el mando:',
+            style: TextStyle(
+              color: connected ? _accent : Colors.white,
+              fontWeight: FontWeight.bold,
+              fontSize: 16,
             ),
-            const SizedBox(width: 4),
-            Flexible(
-              child: Text(
-                title,
-                style: TextStyle(
-                  color: isSelected ? const Color(0xFF00E5FF) : Colors.white60,
-                  fontSize: 9.5,
-                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                ),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 8),
+          if (connected)
+            const Text('Ya puedes colocar este teléfono en el visor.')
+          else ...[
+            const Text('Conecta ambos teléfonos a la misma red Wi-Fi.'),
+            const SizedBox(height: 8),
+            Text(
+              _webQr
+                  ? 'Escanea este QR con la cámara del teléfono y abre el enlace en su navegador.'
+                  : 'Abre VRlizate > Usar como mando > Escanear QR',
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w600,
               ),
             ),
+            const SizedBox(height: 8),
+            Text(
+              _webQr
+                  ? 'Control táctil en el navegador; no requiere sensores.'
+                  : 'Apunta a este código con el escáner de VRlizate, no con la cámara del sistema.',
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Retira este teléfono del visor para mostrar el QR.',
+              style: TextStyle(color: Color(0xFFFFD54F), fontSize: 12),
+            ),
           ],
-        ),
+          const SizedBox(height: 8),
+          Theme(
+            data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+            child: ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              childrenPadding: EdgeInsets.zero,
+              iconColor: Colors.white70,
+              collapsedIconColor: Colors.white70,
+              textColor: Colors.white70,
+              collapsedTextColor: Colors.white70,
+              title: const Text(
+                'Opciones avanzadas',
+                style: TextStyle(fontSize: 13),
+              ),
+              children: [
+                const Text(
+                  'Estos enlaces permiten controlar el visor. Compártelos sólo con personas de confianza.',
+                  style: TextStyle(color: Colors.white60, fontSize: 12),
+                ),
+                _linkOption('Enlace para VRlizate', appLink),
+                _linkOption('Enlace para navegador', webLink),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _linkOption(String label, String link) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label, style: const TextStyle(color: _accent, fontSize: 12)),
+          const SizedBox(height: 4),
+          SelectableText(
+            link,
+            style: const TextStyle(color: Colors.white60, fontSize: 12),
+          ),
+          TextButton.icon(
+            onPressed: () => _copyLink(link),
+            icon: Icon(
+              _copiedLink == link ? Icons.check : Icons.copy,
+              size: 16,
+            ),
+            label: Text(_copiedLink == link ? 'Copiado' : 'Copiar $label'),
+          ),
+        ],
       ),
     );
   }

@@ -2,4 +2,5 @@
 .packages
 build/
 pubspec.lock
+pubspec_overrides.yaml
 .DS_Store

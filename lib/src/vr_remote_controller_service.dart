@@ -12,8 +12,14 @@ import 'package:vrlizate/vrlizate.dart'
         VrRemotePoseFrame,
         VrRemotePosePredictor;
 
-/// Controller operation mode.
-enum RemoteControllerMode { joystick, laser }
+import 'vr_controller_mode.dart';
+import 'vr_controller_mode_protocol.dart';
+import 'vr_local_network_address.dart';
+import 'vr_controller_link.dart';
+
+export 'vr_controller_mode.dart';
+
+enum _ControllerWireFormat { json, binaryPose }
 
 /// Orientation, analog thumbstick and button state emitted by the remote smartphone controller.
 class RemoteControllerState {
@@ -37,7 +43,29 @@ class RemoteControllerState {
   final double pitchRate;
   final double laserX;
   final double laserY;
+
+  /// True only while a finger owns the head-relative touch aiming pad.
+  final bool laserSlideActive;
   final bool recenter;
+
+  /// Desired visibility of the viewer's controller feedback, not a toggle edge.
+  /// Defaults visible for older clients. Safety releases preserve this setting;
+  /// a new connection starts visible until its first complete JSON snapshot.
+  final bool controllerVisible;
+
+  /// Driving-only controls; positive steering turns right. Legacy defaults 0.
+  final double steering;
+  final double throttle;
+  final double brake;
+  final bool drivingPaused;
+
+  /// Reports recent valid gyro samples, not whether the user chose gyro input.
+  /// Legacy clients and released/timed-out states report false.
+  final bool motionAvailable;
+
+  /// Receiver-generated safety release (timeout, disconnect or replacement).
+  /// Never accepted from the wire; hosts should require fresh neutral input.
+  final bool isNeutralized;
   final double? rangeMeters;
   final RemoteControllerMode mode;
   final DateTime timestamp;
@@ -65,7 +93,15 @@ class RemoteControllerState {
     double? lookY,
     this.laserX = 0.0,
     this.laserY = 0.0,
+    this.laserSlideActive = false,
     this.recenter = false,
+    this.controllerVisible = true,
+    this.steering = 0,
+    this.throttle = 0,
+    this.brake = 0,
+    this.drivingPaused = false,
+    this.motionAvailable = false,
+    this.isNeutralized = false,
     this.rangeMeters,
     this.mode = RemoteControllerMode.joystick,
     DateTime? timestamp,
@@ -80,11 +116,11 @@ class RemoteControllerState {
   @override
   String toString() =>
       'RemoteControllerState(mode: ${mode.name}, stick: ($stickX, $stickY), '
-      'turn: $turnRate, pitch: $pitchRate, laser: ($laserX, $laserY), recenter: $recenter, range: $rangeMeters, '
+      'turn: $turnRate, pitch: $pitchRate, laser: ($laserX, $laserY), slide: $laserSlideActive, recenter: $recenter, range: $rangeMeters, '
       'btnA: $btnA, btnB: $btnB, btnX: $btnX, btnY: $btnY, btnL: $btnL, btnR: $btnR, trigger: $isTriggerPressed, grip: $btnGrip)';
 }
 
-/// Server running inside VRlizate that turns any 2nd smartphone into a full VR Gamepad / 3DoF Controller.
+/// Server for a compatible secondary smartphone's touch or 3DoF controller.
 ///
 /// Features:
 /// 1. Hosts a local high-speed WebSocket & Web Controller portal on port 8080.
@@ -108,18 +144,29 @@ class VrRemoteControllerService {
   RawDatagramSocket? _beaconSocket;
   Timer? _beaconTimer;
   Timer? _inputWatchdog;
-  WebSocket? _client;
+  VrControllerLink? _client;
+  StreamSubscription<Object?>? _clientSubscription;
   final Stopwatch _clock = Stopwatch()..start();
   Future<bool>? _startOperation;
   bool _isRunning = false;
   bool _disposed = false;
   int _lifecycleGeneration = 0;
   String? _localIp;
+  int _addressRefreshGeneration = 0;
+  final Future<Iterable<VrLocalAddressCandidate>> Function()
+  _localAddressCandidates;
   int _fallbackSequence = 0;
   int? _lastSequence;
+  _ControllerWireFormat? _wireFormat;
   int? _lastStateReceivedUs;
   int _rateWindowStartUs = 0;
   int _rateWindowCount = 0;
+  VrControllerModeRequest _modeRequest = const VrControllerModeRequest(
+    mode: RemoteControllerMode.joystick,
+    revision: 0,
+  );
+  int? _acceptedModeRevision;
+  bool _modeControlSupported = false;
 
   static const int _maxMessageCharacters = 4096;
   static const int _maxMessagesPerSecond = 240;
@@ -128,7 +175,12 @@ class VrRemoteControllerService {
     this.inputTimeout = const Duration(milliseconds: 500),
     this.watchdogInterval = const Duration(milliseconds: 100),
     String? sessionToken,
-  }) : sessionToken = sessionToken ?? _createSessionToken() {
+    @visibleForTesting
+    Future<Iterable<VrLocalAddressCandidate>> Function()?
+    localAddressCandidates,
+  }) : sessionToken = sessionToken ?? _createSessionToken(),
+       _localAddressCandidates =
+           localAddressCandidates ?? _systemLocalAddressCandidates {
     if (inputTimeout <= Duration.zero || watchdogInterval <= Duration.zero) {
       throw ArgumentError(
         'Input timeout and watchdog interval must be positive.',
@@ -179,6 +231,38 @@ class VrRemoteControllerService {
   String? get localIp => _localIp;
   RemoteControllerState get latestState => _latestState;
 
+  RemoteControllerMode get recommendedMode => _modeRequest.mode;
+
+  /// Requests a controller layout for the active app. Reconnecting receives
+  /// the current recommendation again. Older clients may ignore this message;
+  /// modern clients acknowledge a neutral full state before controls resume.
+  void requestControllerMode(RemoteControllerMode mode) {
+    if (mode == RemoteControllerMode.laser) {
+      throw ArgumentError.value(
+        mode,
+        'mode',
+        'Use joystick with its aiming pad.',
+      );
+    }
+    if (_disposed || mode == _modeRequest.mode) return;
+    _modeRequest = VrControllerModeRequest(
+      mode: mode,
+      revision: _modeRequest.revision + 1,
+    );
+    _releaseInputs();
+    _sendControllerMode();
+  }
+
+  void _sendControllerMode() {
+    final client = _client;
+    if (client == null || _disposed) return;
+    try {
+      client.add(jsonEncode(_modeRequest.toJson()));
+    } catch (_) {
+      _disconnectClient(client);
+    }
+  }
+
   /// Writes the latest latency-compensated controller pose into [out].
   ///
   /// Native controllers provide angular velocity for prediction. Browser
@@ -207,23 +291,8 @@ class VrRemoteControllerService {
 
   Future<bool> _startServer(int port, int generation) async {
     try {
-      // Find local Wi-Fi IP address
-      final interfaces = await NetworkInterface.list(
-        type: InternetAddressType.IPv4,
-        includeLinkLocal: false,
-      );
-
-      for (final iface in interfaces) {
-        for (final addr in iface.addresses) {
-          if (!addr.isLoopback) {
-            _localIp = addr.address;
-            break;
-          }
-        }
-        if (_localIp != null) break;
-      }
-
-      _localIp ??= '127.0.0.1';
+      await refreshLocalAddress();
+      if (_disposed || generation != _lifecycleGeneration) return false;
 
       final server = await HttpServer.bind(InternetAddress.anyIPv4, port);
       if (_disposed || generation != _lifecycleGeneration) {
@@ -233,19 +302,12 @@ class VrRemoteControllerService {
       _server = server;
       _isRunning = true;
       debugPrint(
-        '[VrRemoteControllerService] Server started on $_localIp:${server.port}',
+        '[VrRemoteControllerService] Server started on '
+        '${_localIp ?? "no suitable LAN address"}:${server.port}',
       );
 
       server.listen(_handleHttpRequest);
-      _inputWatchdog = Timer.periodic(watchdogInterval, (_) {
-        final received = _lastStateReceivedUs;
-        if (received != null &&
-            _clock.elapsedMicroseconds - received >=
-                inputTimeout.inMicroseconds) {
-          _lastStateReceivedUs = null;
-          _releaseInputs();
-        }
-      });
+      _ensureInputWatchdog();
 
       // Start UDP auto-discovery beacon
       _startUdpBeacon(server.port, generation);
@@ -255,6 +317,45 @@ class VrRemoteControllerService {
       debugPrint('[VrRemoteControllerService] Start error: $e');
       return false;
     }
+  }
+
+  /// Refreshes the address advertised by QR/UDP without replacing the server,
+  /// session token or connected controller. Call before showing a fresh QR.
+  ///
+  /// Returns whether a suitable local address was found. On failure [localIp]
+  /// and [serverUrl] become null: never advertise loopback, cellular or VPN as
+  /// a phone-to-phone destination. A running socket can remain available while
+  /// Wi-Fi reconnects; this method does not restart it or claim reachability.
+  Future<bool> refreshLocalAddress() async {
+    if (_disposed) return false;
+    final lifecycle = _lifecycleGeneration;
+    final refresh = ++_addressRefreshGeneration;
+    String? selected;
+    try {
+      selected = VrLocalNetworkAddress.select(await _localAddressCandidates());
+    } catch (_) {
+      // Fail closed; retaining an old address would generate a misleading QR.
+    }
+    if (_disposed ||
+        lifecycle != _lifecycleGeneration ||
+        refresh != _addressRefreshGeneration) {
+      return false;
+    }
+    _localIp = selected;
+    return selected != null;
+  }
+
+  static Future<Iterable<VrLocalAddressCandidate>>
+  _systemLocalAddressCandidates() async {
+    final interfaces = await NetworkInterface.list(
+      type: InternetAddressType.IPv4,
+      includeLinkLocal: false,
+    );
+    return [
+      for (final interface in interfaces)
+        for (final address in interface.addresses)
+          VrLocalAddressCandidate(interface.name, address.address),
+    ];
   }
 
   Future<void> _handleHttpRequest(HttpRequest request) async {
@@ -274,7 +375,11 @@ class VrRemoteControllerService {
           await socket.close(WebSocketStatus.goingAway);
           return;
         }
-        _handleWebSocket(socket);
+        socket.pingInterval = const Duration(seconds: 3);
+        final link = VrWebSocketControllerLink(socket);
+        if (!attachControllerLink(link, sessionToken: tokens.single)) {
+          await link.close(WebSocketStatus.goingAway);
+        }
       } else {
         _serveWebController(request);
       }
@@ -331,28 +436,81 @@ class VrRemoteControllerService {
     }
   }
 
-  void _handleWebSocket(WebSocket socket) {
+  /// Attaches a connected duplex channel using this visor's pairing secret.
+  ///
+  /// Returns false without taking ownership when authentication fails, the
+  /// link is closed, or this service is disposed. On true the service owns the
+  /// link, replacing/closing the previous controller. Reattaching the same link
+  /// is idempotent. HTTP startup is not required for BLE/external transports.
+  /// The link feeds the same validated protocol, watchdog and mode handshake
+  /// as WebSocket. The external provider still owns secure peer negotiation.
+  bool attachControllerLink(
+    VrControllerLink link, {
+    required String sessionToken,
+  }) {
+    if (_disposed || !link.isOpen || !_matchesToken(sessionToken)) return false;
+    if (identical(link, _client)) return true;
+    _handleControllerLink(link);
+    return true;
+  }
+
+  void _ensureInputWatchdog() {
+    _inputWatchdog ??= Timer.periodic(watchdogInterval, (_) {
+      final received = _lastStateReceivedUs;
+      if (received != null &&
+          _clock.elapsedMicroseconds - received >=
+              inputTimeout.inMicroseconds) {
+        _lastStateReceivedUs = null;
+        _releaseInputs();
+      }
+    });
+  }
+
+  static Future<void> _closeLink(
+    VrControllerLink link, [
+    int? code,
+    String? reason,
+  ]) async {
+    try {
+      await link.close(code, reason);
+    } catch (_) {
+      // Transport teardown errors must not revive or poison another session.
+    }
+  }
+
+  void _handleControllerLink(VrControllerLink socket) {
     // One controller owns the input state. A reconnect replaces it atomically;
     // late onDone/onError callbacks from the old socket cannot clear the new one.
     final previous = _client;
+    _clientSubscription?.cancel();
+    _clientSubscription = null;
     _client = socket;
+    _ensureInputWatchdog();
     _lastSequence = null;
+    _wireFormat = null;
     _fallbackSequence = 0;
     _lastStateReceivedUs = null;
     _rateWindowStartUs = _clock.elapsedMicroseconds;
     _rateWindowCount = 0;
-    _releaseInputs();
+    _acceptedModeRevision = null;
+    _modeControlSupported = false;
+    _releaseInputs(controllerVisible: true);
     if (previous == null) _connectionController.add(true);
-    unawaited(
-      previous?.close(WebSocketStatus.normalClosure, 'Replaced by controller'),
-    );
-    socket.pingInterval = const Duration(seconds: 3);
+    if (previous != null) {
+      unawaited(
+        _closeLink(
+          previous,
+          WebSocketStatus.normalClosure,
+          'Replaced by controller',
+        ),
+      );
+    }
     HapticFeedback.mediumImpact();
     debugPrint(
       '[VrRemoteControllerService] 2nd Smartphone controller connected!',
     );
 
-    socket.listen(
+    _clientSubscription = socket.messages.listen(
       (data) {
         if (!identical(socket, _client) || _disposed) return;
         final now = _clock.elapsedMicroseconds;
@@ -363,29 +521,31 @@ class VrRemoteControllerService {
         final bool isBinary =
             data is List<int> && VrRemoteBinaryCodec.isBinaryPacket(data);
         if (++_rateWindowCount > _maxMessagesPerSecond ||
-            (!isBinary &&
-                (data is! String || data.length > _maxMessageCharacters))) {
-          _disconnectClient(socket);
-          unawaited(
-            socket.close(
-              WebSocketStatus.policyViolation,
-              'Input limit exceeded',
-            ),
+            (isBinary
+                ? data.length > VrRemoteBinaryCodec.posePacketLength
+                : (data is! String || data.length > _maxMessageCharacters))) {
+          _disconnectClient(
+            socket,
+            closeCode: WebSocketStatus.policyViolation,
+            closeReason: 'Input limit exceeded',
           );
           return;
         }
         if (isBinary) {
+          if (_wireFormat == _ControllerWireFormat.json) return;
           try {
-            final bytes =
-                data is Uint8List ? data : Uint8List.fromList(data);
+            final bytes = data is Uint8List ? data : Uint8List.fromList(data);
             final pose = const VrRemoteBinaryCodec().decodePose(bytes);
-            if (_lastSequence != null && pose.sequence <= _lastSequence!) {
-              return;
+            if (_lastSequence != null) {
+              // Serial-number arithmetic: duplicates, stale frames and the
+              // ambiguous half-range are rejected, including around 65535→0.
+              final advance = (pose.sequence - _lastSequence!) & 0xFFFF;
+              if (advance == 0 || advance >= 0x8000) return;
             }
             final buttons = pose.buttonsBitset;
             final bool trigger = (buttons & 0x0001) != 0;
             final bool action = (buttons & 0x0002) != 0;
-            final bool btnA = (buttons & 0x0004) != 0 || trigger;
+            final bool btnA = (buttons & 0x0004) != 0;
             final bool btnB = (buttons & 0x0008) != 0 || action;
             final bool btnGrip = (buttons & 0x0010) != 0;
             final bool stickClick = (buttons & 0x0020) != 0;
@@ -402,12 +562,13 @@ class VrRemoteControllerService {
             _posePredictor.pushFrame(pose);
             _posePredictor.predictTo(_predictedOrientation);
             _lastSequence = pose.sequence;
+            _wireFormat = _ControllerWireFormat.binaryPose;
             _lastStateReceivedUs = now;
 
             _latestState = RemoteControllerState(
               orientation: _predictedOrientation.clone(),
               angularVelocity: pose.angularVelocity,
-              isTriggerPressed: trigger || btnA,
+              isTriggerPressed: trigger,
               isActionPressed: action || btnB,
               btnA: btnA,
               btnB: btnB,
@@ -425,6 +586,7 @@ class VrRemoteControllerService {
           } catch (_) {}
           return;
         }
+        if (_wireFormat == _ControllerWireFormat.binaryPose) return;
         try {
           final decoded = jsonDecode(data as String);
           if (decoded is! Map<String, dynamic>) return;
@@ -435,6 +597,16 @@ class VrRemoteControllerService {
             return;
           }
           final timestampUs = _optionalCounter(json, 'timestampUs');
+          for (final key in const [
+            'laserSlideActive',
+            'drivingPaused',
+            'motionAvailable',
+            'controllerVisible',
+          ]) {
+            if (json.containsKey(key) && json[key] is! bool) {
+              throw FormatException('$key must be a boolean.');
+            }
+          }
           for (final key in const [
             'qx',
             'qy',
@@ -447,6 +619,19 @@ class VrRemoteControllerService {
             'stickY',
             'tx',
             'ty',
+            'turn',
+            'turnRate',
+            'lookX',
+            'pitchRate',
+            'lookPitch',
+            'lookY',
+            'laserX',
+            'laserY',
+            'aimX',
+            'aimY',
+            'steering',
+            'throttle',
+            'brake',
           ]) {
             final value = json[key];
             if (value != null && (value is! num || !value.isFinite)) {
@@ -473,7 +658,7 @@ class VrRemoteControllerService {
 
           final bool trigger = json['trigger'] == true;
           final bool action = json['action'] == true;
-          final bool btnA = json['btnA'] == true || trigger;
+          final bool btnA = json['btnA'] == true;
           final bool btnB = json['btnB'] == true || action;
           final bool btnX = json['btnX'] == true;
           final bool btnY = json['btnY'] == true;
@@ -486,28 +671,43 @@ class VrRemoteControllerService {
           final double stickY = (json['stickY'] as num?)?.toDouble() ?? 0.0;
           final double tx = (json['tx'] as num?)?.toDouble() ?? stickX;
           final double ty = (json['ty'] as num?)?.toDouble() ?? stickY;
-          final double turnRate = (json['turn'] as num?)?.toDouble() ??
+          final double turnRate =
+              (json['turn'] as num?)?.toDouble() ??
               (json['turnRate'] as num?)?.toDouble() ??
               (json['lookX'] as num?)?.toDouble() ??
               0.0;
-          final double pitchRate = (json['pitchRate'] as num?)?.toDouble() ??
+          final double pitchRate =
+              (json['pitchRate'] as num?)?.toDouble() ??
               (json['lookPitch'] as num?)?.toDouble() ??
               (json['lookY'] as num?)?.toDouble() ??
               0.0;
-          final double laserX = (json['laserX'] as num?)?.toDouble() ??
+          final double laserX =
+              (json['laserX'] as num?)?.toDouble() ??
               (json['aimX'] as num?)?.toDouble() ??
               0.0;
-          final double laserY = (json['laserY'] as num?)?.toDouble() ??
+          final double laserY =
+              (json['laserY'] as num?)?.toDouble() ??
               (json['aimY'] as num?)?.toDouble() ??
               0.0;
           final bool recenter = json['recenter'] == true;
-          final double? rangeMeters = (json['rangeMeters'] as num?)?.toDouble() ??
+          final double? rangeMeters =
+              (json['rangeMeters'] as num?)?.toDouble() ??
               (json['range'] as num?)?.toDouble();
 
           final String modeStr = json['mode'] as String? ?? 'joystick';
-          final mode = modeStr == 'laser'
-              ? RemoteControllerMode.laser
-              : RemoteControllerMode.joystick;
+          final mode = switch (modeStr) {
+            'laser' => RemoteControllerMode.laser,
+            'driving' => RemoteControllerMode.driving,
+            _ => RemoteControllerMode.joystick,
+          };
+          final drivingPaused = json['drivingPaused'] == true;
+          final hostModeRevision = _optionalCounter(json, 'hostModeRevision');
+          if (!_acceptsModeState(json, hostModeRevision, mode)) return;
+          final drivingActive =
+              mode == RemoteControllerMode.driving && !drivingPaused;
+          double drivingAxis(String key, double min) => drivingActive
+              ? ((json[key] as num?)?.toDouble() ?? 0).clamp(min, 1.0)
+              : 0;
 
           final pose = VrRemotePoseFrame(
             sequence: sequence ?? _fallbackSequence++,
@@ -521,12 +721,17 @@ class VrRemoteControllerService {
           _posePredictor.pushFrame(pose);
           _posePredictor.predictTo(_predictedOrientation);
           _lastSequence = sequence ?? _lastSequence;
+          _wireFormat = _ControllerWireFormat.json;
           _lastStateReceivedUs = now;
+          if (hostModeRevision != null) {
+            _modeControlSupported = true;
+            _acceptedModeRevision = hostModeRevision;
+          }
 
           _latestState = RemoteControllerState(
             orientation: _predictedOrientation.clone(),
             angularVelocity: angularVelocity,
-            isTriggerPressed: trigger || btnA || btnL || btnR,
+            isTriggerPressed: trigger || btnR,
             isActionPressed: action || btnB,
             btnA: btnA,
             btnB: btnB,
@@ -544,7 +749,14 @@ class VrRemoteControllerService {
             pitchRate: pitchRate.clamp(-1.0, 1.0),
             laserX: laserX.clamp(-1.0, 1.0),
             laserY: laserY.clamp(-1.0, 1.0),
+            laserSlideActive: json['laserSlideActive'] == true,
             recenter: recenter,
+            controllerVisible: json['controllerVisible'] as bool? ?? true,
+            steering: drivingAxis('steering', -1),
+            throttle: drivingAxis('throttle', 0),
+            brake: drivingAxis('brake', 0),
+            drivingPaused: drivingPaused,
+            motionAvailable: json['motionAvailable'] == true,
             rangeMeters: rangeMeters,
             mode: mode,
           );
@@ -556,6 +768,60 @@ class VrRemoteControllerService {
       onError: (_) => _disconnectClient(socket),
       cancelOnError: true,
     );
+    _sendControllerMode();
+  }
+
+  bool _acceptsModeState(
+    Map<String, dynamic> json,
+    int? revision,
+    RemoteControllerMode mode,
+  ) {
+    // Legacy controller states retain compatibility until this socket opts in.
+    if (revision == null) return !_modeControlSupported;
+    if (revision != _modeRequest.revision) return false;
+    if (_acceptedModeRevision == revision) return true;
+    if (mode != _modeRequest.mode) return false;
+    if (mode == RemoteControllerMode.driving && json['drivingPaused'] != true) {
+      return false;
+    }
+    for (final key in const [
+      'trigger',
+      'action',
+      'btnA',
+      'btnB',
+      'btnX',
+      'btnY',
+      'btnL',
+      'btnR',
+      'btnGrip',
+      'stickClick',
+      'laserSlideActive',
+      'recenter',
+    ]) {
+      if (json[key] == true) return false;
+    }
+    for (final key in const [
+      'stickX',
+      'stickY',
+      'tx',
+      'ty',
+      'turn',
+      'turnRate',
+      'lookX',
+      'pitchRate',
+      'lookPitch',
+      'lookY',
+      'laserX',
+      'laserY',
+      'aimX',
+      'aimY',
+      'steering',
+      'throttle',
+      'brake',
+    ]) {
+      if (json[key] != null && json[key] != 0) return false;
+    }
+    return true;
   }
 
   static int? _optionalCounter(Map<String, dynamic> json, String key) {
@@ -565,19 +831,29 @@ class VrRemoteControllerService {
     return value;
   }
 
-  void _disconnectClient(WebSocket socket) {
+  void _disconnectClient(
+    VrControllerLink socket, {
+    int? closeCode,
+    String? closeReason,
+  }) {
     if (!identical(socket, _client)) return;
     _client = null;
+    _clientSubscription?.cancel();
+    _clientSubscription = null;
+    unawaited(_closeLink(socket, closeCode, closeReason));
     _lastStateReceivedUs = null;
     _releaseInputs();
     if (!_disposed) _connectionController.add(false);
   }
 
-  void _releaseInputs() {
+  void _releaseInputs({bool? controllerVisible}) {
     _posePredictor.reset();
     _latestState = RemoteControllerState(
       orientation: _latestState.orientation.clone(),
       mode: _latestState.mode,
+      drivingPaused: _latestState.mode == RemoteControllerMode.driving,
+      isNeutralized: true,
+      controllerVisible: controllerVisible ?? _latestState.controllerVisible,
     );
     if (!_disposed) _stateController.add(_latestState);
   }
@@ -695,12 +971,13 @@ class VrRemoteControllerService {
 <body>
   <div class="header">
     <div class="title">🎮 VRLIZATE MANDO</div>
+    <button id="feedbackToggle" class="tab" aria-pressed="true">Ocultar mando en visor</button>
     <div id="status" class="status">⚡ Conectando...</div>
   </div>
 
   <div class="tabs">
     <div id="tabJoy" class="tab active" onclick="setMode('joystick')">🕹️ JOYSTICK ANALÓGICO</div>
-    <div id="tabLaser" class="tab" onclick="setMode('laser')">🎯 PUNTERO LÁSER 3D</div>
+    <div id="modeHint" class="tab">La app activa el volante</div>
   </div>
 
   <div class="main-area">
@@ -711,9 +988,14 @@ class VrRemoteControllerService {
 
     <!-- Buttons right side -->
     <div class="btn-cluster">
-      <button id="btnA" class="game-btn btn-a">A · GATILLO</button>
+      <button id="btnA" class="game-btn btn-a">A · ELEGIR / OK</button>
       <button id="btnB" class="game-btn btn-b">B · ATRÁS / HOME</button>
       <button id="btnGrip" class="game-btn btn-grip">AGARRE / MENÚ</button>
+      <div id="driveControls" style="display:none">
+        <button id="driveToggle" class="game-btn btn-a">CONTINUAR (A)</button>
+        <button id="btnThrottle" class="game-btn btn-a">R · ACELERAR</button>
+        <button id="btnBrake" class="game-btn btn-b">L · FRENAR</button>
+      </div>
     </div>
   </div>
 
@@ -724,15 +1006,31 @@ class VrRemoteControllerService {
     let mode = 'joystick';
     let stickX = 0, stickY = 0;
     let btnA = false, btnB = false, btnGrip = false;
-    let qx = 0, qy = 0, qz = 0, qw = 1;
+    const qx = 0, qy = 0, qz = 0, qw = 1;
+    let controllerVisible = true;
     let sequence = 0;
-    let lastPoseSentAt = 0;
+    let hostModeRevision = null;
+    let drivingPaused = true, throttleHeld = false, brakeHeld = false;
+    let drivePulse = null;
+    const buttonPointers = new Map();
 
     function setMode(newMode) {
+      if (newMode !== 'joystick' && newMode !== 'driving') return;
+      releaseInputs(false);
       mode = newMode;
-      document.getElementById('tabJoy').className = mode === 'joystick' ? 'tab active' : 'tab';
-      document.getElementById('tabLaser').className = mode === 'laser' ? 'tab active' : 'tab';
+      updateModeUi();
       sendState();
+    }
+
+    function updateModeUi() {
+      const driving = mode === 'driving';
+      document.getElementById('tabJoy').className = mode === 'joystick' ? 'tab active' : 'tab';
+      document.getElementById('modeHint').innerText = driving ? 'Volante táctil · desliza izquierda/derecha' : 'La app activa el volante';
+      document.getElementById('driveControls').style.display = driving ? 'block' : 'none';
+      document.getElementById('btnA').style.display = 'flex';
+      document.getElementById('btnGrip').style.display = driving ? 'none' : 'flex';
+      document.getElementById('driveToggle').innerText = drivingPaused ? 'CONTINUAR (A)' : 'PAUSA';
+      updateTelemetry();
     }
 
     function connect() {
@@ -743,15 +1041,33 @@ class VrRemoteControllerService {
         return;
       }
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(proto + '//' + location.host + '/?token=' + encodeURIComponent(token));
+      const socket = new WebSocket(proto + '//' + location.host + '/?token=' + encodeURIComponent(token));
+      ws = socket;
+      hostModeRevision = null;
 
-      ws.onopen = () => {
+      socket.onopen = () => {
+        if (ws !== socket) return;
+        setMode('joystick');
         document.getElementById('status').innerText = '✅ CONECTADO AL VISOR';
         document.getElementById('status').style.color = '#10B981';
         sendState();
       };
 
-      ws.onclose = () => {
+      socket.onmessage = (event) => {
+        if (ws !== socket || typeof event.data !== 'string' || event.data.length > 4096) return;
+        let request;
+        try { request = JSON.parse(event.data); } catch (_) { return; }
+        if (!request || request.type !== 'vrlizate.controllerMode' || request.version !== 1 ||
+            !Number.isSafeInteger(request.revision) || request.revision < 0 ||
+            (request.mode !== 'joystick' && request.mode !== 'driving') ||
+            (hostModeRevision !== null && request.revision <= hostModeRevision)) return;
+        hostModeRevision = request.revision;
+        setMode(request.mode); // First ACK is always fully released/paused.
+      };
+
+      socket.onclose = () => {
+        if (ws !== socket) return;
+        releaseInputs(false);
         document.getElementById('status').innerText = '❌ Desconectado. Reconectando...';
         document.getElementById('status').style.color = '#FF007F';
         setTimeout(connect, 1000);
@@ -789,11 +1105,11 @@ class VrRemoteControllerService {
       sendState();
     }
 
-    function resetStick() {
+    function resetStick(send = true) {
       knob.style.transform = 'translate(0px, 0px)';
       stickX = 0; stickY = 0;
       updateTelemetry();
-      sendState();
+      if (send) sendState();
     }
 
     base.addEventListener('touchstart', (e) => { isTouching = true; handleTouch(e); if (navigator.vibrate) navigator.vibrate(15); });
@@ -804,38 +1120,48 @@ class VrRemoteControllerService {
     // Buttons
     function bindBtn(id, setVar) {
       const el = document.getElementById(id);
-      el.addEventListener('pointerdown', (e) => { el.setPointerCapture(e.pointerId); setVar(true); sendState(); if (navigator.vibrate) navigator.vibrate(25); });
-      el.addEventListener('pointerup', () => { setVar(false); sendState(); });
-      el.addEventListener('pointercancel', () => { setVar(false); sendState(); });
-      el.addEventListener('lostpointercapture', () => { setVar(false); sendState(); });
+      el.addEventListener('pointerdown', (e) => {
+        if (buttonPointers.has(id)) return;
+        buttonPointers.set(id, e.pointerId);
+        el.setPointerCapture(e.pointerId); setVar(true); sendState();
+        if (navigator.vibrate) navigator.vibrate(25);
+      });
+      function release(e) {
+        if (buttonPointers.get(id) !== e.pointerId) return;
+        buttonPointers.delete(id); setVar(false); sendState();
+      }
+      el.addEventListener('pointerup', release);
+      el.addEventListener('pointercancel', release);
+      el.addEventListener('lostpointercapture', release);
     }
-    bindBtn('btnA', (v) => btnA = v);
+    bindBtn('btnA', (v) => {
+      btnA = v;
+      if (v && mode === 'driving') {
+        throttleHeld = false; brakeHeld = false; drivingPaused = false;
+        updateModeUi();
+      }
+    });
     bindBtn('btnB', (v) => btnB = v);
     bindBtn('btnGrip', (v) => btnGrip = v);
+    bindBtn('btnThrottle', (v) => throttleHeld = v && mode === 'driving' && !drivingPaused);
+    bindBtn('btnBrake', (v) => brakeHeld = v && mode === 'driving' && !drivingPaused);
+    document.getElementById('driveToggle').addEventListener('click', () => {
+      if (mode !== 'driving') return;
+      if (!drivingPaused) { releaseInputs(); return; }
+      releaseInputs(false);
+      drivingPaused = false; btnA = true;
+      updateModeUi(); sendState();
+      drivePulse = setTimeout(() => { btnA = false; drivePulse = null; sendState(); }, 150);
+    });
 
-    // Gyroscope
-    if (window.DeviceOrientationEvent) {
-      window.addEventListener('deviceorientation', (e) => {
-        const alpha = (e.alpha || 0) * Math.PI / 180;
-        const beta = (e.beta || 0) * Math.PI / 180;
-        const gamma = (e.gamma || 0) * Math.PI / 180;
-
-        const c1 = Math.cos(alpha / 2), s1 = Math.sin(alpha / 2);
-        const c2 = Math.cos(beta / 2), s2 = Math.sin(beta / 2);
-        const c3 = Math.cos(gamma / 2), s3 = Math.sin(gamma / 2);
-
-        qw = c1 * c2 * c3 - s1 * s2 * s3;
-        qx = s1 * s2 * c3 + c1 * c2 * s3;
-        qy = s1 * c2 * c3 + c1 * s2 * s3;
-        qz = c1 * s2 * c3 - s1 * c2 * s3;
-
-        const now = performance.now();
-        if (mode === 'laser' && now - lastPoseSentAt >= 16) {
-          lastPoseSentAt = now;
-          sendState();
-        }
-      });
-    }
+    // Browser fallback is touch-only; do not turn device pose into laser aim.
+    document.getElementById('feedbackToggle').addEventListener('click', () => {
+      controllerVisible = !controllerVisible;
+      const button = document.getElementById('feedbackToggle');
+      button.innerText = controllerVisible ? 'Ocultar mando en visor' : 'Mostrar mando en visor';
+      button.setAttribute('aria-pressed', String(controllerVisible));
+      sendState();
+    });
 
     function updateTelemetry() {
       document.getElementById('telemetry').innerText =
@@ -846,13 +1172,21 @@ class VrRemoteControllerService {
       if (ws && ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 4096) {
         ws.send(JSON.stringify({
           mode,
-          stickX,
-          stickY,
+          hostModeRevision,
+          stickX: mode === 'driving' ? 0 : stickX,
+          stickY: mode === 'driving' ? 0 : stickY,
           btnA,
           btnB,
           btnGrip,
-          trigger: btnA,
+          btnR: throttleHeld,
+          btnL: brakeHeld,
+          controllerVisible,
+          trigger: throttleHeld,
           action: btnB,
+          steering: mode === 'driving' && !drivingPaused ? stickX : 0,
+          throttle: mode === 'driving' && !drivingPaused && throttleHeld && !brakeHeld ? 1 : 0,
+          brake: mode === 'driving' && !drivingPaused && brakeHeld ? 1 : 0,
+          drivingPaused: mode === 'driving' && drivingPaused,
           qx, qy, qz, qw,
           wx: 0, wy: 0, wz: 0,
           sequence: sequence++,
@@ -861,10 +1195,15 @@ class VrRemoteControllerService {
       }
     }
 
-    function releaseInputs() {
+    function releaseInputs(send = true) {
       btnA = false; btnB = false; btnGrip = false;
+      throttleHeld = false; brakeHeld = false; drivingPaused = true;
+      if (drivePulse !== null) clearTimeout(drivePulse);
+      drivePulse = null; buttonPointers.clear();
       isTouching = false;
-      resetStick();
+      resetStick(false);
+      updateModeUi();
+      if (send) sendState();
     }
     window.addEventListener('blur', releaseInputs);
     window.addEventListener('pagehide', releaseInputs);
@@ -899,8 +1238,7 @@ class VrRemoteControllerService {
     _beaconSocket = null;
     final client = _client;
     if (client != null) {
-      _disconnectClient(client);
-      unawaited(client.close(WebSocketStatus.goingAway));
+      _disconnectClient(client, closeCode: WebSocketStatus.goingAway);
     }
     unawaited(_server?.close(force: true));
     _server = null;

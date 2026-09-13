@@ -14,13 +14,21 @@ import 'package:vrlizate/vrlizate.dart';
 import 'virtual_thumbstick.dart';
 import 'vr_pairing_link.dart';
 import 'vr_remote_controller_service.dart';
+import 'vr_steering_controller.dart';
+import 'vr_controller_mode_protocol.dart';
+import 'vr_joystick_geometry.dart';
+import 'vr_controller_region.dart';
+import 'vr_controller_shake_detector.dart';
+import 'vr_controller_link.dart';
 
 /// Native Smartphone VR Controller & Joystick Screen.
 ///
-/// Dual Modes:
+/// Main modes:
 /// 1. [RemoteControllerMode.joystick]: Virtual 2D analog thumbstick for smooth 3D walking/strafe
 ///    locomotion + ergonomic Gamepad button cluster (A, B, Trigger, Grip, Recenter).
-/// 2. [RemoteControllerMode.laser]: 3DoF Gyroscope spatial laser aiming pointing ray.
+/// 2. [RemoteControllerMode.driving]: Calibrated wheel or touch steering/pedals.
+/// The joystick keeps its laser pad. A legacy laser initial mode is normalized
+/// to joystick; the laser wire enum remains compatible with older controllers.
 ///
 /// Roles:
 /// - Supports [isChildRole] when paired via canonical deep link `vrlizate://pair?...`
@@ -34,19 +42,67 @@ class PhoneControllerPage extends StatefulWidget {
   final bool autoConnect;
   final bool isChildRole;
 
+  /// Optional provider-owned connection/authentication (for example BLE).
+  /// On completion this page owns the link and closes it on disposal/retry.
+  /// With no connector the existing authenticated WebSocket path is used.
+  final Future<VrControllerLink> Function()? linkConnector;
+
+  /// Human-readable transport/device label. Never put a token or URI here.
+  final String? connectionLabel;
+  final Duration connectionTimeout;
+
   const PhoneControllerPage({
     super.key,
-    this.initialMode = RemoteControllerMode.laser,
+    this.initialMode = RemoteControllerMode.joystick,
     this.targetHost,
     this.targetPort = 8080,
     this.sessionToken,
     this.transportType = VrTransportType.localSocket,
     this.autoConnect = false,
     this.isChildRole = false,
+    this.linkConnector,
+    this.connectionLabel,
+    this.connectionTimeout = const Duration(seconds: 4),
   });
 
   @override
   State<PhoneControllerPage> createState() => _PhoneControllerPageState();
+}
+
+class _SteeringWheelPainter extends CustomPainter {
+  final Color color;
+  const _SteeringWheelPainter(this.color);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = size.shortestSide * 0.43;
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = radius * 0.16
+      ..strokeCap = StrokeCap.round
+      ..style = PaintingStyle.stroke;
+    canvas.drawCircle(center, radius, paint);
+    canvas.drawCircle(center, radius * 0.22, paint);
+    for (final angle in [0.0, math.pi, math.pi / 2]) {
+      final direction = Offset(math.cos(angle), math.sin(angle));
+      canvas.drawLine(
+        center + direction * radius * 0.24,
+        center + direction * radius * 0.92,
+        paint,
+      );
+    }
+    paint.color = Colors.white;
+    canvas.drawLine(
+      center - Offset(0, radius * 0.83),
+      center - Offset(0, radius * 1.08),
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_SteeringWheelPainter oldDelegate) =>
+      oldDelegate.color != color;
 }
 
 class _PhoneControllerPageState extends State<PhoneControllerPage>
@@ -55,25 +111,45 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     text: '192.168.1.',
   );
 
-  WebSocket? _socket;
+  VrControllerLink? _socket;
+  StreamSubscription<Object?>? _linkSubscription;
   RawDatagramSocket? _udpListener;
   StreamSubscription<GyroscopeEvent>? _gyroSub;
   Timer? _streamTimer;
   Timer? _connectionTimeout;
   Timer? _recenterResetTimer;
-  Completer<WebSocket>? _pendingConnection;
+  Timer? _drivingActionTimer;
+  Completer<VrControllerLink>? _pendingConnection;
 
   bool _isConnected = false;
   bool _isConnecting = false;
   bool _isForeground = true;
   bool _targetEdited = false;
+  bool _useWifiOverride = false;
   String? _discoveredHost;
   late int _targetPort;
   int _connectionGeneration = 0;
+  int _socketGeneration = 0;
+  int _surfaceEpoch = 0;
+  // mounted remains true while descendants dispose their gesture recognizers.
+  // Those recognizers can synchronously call onTapCancel under the tree lock.
+  bool _surfaceMounted = true;
+  final _hostModeSession = VrControllerModeSession();
+  Size? _joystickSize;
+  EdgeInsets? _joystickInsets;
+  bool _settingsOpen = false;
+  VrJoystickGeometry? _joystickGeometry;
+  final Map<VrJoystickControl, Path> _joystickLocalPaths = {};
   VrControllerConnectionTarget? _lastTarget;
   String _status = 'Buscando visor en la red Wi-Fi...';
 
   late RemoteControllerMode _activeMode;
+  final VrSteeringController _steering = VrSteeringController();
+  final Stopwatch _controllerClock = Stopwatch()..start();
+  VrMotionCapability _motionCapability = VrMotionCapability.checking;
+  int? _lastMotionUs;
+  int _lastDrivingTickUs = 0;
+  bool _preferTouchSteering = false;
 
   // Dual Joystick state
   double _stickX = 0.0;
@@ -85,6 +161,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   double _laserYaw = 0.0;
   double _laserPitch = 0.0;
   bool _isLaserSlideActive = false;
+  int? _laserSlidePointer;
   double _laserSlideNormX = 0.0;
   double _laserSlideNormY = 0.0;
   bool _recenterTriggered = false;
@@ -114,9 +191,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   // Shake detection state
-  bool _shakeToRecenterEnabled = true;
+  bool _shakeToToggleEnabled = true;
+  bool _controllerVisible = true;
+  final _shakeDetector = VrControllerShakeDetector();
   StreamSubscription<AccelerometerEvent>? _accelSub;
-  DateTime? _lastShakeTime;
 
   // Buttons state
   bool _triggerActive = false;
@@ -140,15 +218,21 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _activeMode = widget.initialMode;
+    _activeMode = widget.initialMode == RemoteControllerMode.laser
+        ? RemoteControllerMode.joystick
+        : widget.initialMode;
     _targetPort = widget.targetPort;
     _loadSavedHaptics();
-    if (widget.targetHost != null && widget.targetHost!.isNotEmpty) {
+    if (widget.linkConnector != null) {
+      _status = 'Sin vincular · $_externalConnectionLabel';
+    } else if (widget.targetHost != null && widget.targetHost!.isNotEmpty) {
       _ipController.text = widget.targetHost!;
+      _status = 'Sin vincular · ${widget.targetHost}:$_targetPort';
     } else {
       _loadSavedIp();
     }
-    if (widget.targetHost == null || widget.targetHost!.isEmpty) {
+    if (widget.linkConnector == null &&
+        (widget.targetHost == null || widget.targetHost!.isEmpty)) {
       _startUdpAutoDiscovery();
     }
     _startGyroTracking();
@@ -159,10 +243,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       DeviceOrientation.landscapeLeft,
       DeviceOrientation.landscapeRight,
     ]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
 
     if (widget.autoConnect &&
-        widget.targetHost != null &&
-        widget.targetHost!.isNotEmpty) {
+        (widget.linkConnector != null ||
+            (widget.targetHost != null && widget.targetHost!.isNotEmpty))) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted && !_isConnected && !_isConnecting) {
           _connect();
@@ -173,33 +258,33 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   void _startShakeDetection() {
     try {
-      _accelSub = accelerometerEventStream().listen(
-        (AccelerometerEvent event) {
-          if (!mounted || !_isForeground || !_shakeToRecenterEnabled) return;
-          final mag = math.sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
-          final now = DateTime.now();
-          // Shake requires vigorous acceleration (> 20 m/s^2, well above 1g = 9.8 m/s^2)
-          if (mag > 20.0) {
-            if (_lastShakeTime == null ||
-                now.difference(_lastShakeTime!) > const Duration(milliseconds: 1200)) {
-              _lastShakeTime = now;
-              _onShakeDetected();
-            }
-          }
-        },
-        onError: (_) {},
-      );
+      _accelSub = accelerometerEventStream().listen((AccelerometerEvent event) {
+        if (!mounted ||
+            !_isForeground ||
+            _settingsOpen ||
+            !_shakeToToggleEnabled) {
+          return;
+        }
+        if (_shakeDetector.addSample(
+          event.x,
+          event.y,
+          event.z,
+          _controllerClock.elapsedMicroseconds,
+        )) {
+          _onShakeDetected();
+        }
+      }, onError: (_) {});
     } catch (_) {}
   }
 
   void _onShakeDetected() {
     _hapticDoublePulse();
-    _recenterController();
-    if (mounted) {
-      setState(() {
-        _status = '¡Sacudida detectada! Ejes recentrados al frente';
-      });
-    }
+    _setControllerVisible(!_controllerVisible);
+  }
+
+  void _setControllerVisible(bool visible) {
+    setState(() => _controllerVisible = visible);
+    _sendState();
   }
 
   Future<void> _loadSavedHaptics() async {
@@ -287,46 +372,165 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   void _startGyroTracking() {
-    _gyroSub =
-        gyroscopeEventStream(
-          samplingPeriod: const Duration(milliseconds: 16),
-        ).listen(
-          (GyroscopeEvent event) {
-            if (!mounted || !_isForeground) return;
-            if (!event.x.isFinite ||
-                !event.y.isFinite ||
-                !event.z.isFinite ||
-                event.x.abs() > 100 ||
-                event.y.abs() > 100 ||
-                event.z.abs() > 100) {
-              return;
-            }
-            final now = DateTime.now();
-            _angularVelocity.setValues(event.x, event.y, event.z);
-            if (_lastGyroTime != null) {
-              final dt = (now.difference(_lastGyroTime!).inMicroseconds) / 1e6;
-              if (dt > 0 && dt < 0.2) {
-                final omega = vm.Vector3(event.x, event.y, event.z);
-                final angle = omega.length * dt;
-                if (angle > 1e-4) {
-                  final axis = omega.normalized();
-                  final deltaQ = vm.Quaternion.axisAngle(axis, angle);
-                  _orientation = (_orientation * deltaQ).normalized();
+    try {
+      _gyroSub =
+          gyroscopeEventStream(
+            samplingPeriod: const Duration(milliseconds: 16),
+          ).listen(
+            (GyroscopeEvent event) {
+              if (!mounted || !_isForeground) return;
+              if (!event.x.isFinite ||
+                  !event.y.isFinite ||
+                  !event.z.isFinite ||
+                  event.x.abs() > 100 ||
+                  event.y.abs() > 100 ||
+                  event.z.abs() > 100) {
+                return;
+              }
+              _lastMotionUs = _controllerClock.elapsedMicroseconds;
+              _setMotionCapability(VrMotionCapability.available);
+              if (_activeMode != RemoteControllerMode.driving) {
+                // Only the touch pad owns laser aim, including after release.
+                // Keep sensor capability detection alive for the wheel mode.
+                _angularVelocity.setZero();
+                _lastGyroTime = null;
+                return;
+              }
+              final now = DateTime.now();
+              _angularVelocity.setValues(event.x, event.y, event.z);
+              if (_lastGyroTime != null) {
+                final dt =
+                    (now.difference(_lastGyroTime!).inMicroseconds) / 1e6;
+                if (dt > 0 && dt < 0.2) {
+                  final omega = vm.Vector3(event.x, event.y, event.z);
+                  final angle = omega.length * dt;
+                  if (angle > 1e-4) {
+                    final axis = omega.normalized();
+                    final deltaQ = vm.Quaternion.axisAngle(axis, angle);
+                    _orientation = (_orientation * deltaQ).normalized();
+                  }
                 }
               }
-            }
-            _lastGyroTime = now;
-          },
-          onError: (_) {
-            _angularVelocity.setZero();
-            _lastGyroTime = null;
-          },
-        );
+              _lastGyroTime = now;
+              _steering.updateOrientation(_orientation);
+            },
+            onError: (_) {
+              _angularVelocity.setZero();
+              _lastGyroTime = null;
+              _setMotionCapability(VrMotionCapability.unavailable);
+            },
+          );
+    } catch (_) {
+      _setMotionCapability(VrMotionCapability.unavailable);
+    }
 
     // Send state periodically at 60 FPS
     _streamTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+      if (!mounted || !_isForeground) return;
+      final now = _controllerClock.elapsedMicroseconds;
+      if (now - (_lastMotionUs ?? 0) > 2000000) {
+        _setMotionCapability(VrMotionCapability.unavailable);
+      }
+      if (_activeMode == RemoteControllerMode.driving) {
+        _steering.setPedals(
+          throttlePressed: _btnRActive,
+          brakePressed: _btnLActive,
+        );
+        _steering.advance((now - _lastDrivingTickUs) / 1e6);
+        setState(() {});
+      }
+      _lastDrivingTickUs = now;
       _sendState();
     });
+  }
+
+  void _setMotionCapability(VrMotionCapability capability) {
+    if (!mounted || _motionCapability == capability) return;
+    setState(() {
+      final wasDrivingWithMotion =
+          _activeMode == RemoteControllerMode.driving &&
+          _steering.motionAvailable;
+      _motionCapability = capability;
+      _steering.setMotionAvailable(
+        capability == VrMotionCapability.available && !_preferTouchSteering,
+      );
+      if (capability == VrMotionCapability.unavailable) {
+        _angularVelocity.setZero();
+        _lastGyroTime = null;
+        if (wasDrivingWithMotion) {
+          _steering.setPaused(true);
+          _releaseInputs(send: true);
+        }
+        if (_activeMode == RemoteControllerMode.laser) {
+          _activeMode = RemoteControllerMode.joystick;
+          _releaseInputs(send: true);
+        }
+      }
+    });
+  }
+
+  void _selectMode(RemoteControllerMode mode) {
+    setState(() {
+      _releaseInputs();
+      _surfaceEpoch++;
+      _activeMode =
+          mode == RemoteControllerMode.laser &&
+              _motionCapability == VrMotionCapability.unavailable
+          ? RemoteControllerMode.joystick
+          : mode;
+      _steering.setPaused(false);
+      _steering.calibrate(_orientation);
+      _lastDrivingTickUs = _controllerClock.elapsedMicroseconds;
+    });
+    _hapticClick();
+    _sendState();
+  }
+
+  void _centerSteering() {
+    setState(() => _steering.calibrate(_orientation));
+    _hapticClick();
+    _sendState();
+  }
+
+  void _toggleDrivingPause() {
+    final paused = !_steering.state.paused;
+    setState(() {
+      _releaseInputs();
+      _steering.setPaused(paused);
+    });
+    if (paused) {
+      _sendState();
+    } else {
+      _pulseDrivingAction();
+    }
+  }
+
+  void _pulseDrivingAction({bool reset = false}) {
+    _drivingActionTimer?.cancel();
+    setState(() {
+      _btnAActive = !reset;
+      _btnXActive = reset;
+    });
+    _sendState();
+    _drivingActionTimer = Timer(const Duration(milliseconds: 150), () {
+      if (!mounted) return;
+      setState(() {
+        _btnAActive = false;
+        _btnXActive = false;
+      });
+      _sendState();
+    });
+  }
+
+  void _selectDrivingMenu() {
+    setState(() {
+      _releaseInputs();
+      // Drop old pedal gestures, including a pending tap-down, before making
+      // the controller ready. Choosing a menu must never restore held throttle.
+      _surfaceEpoch++;
+      _steering.setPaused(false);
+    });
+    _pulseDrivingAction();
   }
 
   void _updateLaserSlide(double nx, double ny) {
@@ -337,7 +541,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _laserStickY = -_laserSlideNormY;
 
       // 180° frontal hemisphere: horizontal yaw clamped to [-pi/2, +pi/2] (-90° to +90°)
-      _laserYaw = (_laserSlideNormX * (math.pi / 2)).clamp(-math.pi / 2, math.pi / 2);
+      _laserYaw = (_laserSlideNormX * (math.pi / 2)).clamp(
+        -math.pi / 2,
+        math.pi / 2,
+      );
       // Vertical pitch clamped to [-1.25, 1.25] (~ -71° to +71°)
       _laserPitch = (-_laserSlideNormY * 1.25).clamp(-1.25, 1.25);
 
@@ -346,15 +553,22 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       final qYaw = vm.Quaternion.axisAngle(vm.Vector3(0, 1, 0), -_laserYaw);
       final qPitch = vm.Quaternion.axisAngle(vm.Vector3(1, 0, 0), _laserPitch);
       _orientation = (qYaw * qPitch).normalized();
+      _angularVelocity.setZero();
+      _lastGyroTime = null;
     });
     _sendState();
   }
 
   String get _transportLabel {
+    if (widget.linkConnector != null && !_useWifiOverride) {
+      return _externalConnectionLabel;
+    }
     if (_lastTarget != null) return 'Conexión Directa (Socket)';
     switch (widget.transportType) {
       case VrTransportType.bluetoothLe:
-        return 'Bluetooth LE (pendiente)';
+        return _useWifiOverride
+            ? 'Conexión Directa (Socket)'
+            : 'Bluetooth LE (pendiente)';
       case VrTransportType.wifiDirect:
         return 'Wi-Fi Direct (pendiente)';
       case VrTransportType.localSocket:
@@ -362,19 +576,41 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
   }
 
+  String get _externalConnectionLabel =>
+      widget.connectionLabel?.trim().isNotEmpty == true
+      ? widget.connectionLabel!.trim()
+      : 'Enlace externo';
+
+  String get _targetDescription =>
+      (widget.linkConnector != null && !_useWifiOverride)
+      ? _externalConnectionLabel
+      : '${_lastTarget?.host ?? widget.targetHost ?? _discoveredHost ?? 'Sin vincular'}:$_targetPort ($_transportLabel)';
+
+  static Future<void> _closeLink(VrControllerLink link) async {
+    try {
+      await link.close();
+    } catch (_) {
+      // A failed transport teardown must not interfere with another session.
+    }
+  }
+
   Future<void> _connect() async {
     if (!mounted || !_isForeground || _isConnecting) return;
-    late final VrControllerConnectionTarget target;
+    VrControllerConnectionTarget? target;
     try {
-      target = VrControllerConnectionTarget.parse(
-        _ipController.text,
-        pairedHost: _lastTarget?.host ?? widget.targetHost,
-        pairedPort: _lastTarget?.port ?? _targetPort,
-        sessionToken: _lastTarget?.token ?? widget.sessionToken,
-        transportType: _lastTarget == null
-            ? widget.transportType
-            : VrTransportType.localSocket,
-      );
+      if (widget.linkConnector == null || _useWifiOverride) {
+        target = VrControllerConnectionTarget.parse(
+          _ipController.text,
+          pairedHost: _lastTarget?.host ?? widget.targetHost,
+          pairedPort: _lastTarget?.port ?? _targetPort,
+          sessionToken: _lastTarget?.token ?? widget.sessionToken,
+          transportType: _lastTarget == null
+              ? (_useWifiOverride
+                  ? VrTransportType.localSocket
+                  : widget.transportType)
+              : VrTransportType.localSocket,
+        );
+      }
     } on FormatException catch (error) {
       setState(() => _status = error.message);
       return;
@@ -386,35 +622,49 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _releaseInputs(send: true);
     final previous = _socket;
     _socket = null;
-    unawaited(previous?.close());
+    _linkSubscription?.cancel();
+    _linkSubscription = null;
+    if (previous != null) unawaited(_closeLink(previous));
     setState(() {
       _isConnecting = true;
       _isConnected = false;
-      _status = 'Conectando al visor ${target.host}:${target.port}...';
+      _status = target == null
+          ? 'Conectando · $_externalConnectionLabel...'
+          : 'Conectando al visor ${target.host}:${target.port}...';
     });
 
     try {
-      final socket = await _openSocket(target.webSocketUri, generation);
+      final socket = await _openLink(target?.webSocketUri, generation);
       if (!mounted || generation != _connectionGeneration) {
-        unawaited(socket.close());
+        unawaited(_closeLink(socket));
         return;
       }
       _socket = socket;
-      _lastTarget = target;
-      _targetPort = target.port;
+      _socketGeneration = generation;
+      _hostModeSession.reset();
+      if (target != null) {
+        _lastTarget = target;
+        _targetPort = target.port;
+      }
       _sequence = 0;
       _releaseInputs();
+      _surfaceEpoch++;
+      if (_activeMode == RemoteControllerMode.driving) {
+        _steering.setPaused(true);
+      }
       setState(() {
         _isConnected = true;
         _isConnecting = false;
-        _status = widget.isChildRole
+        _status = target == null
+            ? '⚡ VINCULADO · $_externalConnectionLabel'
+            : widget.isChildRole
             ? '⚡ VINCULADO AL VISOR PADRE (${target.host}:${target.port})'
             : '⚡ CONECTADO AL VISOR';
       });
-      unawaited(_rememberHost(target.host));
+      if (target != null) unawaited(_rememberHost(target.host));
       _hapticDoublePulse();
-      socket.listen(
-        (data) {},
+      _linkSubscription = socket.messages.listen(
+        (data) => _onHostMessage(data, socket, generation),
         onDone: () => _onDisconnected(socket),
         onError: (_) => _onDisconnected(socket),
         cancelOnError: true,
@@ -423,21 +673,52 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     } catch (e) {
       if (mounted && generation == _connectionGeneration) {
         _connectionGeneration++;
+        final failedLink = _socket;
+        _socket = null;
+        _linkSubscription?.cancel();
+        _linkSubscription = null;
+        if (failedLink != null) unawaited(_closeLink(failedLink));
         setState(() {
           _isConnected = false;
           _isConnecting = false;
           // Exceptions can contain the authenticated URL; don't echo secrets.
-          _status =
-              'No se pudo vincular. Verifica el enlace del visor y la red Wi-Fi.';
+          _status = widget.linkConnector != null
+              ? 'No se pudo vincular por $_externalConnectionLabel. Revisa el visor, los permisos y vuelve a intentar.'
+              : 'No se pudo vincular. Verifica el enlace del visor y la red Wi-Fi.';
         });
       }
     }
   }
 
-  Future<WebSocket> _openSocket(Uri uri, int generation) {
-    final completion = Completer<WebSocket>();
+  void _onHostMessage(Object? data, VrControllerLink socket, int generation) {
+    if (!mounted ||
+        !_surfaceMounted ||
+        generation != _socketGeneration ||
+        !identical(_socket, socket)) {
+      return;
+    }
+    final request = _hostModeSession.accept(data);
+    if (request == null) return;
+    // Mode requests are scoped to this authenticated socket. Send no packet
+    // between accepting its revision and installing a completely neutral mode.
+    setState(() {
+      _releaseInputs();
+      _surfaceEpoch++;
+      _activeMode = request.mode;
+      _steering.setPaused(request.mode == RemoteControllerMode.driving);
+      _lastDrivingTickUs = _controllerClock.elapsedMicroseconds;
+      _status = request.mode == RemoteControllerMode.driving
+          ? 'Conducción lista · pulsa CONTINUAR para iniciar'
+          : 'Joystick listo · puntero y botones disponibles';
+    });
+    // Even while backgrounded the host must receive a neutral mode ACK.
+    _sendState(force: true);
+  }
+
+  Future<VrControllerLink> _openLink(Uri? uri, int generation) {
+    final completion = Completer<VrControllerLink>();
     _pendingConnection = completion;
-    _connectionTimeout = Timer(const Duration(seconds: 4), () {
+    _connectionTimeout = Timer(widget.connectionTimeout, () {
       if (!completion.isCompleted) {
         _pendingConnection = null;
         _connectionTimeout = null;
@@ -447,18 +728,29 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       }
     });
     unawaited(
-      WebSocket.connect(uri.toString()).then<void>(
+      Future<VrControllerLink>.sync(() {
+        final connector = _useWifiOverride ? null : widget.linkConnector;
+        if (connector != null) return connector();
+        return WebSocket.connect(
+          uri!.toString(),
+        ).then(VrWebSocketControllerLink.new);
+      }).then<void>(
         (socket) {
           // Dart cannot cancel the underlying upgrade: close any late arrival.
           if (!mounted ||
               generation != _connectionGeneration ||
               completion.isCompleted) {
-            unawaited(socket.close());
+            unawaited(_closeLink(socket));
             return;
           }
           _connectionTimeout?.cancel();
           _connectionTimeout = null;
           _pendingConnection = null;
+          if (!socket.isOpen) {
+            unawaited(_closeLink(socket));
+            completion.completeError(StateError('Controller link is closed'));
+            return;
+          }
           completion.complete(socket);
         },
         onError: (Object error, StackTrace stack) {
@@ -491,11 +783,20 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     } catch (_) {}
   }
 
-  void _onDisconnected(WebSocket socket) {
-    if (!mounted || !identical(_socket, socket)) return;
+  void _onDisconnected(VrControllerLink socket) {
+    if (!mounted || !_surfaceMounted || !identical(_socket, socket)) return;
     _socket = null;
+    _linkSubscription?.cancel();
+    _linkSubscription = null;
+    unawaited(_closeLink(socket));
+    _socketGeneration = 0;
+    _hostModeSession.reset();
+    if (_activeMode == RemoteControllerMode.driving) {
+      _steering.setPaused(true);
+    }
     _releaseInputs();
     setState(() {
+      _surfaceEpoch++;
       _isConnected = false;
       _isConnecting = false;
       _status =
@@ -504,6 +805,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   void _releaseInputs({bool send = false}) {
+    _drivingActionTimer?.cancel();
+    _drivingActionTimer = null;
+    _recenterResetTimer?.cancel();
+    _recenterResetTimer = null;
     _stickX = 0;
     _stickY = 0;
     _lookX = 0;
@@ -511,6 +816,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _laserStickX = 0;
     _laserStickY = 0;
     _isLaserSlideActive = false;
+    _laserSlidePointer = null;
     _laserSlideNormX = 0;
     _laserSlideNormY = 0;
     _recenterTriggered = false;
@@ -527,31 +833,38 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _gripHoldTimer = null;
     _angularVelocity.setZero();
     _lastGyroTime = null;
+    _steering.release();
     if (send) _sendState(force: true);
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    _shakeDetector.reset();
     _isForeground = state == AppLifecycleState.resumed;
     if (!_isForeground) {
       _cancelPendingConnection();
       setState(() {
+        if (_activeMode == RemoteControllerMode.driving) {
+          _steering.setPaused(true);
+        }
         _releaseInputs(send: true);
+        // Discard held thumbstick/pad gestures across suspension as well.
+        _surfaceEpoch++;
         _isConnecting = false;
       });
     } else {
       _lastGyroTime = null;
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     }
   }
 
   void _sendState({bool force = false}) {
     final ws = _socket;
-    if (ws != null &&
-        ws.readyState == WebSocket.open &&
-        _isConnected &&
-        (_isForeground || force)) {
+    final driving = _steering.state;
+    if (ws != null && ws.isOpen && _isConnected && (_isForeground || force)) {
       final payload = jsonEncode({
         'sequence': _sequence++,
+        'hostModeRevision': _hostModeSession.revision,
         'timestampUs': DateTime.now().microsecondsSinceEpoch,
         'qx': _orientation.x,
         'qy': _orientation.y,
@@ -572,11 +885,13 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         'lookPitch': _lookY,
         'laserX': _laserStickX,
         'laserY': _laserStickY,
+        'laserSlideActive': _isLaserSlideActive,
         'aimX': _laserStickX,
         'aimY': _laserStickY,
         'recenter': _recenterTriggered,
+        'controllerVisible': _controllerVisible,
         'rangeMeters': 0.55,
-        'trigger': _triggerActive || _btnLActive || _btnRActive,
+        'trigger': _triggerActive || _btnRActive,
         'action': _actionActive || _btnBActive,
         'btnA': _btnAActive,
         'btnB': _btnBActive,
@@ -585,7 +900,19 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         'btnL': _btnLActive,
         'btnR': _btnRActive,
         'btnGrip': _btnGripActive,
-        'mode': _activeMode == RemoteControllerMode.laser ? 'laser' : 'joystick',
+        'mode': _activeMode.name,
+        'steering': _activeMode == RemoteControllerMode.driving
+            ? driving.steering
+            : 0.0,
+        'throttle': _activeMode == RemoteControllerMode.driving
+            ? driving.throttle
+            : 0.0,
+        'brake': _activeMode == RemoteControllerMode.driving
+            ? driving.brake
+            : 0.0,
+        'drivingPaused':
+            _activeMode == RemoteControllerMode.driving && driving.paused,
+        'motionAvailable': _motionCapability == VrMotionCapability.available,
       });
 
       try {
@@ -607,6 +934,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _laserSlideNormX = 0.0;
       _laserSlideNormY = 0.0;
       _lastGyroTime = null;
+      _steering.calibrate(_orientation);
       _recenterTriggered = true;
     });
     _hapticMedium();
@@ -623,7 +951,29 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   @override
+  void deactivate() {
+    // Descendant gesture cancellation happens before this State.dispose, when
+    // mounted alone cannot distinguish a closing controller from a live one.
+    _surfaceMounted = false;
+    super.deactivate();
+  }
+
+  @override
+  void activate() {
+    super.activate();
+    _surfaceMounted = true;
+  }
+
+  bool _acceptsSurfaceInput(int epoch) =>
+      mounted &&
+      _surfaceMounted &&
+      _isForeground &&
+      !_settingsOpen &&
+      epoch == _surfaceEpoch;
+
+  @override
   void dispose() {
+    _surfaceMounted = false;
     WidgetsBinding.instance.removeObserver(this);
     _cancelPendingConnection();
     _releaseInputs(send: true);
@@ -636,15 +986,15 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _gripHoldTimer?.cancel();
     final socket = _socket;
     _socket = null;
+    _linkSubscription?.cancel();
+    _linkSubscription = null;
     if (socket != null) {
       Zone.root.run(() {
-        unawaited(socket.close());
+        unawaited(_closeLink(socket));
       });
     }
     _ipController.dispose();
     SystemChrome.setPreferredOrientations([
-      DeviceOrientation.portraitUp,
-      DeviceOrientation.portraitDown,
       DeviceOrientation.landscapeLeft,
       DeviceOrientation.landscapeRight,
     ]);
@@ -654,6 +1004,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   void _showIpConfigDialog() => _openSettings();
 
   void _openSettings() {
+    if (_settingsOpen) return;
+    setState(() {
+      _settingsOpen = true;
+      _releaseInputs(send: true);
+      _surfaceEpoch++;
+    });
     showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -670,7 +1026,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 constraints: BoxConstraints(
                   maxHeight: MediaQuery.of(ctx).size.height * 0.90,
                 ),
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 12,
+                ),
                 child: SingleChildScrollView(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
@@ -682,7 +1041,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                         children: [
                           const Row(
                             children: [
-                              Icon(Icons.tune_rounded, color: Color(0xFF00E5FF), size: 22),
+                              Icon(
+                                Icons.tune_rounded,
+                                color: Color(0xFF00E5FF),
+                                size: 22,
+                              ),
                               SizedBox(width: 8),
                               Text(
                                 'AJUSTES DEL MANDO VR',
@@ -696,12 +1059,25 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                             ],
                           ),
                           IconButton(
-                            icon: const Icon(Icons.close_rounded, color: Colors.white70),
+                            icon: const Icon(
+                              Icons.close_rounded,
+                              color: Colors.white70,
+                            ),
                             onPressed: () => Navigator.of(ctx).pop(),
                           ),
                         ],
                       ),
                       const Divider(color: Color(0xFF00E5FF), thickness: 0.5),
+                      Text(
+                        'Visor: $_targetDescription',
+                        key: const ValueKey('controller_pairing_target'),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 11,
+                        ),
+                      ),
                       const SizedBox(height: 6),
 
                       // Section 1: Modo del Mando
@@ -715,38 +1091,29 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                         ),
                       ),
                       const SizedBox(height: 6),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: _buildSettingsModeCard(
-                              title: 'JOYSTICK DUAL',
-                              subtitle: 'Navegación + Vista 360°/180°',
-                              icon: Icons.gamepad_rounded,
-                              isSelected: _activeMode == RemoteControllerMode.joystick,
-                              onTap: () {
-                                setState(() => _activeMode = RemoteControllerMode.joystick);
-                                setModalState(() {});
-                                _hapticClick();
-                                _sendState();
-                              },
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: _buildSettingsModeCard(
-                              title: 'PUNTERO LÁSER',
-                              subtitle: '3DoF Giroscopio Espacial',
-                              icon: Icons.flare_rounded,
-                              isSelected: _activeMode == RemoteControllerMode.laser,
-                              onTap: () {
-                                setState(() => _activeMode = RemoteControllerMode.laser);
-                                setModalState(() {});
-                                _hapticClick();
-                                _sendState();
-                              },
-                            ),
-                          ),
-                        ],
+                      _buildSettingsModeCard(
+                        title: 'JOYSTICK DUAL',
+                        subtitle: 'Navegación + Vista + Puntero integrado',
+                        icon: Icons.gamepad_rounded,
+                        isSelected:
+                            _activeMode == RemoteControllerMode.joystick,
+                        onTap: () {
+                          _selectMode(RemoteControllerMode.joystick);
+                          setModalState(() {});
+                        },
+                      ),
+                      const SizedBox(height: 8),
+                      _buildSettingsModeCard(
+                        title: 'CONDUCCIÓN',
+                        subtitle:
+                            'Volante calibrable o dirección táctil · L frena / R acelera',
+                        icon: Icons.sports_motorsports_rounded,
+                        isSelected: _activeMode == RemoteControllerMode.driving,
+                        onTap: () {
+                          _selectMode(RemoteControllerMode.driving);
+                          setModalState(() {});
+                          Navigator.of(ctx).pop();
+                        },
                       ),
                       const SizedBox(height: 12),
 
@@ -771,25 +1138,82 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
+                            if (widget.linkConnector != null) ...[
+                              SegmentedButton<bool>(
+                                key: const ValueKey('controller_transport_selector'),
+                                segments: const [
+                                  ButtonSegment(
+                                    value: false,
+                                    icon: Icon(Icons.bluetooth_rounded, size: 16),
+                                    label: Text('Bluetooth LE', style: TextStyle(fontSize: 11)),
+                                  ),
+                                  ButtonSegment(
+                                    value: true,
+                                    icon: Icon(Icons.wifi_rounded, size: 16),
+                                    label: Text('Wi-Fi local', style: TextStyle(fontSize: 11)),
+                                  ),
+                                ],
+                                selected: {_useWifiOverride},
+                                onSelectionChanged: (val) {
+                                  final next = val.single;
+                                  setModalState(() => _useWifiOverride = next);
+                                  setState(() => _useWifiOverride = next);
+                                },
+                              ),
+                              const SizedBox(height: 8),
+                            ],
                             Row(
                               children: [
                                 Expanded(
-                                  child: TextField(
-                                    controller: _ipController,
-                                    onChanged: (_) => _targetEdited = true,
-                                    style: const TextStyle(color: Colors.white, fontSize: 13),
-                                    decoration: InputDecoration(
-                                      isDense: true,
-                                      filled: true,
-                                      fillColor: const Color(0xFF101528),
-                                      hintText: '192.168.1.XX:8080 o vrlizate://pair?...',
-                                      hintStyle: const TextStyle(color: Colors.white30, fontSize: 11),
-                                      border: OutlineInputBorder(
-                                        borderRadius: BorderRadius.circular(8),
-                                        borderSide: const BorderSide(color: Color(0xFF00E5FF)),
-                                      ),
-                                    ),
-                                  ),
+                                  child: (widget.linkConnector != null && !_useWifiOverride)
+                                      ? Column(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            Text(
+                                              _externalConnectionLabel,
+                                              style: const TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 12,
+                                                fontWeight: FontWeight.w600,
+                                              ),
+                                            ),
+                                            const SizedBox(height: 2),
+                                            const Text(
+                                              'Vínculo directo BLE sin router ni contraseña.',
+                                              style: TextStyle(
+                                                color: Colors.white54,
+                                                fontSize: 10,
+                                              ),
+                                            ),
+                                          ],
+                                        )
+                                      : TextField(
+                                          controller: _ipController,
+                                          onChanged: (_) =>
+                                              _targetEdited = true,
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 13,
+                                          ),
+                                          decoration: InputDecoration(
+                                            isDense: true,
+                                            filled: true,
+                                            fillColor: const Color(0xFF101528),
+                                            hintText:
+                                                '192.168.1.XX:8080 o vrlizate://pair?...',
+                                            hintStyle: const TextStyle(
+                                              color: Colors.white30,
+                                              fontSize: 11,
+                                            ),
+                                            border: OutlineInputBorder(
+                                              borderRadius:
+                                                  BorderRadius.circular(8),
+                                              borderSide: const BorderSide(
+                                                color: Color(0xFF00E5FF),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
                                 ),
                                 const SizedBox(width: 8),
                                 ElevatedButton(
@@ -804,11 +1228,17 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                                         ? const Color(0xFF10B981)
                                         : const Color(0xFF00E5FF),
                                     foregroundColor: Colors.black,
-                                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 14,
+                                      vertical: 10,
+                                    ),
                                   ),
                                   child: Text(
                                     _isConnected ? 'RECONECTAR' : 'CONECTAR',
-                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11),
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 11,
+                                    ),
                                   ),
                                 ),
                               ],
@@ -816,7 +1246,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                             const SizedBox(height: 6),
                             Text(
                               'Estado: $_status\nTransporte: $_transportLabel | Rol: ${widget.isChildRole ? "Mando Hijo (Enlace Directo)" : "Mando Independiente"}',
-                              style: const TextStyle(color: Colors.white60, fontSize: 9.5),
+                              style: const TextStyle(
+                                color: Colors.white60,
+                                fontSize: 9.5,
+                              ),
                             ),
                           ],
                         ),
@@ -835,19 +1268,43 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       ),
                       const SizedBox(height: 4),
                       SwitchListTile(
+                        key: const ValueKey('controller_visibility_toggle'),
                         contentPadding: EdgeInsets.zero,
-                        value: _shakeToRecenterEnabled,
+                        value: _controllerVisible,
                         activeThumbColor: const Color(0xFF00E5FF),
                         title: const Text(
-                          'Recentrar con sacudida del celular',
-                          style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+                          'Mostrar mando en visor',
+                          style: TextStyle(color: Colors.white, fontSize: 12),
                         ),
                         subtitle: const Text(
-                          'Sacude enérgicamente el teléfono para centrar automáticamente el visor y el horizonte.',
+                          'Muestra los botones y sticks pulsados dentro del VR.',
                           style: TextStyle(color: Colors.white60, fontSize: 10),
                         ),
                         onChanged: (val) {
-                          setState(() => _shakeToRecenterEnabled = val);
+                          _setControllerVisible(val);
+                          setModalState(() {});
+                        },
+                      ),
+                      SwitchListTile(
+                        key: const ValueKey('controller_shake_toggle'),
+                        contentPadding: EdgeInsets.zero,
+                        value: _shakeToToggleEnabled,
+                        activeThumbColor: const Color(0xFF00E5FF),
+                        title: const Text(
+                          'Sacudir para mostrar/ocultar el mando',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        subtitle: const Text(
+                          'Sacude el control en cualquier dirección. No cambia la mira ni recentra el visor; también funciona en conducción.',
+                          style: TextStyle(color: Colors.white60, fontSize: 10),
+                        ),
+                        onChanged: (val) {
+                          setState(() => _shakeToToggleEnabled = val);
+                          _shakeDetector.reset();
                           setModalState(() {});
                         },
                       ),
@@ -858,7 +1315,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                         activeThumbColor: const Color(0xFF00E5FF),
                         title: const Text(
                           'Vibración háptica del mando',
-                          style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
                         subtitle: const Text(
                           'Respuesta táctil al pulsar botones, límites del joystick, sacudir o recentrar.',
@@ -879,12 +1340,17 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                           _recenterController();
                           Navigator.of(ctx).pop();
                         },
-                        icon: const Icon(Icons.filter_center_focus_rounded, size: 16),
+                        icon: const Icon(
+                          Icons.filter_center_focus_rounded,
+                          size: 16,
+                        ),
                         label: const Text('Recentrar Vista y Mandos Ahora'),
                         style: OutlinedButton.styleFrom(
                           foregroundColor: const Color(0xFF00E5FF),
                           side: const BorderSide(color: Color(0xFF00E5FF)),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
                         ),
                       ),
                     ],
@@ -895,7 +1361,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           },
         );
       },
-    );
+    ).whenComplete(() {
+      if (mounted) setState(() => _settingsOpen = false);
+    });
   }
 
   Widget _buildSettingsModeCard({
@@ -935,20 +1403,29 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   Text(
                     title,
                     style: TextStyle(
-                      color: isSelected ? const Color(0xFF00E5FF) : Colors.white,
+                      color: isSelected
+                          ? const Color(0xFF00E5FF)
+                          : Colors.white,
                       fontSize: 11,
                       fontWeight: FontWeight.bold,
                     ),
                   ),
                   Text(
                     subtitle,
-                    style: const TextStyle(color: Colors.white54, fontSize: 8.5),
+                    style: const TextStyle(
+                      color: Colors.white54,
+                      fontSize: 8.5,
+                    ),
                   ),
                 ],
               ),
             ),
             if (isSelected)
-              const Icon(Icons.check_circle_rounded, color: Color(0xFF00E5FF), size: 16),
+              const Icon(
+                Icons.check_circle_rounded,
+                color: Color(0xFF00E5FF),
+                size: 16,
+              ),
           ],
         ),
       ),
@@ -957,6 +1434,17 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   @override
   Widget build(BuildContext context) {
+    if (_activeMode == RemoteControllerMode.joystick) {
+      // Bands reach the available display edges. Insets protect labels and
+      // central settings only, never add a dead footer beneath X/A.
+      return Scaffold(
+        backgroundColor: const Color(0xFF080816),
+        body: KeyedSubtree(
+          key: ValueKey('controller_surface_$_surfaceEpoch'),
+          child: _buildJoystickLayout(),
+        ),
+      );
+    }
     return Scaffold(
       backgroundColor: const Color(0xFF080816),
       appBar: AppBar(
@@ -969,7 +1457,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.sports_esports_rounded, color: Color(0xFF00E5FF), size: 18),
+              Icon(
+                Icons.sports_esports_rounded,
+                color: Color(0xFF00E5FF),
+                size: 18,
+              ),
               SizedBox(width: 8),
               Text(
                 'MANDO 3DoF VRLIZATE',
@@ -987,12 +1479,20 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           _buildConnectionPill(),
           const SizedBox(width: 2),
           IconButton(
-            icon: const Icon(Icons.filter_center_focus_rounded, color: Color(0xFF00E5FF), size: 19),
+            icon: const Icon(
+              Icons.filter_center_focus_rounded,
+              color: Color(0xFF00E5FF),
+              size: 19,
+            ),
             tooltip: 'Recentrar vista',
             onPressed: _recenterController,
           ),
           IconButton(
-            icon: const Icon(Icons.settings_rounded, color: Color(0xFF00E5FF), size: 19),
+            icon: const Icon(
+              Icons.settings_rounded,
+              color: Color(0xFF00E5FF),
+              size: 19,
+            ),
             tooltip: 'Ajustes y Modo',
             onPressed: _openSettings,
           ),
@@ -1005,22 +1505,38 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              if (widget.isChildRole) ...[
+              if (widget.isChildRole &&
+                  MediaQuery.sizeOf(context).height >= 340) ...[
                 _buildChildRoleBanner(),
                 const SizedBox(height: 4),
               ],
 
               // Active Controller Surface (Dual Joystick vs Laser)
               Expanded(
-                child: _activeMode == RemoteControllerMode.joystick
-                    ? _buildJoystickLayout()
-                    : _buildLaserPointerLayout(),
+                child: KeyedSubtree(
+                  key: ValueKey('controller_surface_$_surfaceEpoch'),
+                  child: switch (_activeMode) {
+                    RemoteControllerMode.joystick => _buildJoystickLayout(),
+                    RemoteControllerMode.laser => _buildLaserPointerLayout(),
+                    RemoteControllerMode.driving => _buildDrivingLayout(),
+                  },
+                ),
               ),
 
               const SizedBox(height: 3),
 
               // Real-time Telemetry Bar
               _buildTelemetryBar(),
+              if (_motionCapability != VrMotionCapability.available)
+                Text(
+                  _motionCapability == VrMotionCapability.checking
+                      ? 'Comprobando giroscopio · controles táctiles disponibles'
+                      : 'Sin giroscopio disponible · usa los controles táctiles',
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.amber, fontSize: 10),
+                ),
             ],
           ),
         ),
@@ -1030,94 +1546,30 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   Widget _buildChildRoleBanner() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
-        color: const Color(0xFF00E5FF).withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(
-          color: const Color(0xFF00E5FF).withValues(alpha: 0.4),
-          width: 1.2,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: const Color(0xFF00E5FF).withValues(alpha: 0.15),
-            blurRadius: 8,
-          ),
-        ],
+        color: const Color(0xFF00E5FF).withValues(alpha: .08),
+        borderRadius: BorderRadius.circular(8),
       ),
       child: Row(
         children: [
-          Container(
-            padding: const EdgeInsets.all(5),
-            decoration: BoxDecoration(
-              color: const Color(0xFF00E5FF).withValues(alpha: 0.2),
-              shape: BoxShape.circle,
-            ),
-            child: const Icon(
-              Icons.link_rounded,
+          const Icon(Icons.link_rounded, color: Color(0xFF00E5FF), size: 14),
+          const SizedBox(width: 6),
+          const Text(
+            'ROL: MANDO HIJO',
+            style: TextStyle(
               color: Color(0xFF00E5FF),
-              size: 16,
+              fontSize: 9,
+              fontWeight: FontWeight.bold,
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 10),
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Row(
-                  children: [
-                    Text(
-                      'ROL: MANDO HIJO',
-                      style: TextStyle(
-                        color: Color(0xFF00E5FF),
-                        fontSize: 10.5,
-                        fontWeight: FontWeight.bold,
-                        letterSpacing: 0.8,
-                      ),
-                    ),
-                    SizedBox(width: 6),
-                    Text(
-                      '· ENLACE DIRECTO',
-                      style: TextStyle(
-                        color: Colors.white60,
-                        fontSize: 9,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ],
-                ),
-                Text(
-                  'Visor Padre: ${_lastTarget?.host ?? widget.targetHost ?? _discoveredHost ?? 'Sin vincular'}:$_targetPort ($_transportLabel)',
-                  style: const TextStyle(color: Colors.white70, fontSize: 9.5),
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ],
-            ),
-          ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-            decoration: BoxDecoration(
-              color: _isConnected
-                  ? const Color(0xFF10B981).withValues(alpha: 0.2)
-                  : const Color(0xFFFF9100).withValues(alpha: 0.2),
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(
-                color: _isConnected
-                    ? const Color(0xFF10B981)
-                    : const Color(0xFFFF9100),
-              ),
-            ),
             child: Text(
-              _isConnected
-                  ? 'SINCRONIZADO'
-                  : (_isConnecting ? 'CONECTANDO' : 'SIN VINCULAR'),
-              style: TextStyle(
-                color: _isConnected
-                    ? const Color(0xFF10B981)
-                    : const Color(0xFFFF9100),
-                fontSize: 8.5,
-                fontWeight: FontWeight.bold,
-              ),
+              'Visor Padre: $_targetDescription',
+              style: const TextStyle(color: Colors.white54, fontSize: 9),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
             ),
           ),
         ],
@@ -1146,19 +1598,30 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               mainAxisSize: MainAxisSize.min,
               children: [
                 Icon(
-                  _isConnected ? Icons.wifi_rounded : Icons.wifi_off_rounded,
+                  (widget.linkConnector != null && !_useWifiOverride)
+                      ? Icons.bluetooth_rounded
+                      : (_isConnected
+                            ? Icons.wifi_rounded
+                            : Icons.wifi_off_rounded),
                   color: _isConnected
                       ? const Color(0xFF10B981)
                       : const Color(0xFFFF9100),
                   size: 13,
                 ),
                 const SizedBox(width: 4),
-                Text(
-                  _lastTarget?.host ??
-                      (_ipController.text.isNotEmpty
-                          ? _ipController.text
-                          : 'Config IP'),
-                  style: const TextStyle(color: Colors.white70, fontSize: 10),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 110),
+                  child: Text(
+                    (widget.linkConnector != null && !_useWifiOverride)
+                        ? _externalConnectionLabel
+                        : (_lastTarget?.host ??
+                              (_ipController.text.isNotEmpty
+                                  ? _ipController.text
+                                  : 'Config IP')),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white70, fontSize: 10),
+                  ),
                 ),
                 const SizedBox(width: 2),
                 const Icon(Icons.edit_rounded, color: Colors.white38, size: 11),
@@ -1195,327 +1658,221 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   // ─── Modo Joystick Virtual Layout ────────────────────────────────────────
 
-  Widget _buildJoystickLayout() {
+  Widget _buildDrivingLayout() {
+    final surfaceEpoch = _surfaceEpoch;
+    final driving = _steering.state;
+    final usesMotion = _steering.motionAvailable;
     return LayoutBuilder(
       builder: (context, constraints) {
-        final double stickSize =
-            (constraints.maxHeight * 0.35).clamp(88.0, 108.0);
-        final double btnHeight =
-            (constraints.maxHeight * 0.18).clamp(44.0, 52.0);
-
+        final compact = constraints.maxHeight < 190;
         return Row(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // ── 1. Columna Izquierda: L (Arriba) + Y (Sobre Stick) + Stick Locomoción + X (Bajo Stick) ──
+            Expanded(
+              flex: 2,
+              child: _buildButton(
+                title: 'L · FRENO',
+                subtitle: 'Mantén para frenar',
+                icon: Icons.back_hand_rounded,
+                isActive: _btnLActive,
+                colors: const [Color(0xFFDC2626), Color(0xFF9F1239)],
+                onDown: () => setState(() {
+                  _btnLActive = !driving.paused;
+                }),
+                onUp: () => setState(() => _btnLActive = false),
+              ),
+            ),
+            const SizedBox(width: 8),
             Expanded(
               flex: 5,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF101528).withValues(alpha: 0.7),
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(
-                    color: const Color(0xFF00E5FF).withValues(alpha: 0.3),
-                  ),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    // Botón Superior: L (Gatillo Izquierdo)
-                    Expanded(
-                      flex: 2,
-                      child: _buildButton(
-                        title: 'L',
-                        subtitle: 'Gatillo Izquierdo',
-                        icon: Icons.touch_app_rounded,
-                        isActive: _btnLActive,
-                        colors: const [Color(0xFF00E5FF), Color(0xFF7C4DFF)],
-                        onDown: () => setState(() {
-                          _btnLActive = true;
-                          _triggerActive = true;
-                        }),
-                        onUp: () => setState(() {
-                          _btnLActive = false;
-                          _triggerActive = _btnRActive;
-                        }),
+              child: Column(
+                children: [
+                  Row(
+                    children: [
+                      IconButton(
+                        tooltip: 'Reiniciar carrera',
+                        onPressed: () {
+                          setState(() {
+                            _steering.setPaused(true);
+                            _releaseInputs();
+                          });
+                          _pulseDrivingAction(reset: true);
+                        },
+                        icon: const Icon(Icons.replay, color: Colors.white70),
                       ),
-                    ),
-                    const SizedBox(height: 4),
-
-                    // Botón Superior al Stick: Y
-                    Expanded(
-                      flex: 2,
-                      child: _buildButton(
-                        title: 'Y',
-                        subtitle: 'Secundario',
-                        icon: Icons.change_circle_outlined,
-                        isActive: _btnYActive,
-                        borderRadius: const BorderRadius.only(
-                          topLeft: Radius.circular(14),
-                          topRight: Radius.circular(14),
-                          bottomLeft: Radius.circular(26),
-                          bottomRight: Radius.circular(26),
-                        ),
-                        colors: const [Color(0xFF6366F1), Color(0xFF3B82F6)],
-                        onDown: () => setState(() => _btnYActive = true),
-                        onUp: () => setState(() => _btnYActive = false),
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-
-                    // Centro: Thumbstick Navegación 3D
-                    Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          VirtualThumbstick(
-                            size: stickSize,
-                            knobRadius: 16.0,
-                            accentColor: const Color(0xFF00E5FF),
-                            hapticsEnabled: _hapticsEnabled,
-                            onChanged: (x, y) {
-                              _stickX = x;
-                              _stickY = y;
-                              _sendState();
-                            },
-                            onRelease: () {
-                              _stickX = 0.0;
-                              _stickY = 0.0;
-                              _sendState();
-                            },
-                          ),
-                          const SizedBox(height: 2),
-                          const Text(
-                            'NAVEGACIÓN 3D (DESPLAZAMIENTO)',
-                            style: TextStyle(
-                              color: Color(0xFF00E5FF),
-                              fontSize: 8.0,
-                              fontWeight: FontWeight.bold,
-                              letterSpacing: 0.5,
+                      Expanded(
+                        child: TextButton(
+                          onPressed: _centerSteering,
+                          child: const FittedBox(
+                            fit: BoxFit.scaleDown,
+                            child: Text(
+                              'CENTRAR VOLANTE',
+                              style: TextStyle(fontSize: 11),
                             ),
                           ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-
-                    // Botón Inferior al Stick: X
-                    Expanded(
-                      flex: 2,
-                      child: _buildButton(
-                        title: 'X',
-                        subtitle: 'Principal',
-                        icon: Icons.radio_button_checked_rounded,
-                        isActive: _btnXActive,
-                        borderRadius: const BorderRadius.only(
-                          bottomLeft: Radius.circular(14),
-                          bottomRight: Radius.circular(14),
-                          topLeft: Radius.circular(26),
-                          topRight: Radius.circular(26),
-                        ),
-                        colors: const [Color(0xFF0EA5E9), Color(0xFF06B6D4)],
-                        onDown: () => setState(() => _btnXActive = true),
-                        onUp: () => setState(() => _btnXActive = false),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            // Separator 1
-            Container(
-              width: 1.0,
-              margin: const EdgeInsets.symmetric(horizontal: 3, vertical: 8),
-              decoration: BoxDecoration(
-                color: const Color(0xFF00E5FF).withValues(alpha: 0.2),
-                borderRadius: BorderRadius.circular(1),
-              ),
-            ),
-
-            // ── 2. Columna Central: Botón Superior (Recentrar) + Espacio Slide Láser 180° + onHold Grip ──
-            Expanded(
-              flex: 5,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF101528).withValues(alpha: 0.7),
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(
-                    color: _btnGripActive
-                        ? const Color(0xFFFF9100).withValues(alpha: 0.6)
-                        : const Color(0xFF10B981).withValues(alpha: 0.3),
-                  ),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    // Top Button: Recentrar Vista
-                    SizedBox(
-                      height: btnHeight,
-                      child: _buildButton(
-                        title: 'RECENTRAR VISTA',
-                        subtitle: 'Centrar horizonte y mira',
-                        icon: Icons.filter_center_focus_rounded,
-                        isActive: _recenterTriggered,
-                        colors: const [Color(0xFFFF9100), Color(0xFFFF007F)],
-                        onDown: _recenterController,
-                        onUp: () {},
-                      ),
-                    ),
-
-                    const SizedBox(height: 4),
-
-                    // Center: Laser Slide Space (Slide táctil libre, 180° frontal estricto + onHold Grip)
-                    Expanded(
-                      child: _buildLaserSlidePad(),
-                    ),
-
-                    const SizedBox(height: 2),
-                    Center(
-                      child: Text(
-                        _btnGripActive
-                            ? '✊ GRIP (AGARRE) ACTIVO'
-                            : 'PUNTERO LÁSER (SLIDE 180° · HOLD GRIP)',
-                        style: TextStyle(
-                          color: _btnGripActive
-                              ? const Color(0xFFFF9100)
-                              : const Color(0xFF10B981),
-                          fontSize: 8.5,
-                          fontWeight: FontWeight.bold,
-                          letterSpacing: 0.6,
                         ),
                       ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            // Separator 2
-            Container(
-              width: 1.0,
-              margin: const EdgeInsets.symmetric(horizontal: 3, vertical: 8),
-              decoration: BoxDecoration(
-                color: const Color(0xFFFF9100).withValues(alpha: 0.2),
-                borderRadius: BorderRadius.circular(1),
-              ),
-            ),
-
-            // ── 3. Columna Derecha: R (Arriba) + B (Sobre Stick) + Stick Giro/Vista + A (Bajo Stick) ──
-            Expanded(
-              flex: 5,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF101528).withValues(alpha: 0.7),
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(
-                    color: const Color(0xFFFF9100).withValues(alpha: 0.3),
-                  ),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    // Botón Superior: R (Gatillo Derecho)
-                    Expanded(
-                      flex: 2,
-                      child: _buildButton(
-                        title: 'R',
-                        subtitle: 'Gatillo Derecho',
-                        icon: Icons.touch_app_rounded,
-                        isActive: _btnRActive,
-                        colors: const [Color(0xFFFF9100), Color(0xFFFF007F)],
-                        onDown: () => setState(() {
-                          _btnRActive = true;
-                          _triggerActive = true;
-                        }),
-                        onUp: () => setState(() {
-                          _btnRActive = false;
-                          _triggerActive = _btnLActive;
-                        }),
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-
-                    // Botón Superior al Stick: B
-                    Expanded(
-                      flex: 2,
-                      child: _buildButton(
-                        title: 'B',
-                        subtitle: 'Atrás / Home',
-                        icon: Icons.navigation_rounded,
-                        isActive: _btnBActive,
-                        borderRadius: const BorderRadius.only(
-                          topLeft: Radius.circular(14),
-                          topRight: Radius.circular(14),
-                          bottomLeft: Radius.circular(26),
-                          bottomRight: Radius.circular(26),
-                        ),
-                        colors: const [Color(0xFFFF007F), Color(0xFFFF5252)],
-                        onDown: () => setState(() => _btnBActive = true),
-                        onUp: () => setState(() => _btnBActive = false),
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-
-                    // Centro: Thumbstick de Vista y Giro 360°/180°
-                    Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          VirtualThumbstick(
-                            size: stickSize,
-                            knobRadius: 16.0,
-                            accentColor: const Color(0xFFFF9100),
-                            hapticsEnabled: _hapticsEnabled,
-                            onChanged: (x, y) {
-                              _lookX = x;
-                              _lookY = y;
-                              _sendState();
-                            },
-                            onRelease: () {
-                              _lookX = 0.0;
-                              _lookY = 0.0;
-                              _sendState();
-                            },
-                          ),
-                          const SizedBox(height: 2),
-                          const Text(
-                            'VISTA & GIRO (360° HORIZ / 180° VERT)',
-                            style: TextStyle(
-                              color: Color(0xFFFF9100),
-                              fontSize: 8.0,
-                              fontWeight: FontWeight.bold,
-                              letterSpacing: 0.5,
+                      Expanded(
+                        child: TextButton(
+                          onPressed: _toggleDrivingPause,
+                          child: FittedBox(
+                            fit: BoxFit.scaleDown,
+                            child: Text(
+                              driving.paused ? 'CONTINUAR' : 'PAUSAR',
+                              style: const TextStyle(fontSize: 11),
                             ),
                           ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-
-                    // Botón Inferior al Stick: A
-                    Expanded(
-                      flex: 2,
-                      child: _buildButton(
-                        title: 'A',
-                        subtitle: 'Seleccionar',
-                        icon: Icons.check_circle_outline_rounded,
-                        isActive: _btnAActive,
-                        borderRadius: const BorderRadius.only(
-                          bottomLeft: Radius.circular(14),
-                          bottomRight: Radius.circular(14),
-                          topLeft: Radius.circular(26),
-                          topRight: Radius.circular(26),
                         ),
-                        colors: const [Color(0xFF10B981), Color(0xFF00E5FF)],
-                        onDown: () => setState(() => _btnAActive = true),
-                        onUp: () => setState(() => _btnAActive = false),
+                      ),
+                    ],
+                  ),
+                  Expanded(
+                    child: FittedBox(
+                      child: Transform.rotate(
+                        key: const ValueKey('driving_wheel_rotation'),
+                        // Flutter canvas +angle is clockwise: keep this positive.
+                        // The 3D cockpit has a different projected X convention.
+                        angle: driving.steering * math.pi / 4,
+                        child: CustomPaint(
+                          size: const Size.square(100),
+                          painter: _SteeringWheelPainter(
+                            driving.paused ? Colors.grey : Colors.cyan,
+                          ),
+                        ),
                       ),
                     ),
-                  ],
-                ),
+                  ),
+                  if (!compact)
+                    Text(
+                      driving.paused
+                          ? 'PAUSA · pedales liberados'
+                          : usesMotion
+                          ? 'Gira ±55° · centro suave · derecha positiva'
+                          : 'DIRECCIÓN TÁCTIL · sin giroscopio necesario',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 10,
+                      ),
+                    ),
+                  Slider(
+                    key: const ValueKey('driving_steering_slider'),
+                    value: driving.steering,
+                    min: -1,
+                    max: 1,
+                    label: 'Dirección',
+                    onChanged: driving.paused
+                        ? null
+                        : (value) {
+                            if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                            setState(() => _steering.setTouchSteering(value));
+                            _sendState();
+                          },
+                    onChangeEnd: (_) {
+                      if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                      setState(() {
+                        // Return from touch to the current hand pose without a
+                        // sudden full-lock turn. The touch slider springs back.
+                        _steering.calibrate(_orientation);
+                      });
+                      _sendState();
+                    },
+                  ),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextButton(
+                          onPressed:
+                              _motionCapability != VrMotionCapability.available
+                              ? null
+                              : () {
+                                  setState(() {
+                                    _preferTouchSteering =
+                                        !_preferTouchSteering;
+                                    _steering.setMotionAvailable(
+                                      !_preferTouchSteering,
+                                    );
+                                  });
+                                },
+                          child: Text(
+                            usesMotion ? 'USAR TÁCTIL' : 'USAR GIRO',
+                            style: const TextStyle(fontSize: 10),
+                          ),
+                        ),
+                      ),
+                      Expanded(
+                        child: SizedBox(
+                          height: 42,
+                          child: _buildButton(
+                            title: 'ATRÁS / HOME',
+                            subtitle: 'B',
+                            icon: Icons.home_rounded,
+                            isActive: _btnBActive,
+                            colors: const [
+                              Color(0xFF7C3AED),
+                              Color(0xFF4338CA),
+                            ],
+                            onDown: () => setState(() {
+                              _steering.setPaused(true);
+                              _releaseInputs();
+                              _btnBActive = true;
+                            }),
+                            onUp: () => setState(() => _btnBActive = false),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              flex: 2,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SizedBox(
+                    height: 56,
+                    child: FilledButton(
+                      key: const ValueKey('driving_menu_select'),
+                      onPressed: _selectDrivingMenu,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xFF10B981),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                      child: const FittedBox(
+                        fit: BoxFit.scaleDown,
+                        child: Text(
+                          'A · ELEGIR',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: _buildButton(
+                      key: const ValueKey('driving_accelerator'),
+                      title: 'R · ACELERAR',
+                      subtitle: 'Mantén para acelerar',
+                      icon: Icons.speed_rounded,
+                      isActive: _btnRActive,
+                      colors: const [Color(0xFF059669), Color(0xFF0891B2)],
+                      onDown: () => setState(() {
+                        _btnRActive = !driving.paused;
+                      }),
+                      onUp: () => setState(() => _btnRActive = false),
+                    ),
+                  ),
+                ],
               ),
             ),
           ],
@@ -1524,15 +1881,406 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     );
   }
 
+  Widget _buildJoystickLayout() {
+    final surfaceEpoch = _surfaceEpoch;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (constraints.maxWidth <= 0 || constraints.maxHeight <= 0) {
+          return const SizedBox.shrink();
+        }
+        final insets = MediaQuery.viewPaddingOf(context);
+        if (_joystickSize != constraints.biggest || _joystickInsets != insets) {
+          _joystickSize = constraints.biggest;
+          _joystickInsets = insets;
+          _joystickGeometry = VrJoystickGeometry.fit(
+            constraints.biggest,
+            leftInset: insets.left,
+            rightInset: insets.right,
+          );
+          _joystickLocalPaths.clear();
+          for (final control in VrJoystickControl.values) {
+            _joystickLocalPaths[control] = _joystickGeometry!
+                .shape(control)
+                .shift(-_joystickGeometry![control].topLeft);
+          }
+        }
+        final geometry = _joystickGeometry!;
+
+        Widget button(
+          VrJoystickControl control, {
+          required String title,
+          required String subtitle,
+          required bool active,
+          required List<Color> colors,
+          required VoidCallback onDown,
+          required VoidCallback onUp,
+          Color textColor = Colors.white,
+        }) {
+          final rect = geometry[control];
+          var label = geometry.labels[control]!;
+          // A notch can cover an outer edge. Keep the full touch/paint band,
+          // but move its letter into the solid area that remains visible.
+          if (control == VrJoystickControl.y) {
+            label = Offset(
+              math.min(rect.right - 14, math.max(label.dx, insets.left + 16)),
+              label.dy,
+            );
+          } else if (control == VrJoystickControl.b) {
+            label = Offset(
+              math.max(
+                rect.left + 14,
+                math.min(label.dx, constraints.maxWidth - insets.right - 16),
+              ),
+              label.dy,
+            );
+          }
+          label = Offset(
+            label.dx,
+            label.dy.clamp(
+              insets.top + 20,
+              math.max(
+                insets.top + 20,
+                constraints.maxHeight - insets.bottom - 20,
+              ),
+            ),
+          );
+          return Positioned.fromRect(
+            rect: rect,
+            child: VrControllerRegion(
+              key: ValueKey('joystick_button_$title'),
+              path: _joystickLocalPaths[control]!,
+              labelPosition: label - rect.topLeft,
+              label: title,
+              active: active,
+              colors: colors,
+              textColor: textColor,
+              onDown: () {
+                if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                onDown();
+                _hapticMedium();
+                _sendState();
+              },
+              onUp: () {
+                if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                onUp();
+                _hapticLight();
+                _sendState();
+              },
+            ),
+          );
+        }
+
+        Widget stick(VrJoystickControl control, bool movement) {
+          final rect = geometry[control];
+          return Positioned.fromRect(
+            rect: rect,
+            child: ClipOval(
+              child: VirtualThumbstick(
+                key: ValueKey(
+                  movement ? 'joystick_move_stick' : 'joystick_look_stick',
+                ),
+                size: rect.width,
+                knobRadius: rect.width * .19,
+                accentColor: movement
+                    ? const Color(0xFF00E5FF)
+                    : const Color(0xFFFF9100),
+                hapticsEnabled: _hapticsEnabled,
+                onChanged: (x, y) {
+                  if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                  if (movement) {
+                    _stickX = x;
+                    _stickY = y;
+                  } else {
+                    _lookX = x;
+                    _lookY = y;
+                  }
+                  _sendState();
+                },
+                onRelease: () {
+                  if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                  if (movement) {
+                    _stickX = 0;
+                    _stickY = 0;
+                  } else {
+                    _lookX = 0;
+                    _lookY = 0;
+                  }
+                  _sendState();
+                },
+              ),
+            ),
+          );
+        }
+
+        return Stack(
+          key: const ValueKey('joystick_surface'),
+          children: [
+            Positioned.fromRect(
+              rect: geometry.centerPanel,
+              child: IgnorePointer(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF101528),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                      color:
+                          (_btnGripActive
+                                  ? const Color(0xFFFF9100)
+                                  : const Color(0xFF10B981))
+                              .withValues(alpha: .35),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            button(
+              VrJoystickControl.l,
+              title: 'L',
+              subtitle: 'Utilidad',
+              active: _btnLActive,
+              colors: const [Color(0xFF00A7B5), Color(0xFF395AB5)],
+              onDown: () => setState(() => _btnLActive = true),
+              onUp: () => setState(() => _btnLActive = false),
+            ),
+            button(
+              VrJoystickControl.r,
+              title: 'R',
+              subtitle: 'Gatillo',
+              active: _btnRActive,
+              colors: const [Color(0xFFFF9100), Color(0xFFD64D18)],
+              onDown: () => setState(() => _btnRActive = true),
+              onUp: () => setState(() => _btnRActive = false),
+            ),
+            button(
+              VrJoystickControl.y,
+              title: 'Y',
+              subtitle: 'Alternar',
+              active: _btnYActive,
+              colors: const [Color(0xFFFFD54F), Color(0xFFF59E0B)],
+              textColor: const Color(0xFF211500),
+              onDown: () => setState(() => _btnYActive = true),
+              onUp: () => setState(() => _btnYActive = false),
+            ),
+            button(
+              VrJoystickControl.x,
+              title: 'X',
+              subtitle: 'Acción',
+              active: _btnXActive,
+              colors: const [Color(0xFF2979FF), Color(0xFF1555BA)],
+              onDown: () => setState(() => _btnXActive = true),
+              onUp: () => setState(() => _btnXActive = false),
+            ),
+            button(
+              VrJoystickControl.b,
+              title: 'B',
+              subtitle: 'Atrás / Home',
+              active: _btnBActive,
+              colors: const [Color(0xFFFF5252), Color(0xFFB71C45)],
+              onDown: () => setState(() => _btnBActive = true),
+              onUp: () => setState(() => _btnBActive = false),
+            ),
+            button(
+              VrJoystickControl.a,
+              title: 'A',
+              subtitle: 'Seleccionar',
+              active: _btnAActive,
+              colors: const [Color(0xFF10B981), Color(0xFF087848)],
+              onDown: () => setState(() => _btnAActive = true),
+              onUp: () => setState(() => _btnAActive = false),
+            ),
+            stick(VrJoystickControl.moveStick, true),
+            stick(VrJoystickControl.lookStick, false),
+            Positioned(
+              left: geometry.centerPanel.left + 6,
+              width: geometry.centerPanel.width - 12,
+              top: 0,
+              height: geometry[VrJoystickControl.recenter].top - 4,
+              child: _buildJoystickChrome(),
+            ),
+            Positioned.fromRect(
+              rect: geometry[VrJoystickControl.recenter],
+              child: _buildButton(
+                key: const ValueKey('joystick_recenter'),
+                title: 'RECENTRAR VISTA',
+                subtitle: 'Centrar horizonte y mira',
+                icon: Icons.filter_center_focus_rounded,
+                isActive: _recenterTriggered,
+                colors: const [Color(0xFFE17815), Color(0xFFB43A77)],
+                onDown: _recenterController,
+                onUp: () {},
+              ),
+            ),
+            Positioned.fromRect(
+              rect: geometry[VrJoystickControl.laserPad],
+              child: _buildLaserSlidePad(),
+            ),
+            Positioned(
+              left: geometry.centerPanel.left + 6,
+              right: constraints.maxWidth - geometry.centerPanel.right + 6,
+              bottom: 0,
+              height: geometry.footerHeight,
+              child: _buildJoystickStatus(),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildJoystickChrome() => Material(
+    type: MaterialType.transparency,
+    child: SafeArea(
+      left: false,
+      right: false,
+      bottom: false,
+      child: Column(
+        children: [
+          Expanded(
+            child: Row(
+              children: [
+                IconButton(
+                  tooltip: 'Salir del mando',
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints.tightFor(
+                    width: 28,
+                    height: 28,
+                  ),
+                  icon: const Icon(
+                    Icons.arrow_back,
+                    size: 18,
+                    color: Colors.white70,
+                  ),
+                  onPressed: () => Navigator.of(context).maybePop(),
+                ),
+                const Expanded(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Text(
+                      'MANDO 3DoF VRLIZATE',
+                      style: TextStyle(
+                        color: Color(0xFF00E5FF),
+                        fontSize: 9,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Ajustes y Modo',
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints.tightFor(
+                    width: 28,
+                    height: 28,
+                  ),
+                  icon: const Icon(
+                    Icons.settings_rounded,
+                    size: 19,
+                    color: Color(0xFF00E5FF),
+                  ),
+                  onPressed: _openSettings,
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Row(
+              children: [
+                IconButton(
+                  tooltip: 'Configurar visor',
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints.tightFor(
+                    width: 28,
+                    height: 28,
+                  ),
+                  icon: Icon(
+                    widget.linkConnector != null
+                        ? Icons.link
+                        : (_isConnected ? Icons.wifi : Icons.wifi_off),
+                    size: 17,
+                    color: _isConnected ? Colors.greenAccent : Colors.amber,
+                  ),
+                  onPressed: _showIpConfigDialog,
+                ),
+                Expanded(
+                  child: TextButton(
+                    onPressed: _isConnecting ? null : _connect,
+                    style: TextButton.styleFrom(
+                      foregroundColor: const Color(0xFF00E5FF),
+                      padding: EdgeInsets.zero,
+                      minimumSize: Size.zero,
+                    ),
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text(
+                        _isConnected ? 'RECONECTAR' : 'CONECTAR',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+
+  Widget _buildJoystickStatus() => IgnorePointer(
+    child: Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(
+              _btnGripActive
+                  ? '✊ GRIP (AGARRE) ACTIVO'
+                  : 'PUNTERO LÁSER (SLIDE 180° · HOLD GRIP)',
+              style: const TextStyle(color: Color(0xFF10B981), fontSize: 8),
+            ),
+          ),
+          Text(
+            _status,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white60, fontSize: 9),
+          ),
+          if (_motionCapability != VrMotionCapability.available)
+            Flexible(
+              child: Text(
+                _motionCapability == VrMotionCapability.checking
+                    ? 'Comprobando giroscopio · controles táctiles disponibles'
+                    : 'Sin giroscopio disponible · usa los controles táctiles',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.amber, fontSize: 9),
+              ),
+            ),
+        ],
+      ),
+    ),
+  );
+
   Widget _buildLaserSlidePad() {
+    final surfaceEpoch = _surfaceEpoch;
     return LayoutBuilder(
       builder: (context, constraints) {
         final padWidth = constraints.maxWidth;
         final padHeight = constraints.maxHeight;
+        final compact = padWidth < 220 || padHeight < 140;
 
         void handleTouch(Offset localPos) {
-          final nx =
-              ((localPos.dx - padWidth / 2) / (padWidth / 2)).clamp(-1.0, 1.0);
+          final nx = ((localPos.dx - padWidth / 2) / (padWidth / 2)).clamp(
+            -1.0,
+            1.0,
+          );
           final ny = ((localPos.dy - padHeight / 2) / (padHeight / 2)).clamp(
             -1.0,
             1.0,
@@ -1540,13 +2288,16 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           _updateLaserSlide(nx, ny);
         }
 
-        void startTouch(Offset localPos) {
+        void startTouch(PointerDownEvent event) {
+          if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+          if (_laserSlidePointer != null) return;
+          _laserSlidePointer = event.pointer;
           setState(() => _isLaserSlideActive = true);
           if (_hapticsEnabled) HapticFeedback.selectionClick();
-          handleTouch(localPos);
+          handleTouch(event.localPosition);
           _gripHoldTimer?.cancel();
           _gripHoldTimer = Timer(const Duration(milliseconds: 280), () {
-            if (mounted && _isLaserSlideActive) {
+            if (_acceptsSurfaceInput(surfaceEpoch) && _isLaserSlideActive) {
               setState(() => _btnGripActive = true);
               if (_hapticsEnabled) HapticFeedback.heavyImpact();
               _sendState();
@@ -1554,17 +2305,24 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           });
         }
 
-        void updateTouch(Offset localPos) {
-          handleTouch(localPos);
+        void updateTouch(PointerMoveEvent event) {
+          if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+          if (event.pointer != _laserSlidePointer) return;
+          handleTouch(event.localPosition);
         }
 
-        void endTouch() {
+        void endTouch(PointerEvent event) {
+          if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+          if (event.pointer != _laserSlidePointer) return;
+          _laserSlidePointer = null;
           _gripHoldTimer?.cancel();
           _gripHoldTimer = null;
           final hadGrip = _btnGripActive;
           setState(() {
             _isLaserSlideActive = false;
             _btnGripActive = false;
+            _angularVelocity.setZero();
+            _lastGyroTime = null;
           });
           if (hadGrip && _hapticsEnabled) {
             HapticFeedback.mediumImpact();
@@ -1577,13 +2335,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         return Listener(
           key: const ValueKey('laser_slide_pad'),
           behavior: HitTestBehavior.opaque,
-          onPointerDown: (event) => startTouch(event.localPosition),
-          onPointerMove: (event) => updateTouch(event.localPosition),
-          onPointerUp: (_) => endTouch(),
-          onPointerCancel: (_) => endTouch(),
+          onPointerDown: startTouch,
+          onPointerMove: updateTouch,
+          onPointerUp: endTouch,
+          onPointerCancel: endTouch,
           child: GestureDetector(
             behavior: HitTestBehavior.translucent,
             onDoubleTap: () {
+              if (!_acceptsSurfaceInput(surfaceEpoch)) return;
               _gripHoldTimer?.cancel();
               _gripHoldTimer = null;
               _btnGripActive = false;
@@ -1591,138 +2350,156 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               if (_hapticsEnabled) HapticFeedback.mediumImpact();
             },
             child: Container(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [
-                  const Color(0xFF101E2E).withValues(alpha: 0.85),
-                  const Color(0xFF080D1A).withValues(alpha: 0.95),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    const Color(0xFF101E2E).withValues(alpha: 0.85),
+                    const Color(0xFF080D1A).withValues(alpha: 0.95),
+                  ],
+                ),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: _btnGripActive
+                      ? const Color(0xFFFF9100)
+                      : (_isLaserSlideActive
+                            ? const Color(0xFF10B981)
+                            : const Color(0xFF10B981).withValues(alpha: 0.4)),
+                  width: _btnGripActive
+                      ? 2.5
+                      : (_isLaserSlideActive ? 1.8 : 1.2),
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color:
+                        (_btnGripActive
+                                ? const Color(0xFFFF9100)
+                                : const Color(0xFF10B981))
+                            .withValues(
+                              alpha: _btnGripActive
+                                  ? 0.40
+                                  : (_isLaserSlideActive ? 0.25 : 0.08),
+                            ),
+                    blurRadius: _btnGripActive
+                        ? 20
+                        : (_isLaserSlideActive ? 14 : 6),
+                    offset: const Offset(0, 2),
+                  ),
                 ],
               ),
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(
-                color: _btnGripActive
-                    ? const Color(0xFFFF9100)
-                    : (_isLaserSlideActive
-                        ? const Color(0xFF10B981)
-                        : const Color(0xFF10B981).withValues(alpha: 0.4)),
-                width: _btnGripActive ? 2.5 : (_isLaserSlideActive ? 1.8 : 1.2),
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: (_btnGripActive
-                          ? const Color(0xFFFF9100)
-                          : const Color(0xFF10B981))
-                      .withValues(
-                    alpha: _btnGripActive
-                        ? 0.40
-                        : (_isLaserSlideActive ? 0.25 : 0.08),
-                  ),
-                  blurRadius: _btnGripActive ? 20 : (_isLaserSlideActive ? 14 : 6),
-                  offset: const Offset(0, 2),
-                ),
-              ],
-            ),
-            child: Stack(
-              children: [
-                // Custom radar / 180° grid painter
-                Positioned.fill(
-                  child: CustomPaint(
-                    painter: _LaserSlidePadPainter(
-                      normX: _laserSlideNormX,
-                      normY: _laserSlideNormY,
-                      isActive: _isLaserSlideActive,
-                      isGrip: _btnGripActive,
+              child: Stack(
+                children: [
+                  // Custom radar / 180° grid painter
+                  Positioned.fill(
+                    child: CustomPaint(
+                      painter: _LaserSlidePadPainter(
+                        normX: _laserSlideNormX,
+                        normY: _laserSlideNormY,
+                        isActive: _isLaserSlideActive,
+                        isGrip: _btnGripActive,
+                      ),
                     ),
                   ),
-                ),
 
-                // Center forward indicator
-                Positioned(
-                  top: 5,
-                  left: 0,
-                  right: 0,
-                  child: Center(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black54,
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(
-                          color: _btnGripActive
-                              ? const Color(0xFFFF9100).withValues(alpha: 0.5)
-                              : const Color(0xFF10B981).withValues(alpha: 0.3),
+                  // Center forward indicator
+                  Positioned(
+                    top: 5,
+                    left: 0,
+                    right: 0,
+                    child: Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 2,
                         ),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            _btnGripActive
-                                ? Icons.pan_tool_alt_rounded
-                                : Icons.radar_rounded,
-                            size: 11,
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(
                             color: _btnGripActive
-                                ? const Color(0xFFFF9100)
-                                : const Color(0xFF10B981),
+                                ? const Color(0xFFFF9100).withValues(alpha: 0.5)
+                                : const Color(
+                                    0xFF10B981,
+                                  ).withValues(alpha: 0.3),
                           ),
-                          const SizedBox(width: 4),
-                          Text(
-                            _btnGripActive ? '✊ GRIP ACTIVO' : '180° FRONTAL',
-                            style: TextStyle(
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              _btnGripActive
+                                  ? Icons.pan_tool_alt_rounded
+                                  : Icons.radar_rounded,
+                              size: 11,
                               color: _btnGripActive
                                   ? const Color(0xFFFF9100)
                                   : const Color(0xFF10B981),
-                              fontSize: 9.0,
-                              fontWeight: FontWeight.bold,
-                              letterSpacing: 0.6,
                             ),
-                          ),
-                        ],
+                            const SizedBox(width: 4),
+                            Flexible(
+                              child: Text(
+                                _btnGripActive
+                                    ? 'GRIP ACTIVO'
+                                    : (compact ? 'LÁSER' : '180° FRONTAL'),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: _btnGripActive
+                                      ? const Color(0xFFFF9100)
+                                      : const Color(0xFF10B981),
+                                  fontSize: 9.0,
+                                  fontWeight: FontWeight.bold,
+                                  letterSpacing: 0.6,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
-                ),
 
-                // Bottom label
-                Positioned(
-                  bottom: 5,
-                  left: 0,
-                  right: 0,
-                  child: Center(
-                    child: Text(
-                      _btnGripActive
-                          ? '✊ GRIP (AGARRE) ACTIVO · ARRASTRA PARA MOVER'
-                          : (_isLaserSlideActive
-                              ? 'APUNTANDO: (${(_laserSlideNormX * 90).toStringAsFixed(0)}°, ${(-_laserSlideNormY * 71).toStringAsFixed(0)}°)'
-                              : 'DESLIZA LÁSER · MANTÉN PRESIONADO PARA GRIP'),
-                      style: TextStyle(
-                        color: _btnGripActive
-                            ? const Color(0xFFFF9100)
+                  // Bottom label
+                  Positioned(
+                    bottom: 5,
+                    left: 0,
+                    right: 0,
+                    child: Center(
+                      child: Text(
+                        compact
+                            ? (_btnGripActive
+                                  ? 'AGARRANDO'
+                                  : 'DESLIZA · MANTÉN')
+                            : _btnGripActive
+                            ? '✊ GRIP (AGARRE) ACTIVO · ARRASTRA PARA MOVER'
                             : (_isLaserSlideActive
-                                ? const Color(0xFF10B981)
-                                : Colors.white60),
-                        fontSize: 8.5,
-                        fontWeight: FontWeight.bold,
-                        letterSpacing: 0.5,
+                                  ? 'APUNTANDO: (${(_laserSlideNormX * 90).toStringAsFixed(0)}°, ${(-_laserSlideNormY * 71).toStringAsFixed(0)}°)'
+                                  : 'DESLIZA LÁSER · MANTÉN PRESIONADO PARA GRIP'),
+                        style: TextStyle(
+                          color: _btnGripActive
+                              ? const Color(0xFFFF9100)
+                              : (_isLaserSlideActive
+                                    ? const Color(0xFF10B981)
+                                    : Colors.white60),
+                          fontSize: 8.5,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 0.5,
+                        ),
                       ),
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
-        ),
-      );
-    },
-  );
+        );
+      },
+    );
   }
 
   Widget _buildButton({
+    Key? key,
     required String title,
     required String subtitle,
     required IconData icon,
@@ -1730,21 +2507,27 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     required List<Color> colors,
     Color textColor = Colors.white,
     BorderRadius? borderRadius,
+    bool emphasizeTitle = false,
     required VoidCallback onDown,
     required VoidCallback onUp,
   }) {
+    final surfaceEpoch = _surfaceEpoch;
     return GestureDetector(
+      key: key,
       onTapDown: (_) {
+        if (!_acceptsSurfaceInput(surfaceEpoch)) return;
         onDown();
         _hapticMedium();
         _sendState();
       },
       onTapUp: (_) {
+        if (!_acceptsSurfaceInput(surfaceEpoch)) return;
         onUp();
         _hapticLight();
         _sendState();
       },
       onTapCancel: () {
+        if (!_acceptsSurfaceInput(surfaceEpoch)) return;
         onUp();
         _sendState();
       },
@@ -1777,14 +2560,17 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 mainAxisSize: MainAxisSize.min,
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Icon(icon, color: textColor, size: 22),
-                  const SizedBox(height: 3),
+                  if (!emphasizeTitle) ...[
+                    Icon(icon, color: textColor, size: 22),
+                    const SizedBox(height: 3),
+                  ],
                   Text(
                     title,
                     style: TextStyle(
                       color: textColor,
                       fontWeight: FontWeight.w900,
-                      fontSize: 13,
+                      fontSize: emphasizeTitle ? 32 : 13,
+                      height: emphasizeTitle ? 1.05 : null,
                       letterSpacing: 0.8,
                     ),
                   ),
@@ -1924,62 +2710,66 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   Widget _buildTelemetryBar() {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onDoubleTap: _recenterController,
+      onDoubleTap: _activeMode == RemoteControllerMode.driving
+          ? _centerSteering
+          : _recenterController,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
         decoration: BoxDecoration(
           color: const Color(0xFF101528),
           borderRadius: BorderRadius.circular(8),
         ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Expanded(
-            child: Row(
-              children: [
-                Container(
-                  width: 7,
-                  height: 7,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: _isConnected
-                        ? const Color(0xFF10B981)
-                        : const Color(0xFFFF007F),
-                  ),
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    _status,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Expanded(
+              child: Row(
+                children: [
+                  Container(
+                    width: 7,
+                    height: 7,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
                       color: _isConnected
                           ? const Color(0xFF10B981)
-                          : Colors.white70,
-                      fontSize: 9.5,
-                      fontWeight: FontWeight.w600,
+                          : const Color(0xFFFF007F),
                     ),
                   ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      _status,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: _isConnected
+                            ? const Color(0xFF10B981)
+                            : Colors.white70,
+                        fontSize: 9.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (MediaQuery.sizeOf(context).width >= 740) ...[
+              const SizedBox(width: 8),
+              Text(
+                'NAV: (${_stickX.toStringAsFixed(1)}, ${_stickY.toStringAsFixed(1)}) | '
+                'VISTA: (${_lookX.toStringAsFixed(1)}, ${_lookY.toStringAsFixed(1)}) | '
+                'LÁSER: (${_laserStickX.toStringAsFixed(1)}, ${_laserStickY.toStringAsFixed(1)})',
+                style: const TextStyle(
+                  color: Color(0xFF00E5FF),
+                  fontSize: 8.5,
+                  fontFamily: 'Courier',
+                  fontWeight: FontWeight.bold,
                 ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            'NAV: (${_stickX.toStringAsFixed(1)}, ${_stickY.toStringAsFixed(1)}) | '
-            'VISTA: (${_lookX.toStringAsFixed(1)}, ${_lookY.toStringAsFixed(1)}) | '
-            'LÁSER: (${_laserStickX.toStringAsFixed(1)}, ${_laserStickY.toStringAsFixed(1)})',
-            style: const TextStyle(
-              color: Color(0xFF00E5FF),
-              fontSize: 8.5,
-              fontFamily: 'Courier',
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        ],
+              ),
+            ],
+          ],
+        ),
       ),
-    ),
     );
   }
 }
@@ -2044,7 +2834,9 @@ class _LaserSlidePadPainter extends CustomPainter {
 
       // Glow halo around reticle
       final glowPaint = Paint()
-        ..color = baseColor.withValues(alpha: isGrip ? 0.5 : (isActive ? 0.35 : 0.15))
+        ..color = baseColor.withValues(
+          alpha: isGrip ? 0.5 : (isActive ? 0.35 : 0.15),
+        )
         ..maskFilter = MaskFilter.blur(BlurStyle.normal, isGrip ? 12 : 8);
       canvas.drawCircle(targetOffset, isGrip ? 18 : 14, glowPaint);
 
