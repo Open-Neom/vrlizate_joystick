@@ -111,6 +111,38 @@ void main() {
     },
   );
 
+  test('caption-only request relabels without releasing held inputs', () async {
+    final socket = await connect();
+    send(socket, 0, 0, 'joystick');
+    await _until(() => !service.latestState.isNeutralized);
+    service.requestControllerMode(
+      RemoteControllerMode.joystick,
+      actions: const {'A': 'Disparar', 'X': 'Cambiar arma'},
+    );
+    await _until(() => messages.length == 2);
+    expect(messages.last.mode, RemoteControllerMode.joystick);
+    expect(messages.last.revision, 1);
+    expect(messages.last.actions, {'A': 'Disparar', 'X': 'Cambiar arma'});
+    // Same layout: the host keeps the live state instead of neutralizing.
+    expect(service.latestState.isNeutralized, isFalse);
+    // Identical captions again: nothing new on the wire.
+    service.requestControllerMode(
+      RemoteControllerMode.joystick,
+      actions: const {'X': 'Cambiar arma', 'A': 'Disparar'},
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    expect(messages.length, 2);
+    // A layout change still releases inputs, captions included.
+    service.requestControllerMode(
+      RemoteControllerMode.driving,
+      actions: const {'B': 'Salir del coche'},
+    );
+    await _until(() => messages.length == 3);
+    expect(messages.last.revision, 2);
+    expect(messages.last.actions, {'B': 'Salir del coche'});
+    expect(service.latestState.isNeutralized, isTrue);
+  });
+
   test(
     'Riviera enter/exit rejects stale and held ACK until neutral without auto-accelerating',
     () async {

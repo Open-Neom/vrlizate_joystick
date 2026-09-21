@@ -233,10 +233,18 @@ class VrRemoteControllerService {
 
   RemoteControllerMode get recommendedMode => _modeRequest.mode;
 
-  /// Requests a controller layout for the active app. Reconnecting receives
-  /// the current recommendation again. Older clients may ignore this message;
-  /// modern clients acknowledge a neutral full state before controls resume.
-  void requestControllerMode(RemoteControllerMode mode) {
+  /// Requests a controller layout for the active app, optionally with what
+  /// each button does there ([actions], keyed `A`/`B`/`X`/`Y`/`L`/`R`/`GRIP`)
+  /// so the phone can caption its keys. Reconnecting receives the current
+  /// recommendation again. Older clients may ignore this message; modern
+  /// clients acknowledge a neutral full state before controls resume.
+  ///
+  /// A caption-only change (same mode, new actions) is sent without releasing
+  /// held inputs: it is a relabel, not a layout swap.
+  void requestControllerMode(
+    RemoteControllerMode mode, {
+    Map<String, String> actions = const {},
+  }) {
     if (mode == RemoteControllerMode.laser) {
       throw ArgumentError.value(
         mode,
@@ -244,13 +252,25 @@ class VrRemoteControllerService {
         'Use joystick with its aiming pad.',
       );
     }
-    if (_disposed || mode == _modeRequest.mode) return;
+    if (_disposed) return;
+    final clean = VrControllerModeRequest.sanitizeActions(actions);
+    final sameMode = mode == _modeRequest.mode;
+    if (sameMode && _sameActions(clean, _modeRequest.actions)) return;
     _modeRequest = VrControllerModeRequest(
       mode: mode,
       revision: _modeRequest.revision + 1,
+      actions: clean,
     );
-    _releaseInputs();
+    if (!sameMode) _releaseInputs();
     _sendControllerMode();
+  }
+
+  static bool _sameActions(Map<String, String> a, Map<String, String> b) {
+    if (a.length != b.length) return false;
+    for (final entry in a.entries) {
+      if (b[entry.key] != entry.value) return false;
+    }
+    return true;
   }
 
   void _sendControllerMode() {
@@ -1014,6 +1034,21 @@ class VrRemoteControllerService {
     let drivePulse = null;
     const buttonPointers = new Map();
 
+    // Host captions for the buttons this layout has (A, B, grip). Text only
+    // via innerText, known keys only, capped like the native client.
+    const defaultCaptions = { A: 'ELEGIR / OK', B: 'ATRÁS / HOME', GRIP: 'AGARRE / MENÚ' };
+    function applyActions(actions) {
+      const clean = {};
+      if (actions && typeof actions === 'object') {
+        for (const key of ['A', 'B', 'GRIP']) {
+          const value = actions[key];
+          if (typeof value === 'string' && value.trim()) clean[key] = value.trim().slice(0, 24);
+        }
+      }
+      document.getElementById('btnA').innerText = 'A · ' + (clean.A || defaultCaptions.A).toUpperCase();
+      document.getElementById('btnB').innerText = 'B · ' + (clean.B || defaultCaptions.B).toUpperCase();
+      document.getElementById('btnGrip').innerText = (clean.GRIP || defaultCaptions.GRIP).toUpperCase();
+    }
     function setMode(newMode) {
       if (newMode !== 'joystick' && newMode !== 'driving') return;
       releaseInputs(false);
@@ -1063,6 +1098,7 @@ class VrRemoteControllerService {
             (hostModeRevision !== null && request.revision <= hostModeRevision)) return;
         hostModeRevision = request.revision;
         setMode(request.mode); // First ACK is always fully released/paused.
+        applyActions(request.actions);
       };
 
       socket.onclose = () => {

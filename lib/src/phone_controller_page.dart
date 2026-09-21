@@ -135,6 +135,26 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   // Those recognizers can synchronously call onTapCancel under the tree lock.
   bool _surfaceMounted = true;
   final _hostModeSession = VrControllerModeSession();
+
+  /// Per-button captions sent by the host for the active experience; empty
+  /// means the generic role labels. Keyed A/B/X/Y/L/R/GRIP.
+  Map<String, String> _hostActions = const {};
+
+  /// Generic role of each button, shown until a host captions it. Must match
+  /// the host runner: X cycles modes, Y is the special action, L utility, R
+  /// the game trigger.
+  static const _defaultActions = {
+    'A': 'Seleccionar',
+    'B': 'Atrás / Home',
+    'X': 'Cambiar modo',
+    'Y': 'Acción especial',
+    'L': 'Utilidad',
+    'R': 'Gatillo',
+    'GRIP': 'Agarrar',
+  };
+
+  String _actionLabel(String key) =>
+      _hostActions[key] ?? _defaultActions[key] ?? key;
   Size? _joystickSize;
   EdgeInsets? _joystickInsets;
   bool _settingsOpen = false;
@@ -642,6 +662,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _socket = socket;
       _socketGeneration = generation;
       _hostModeSession.reset();
+    _hostActions = const {};
       if (target != null) {
         _lastTarget = target;
         _targetPort = target.port;
@@ -699,9 +720,16 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
     final request = _hostModeSession.accept(data);
     if (request == null) return;
+    if (request.mode == _activeMode) {
+      // Same layout, new captions: relabel without dropping held inputs.
+      setState(() => _hostActions = request.actions);
+      _sendState(force: true);
+      return;
+    }
     // Mode requests are scoped to this authenticated socket. Send no packet
     // between accepting its revision and installing a completely neutral mode.
     setState(() {
+      _hostActions = request.actions;
       _releaseInputs();
       _surfaceEpoch++;
       _activeMode = request.mode;
@@ -791,6 +819,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     unawaited(_closeLink(socket));
     _socketGeneration = 0;
     _hostModeSession.reset();
+    _hostActions = const {};
     if (_activeMode == RemoteControllerMode.driving) {
       _steering.setPaused(true);
     }
@@ -2036,7 +2065,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             button(
               VrJoystickControl.l,
               title: 'L',
-              subtitle: 'Utilidad',
+              subtitle: _actionLabel('L'),
               active: _btnLActive,
               colors: const [Color(0xFF00A7B5), Color(0xFF395AB5)],
               onDown: () => setState(() => _btnLActive = true),
@@ -2045,7 +2074,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             button(
               VrJoystickControl.r,
               title: 'R',
-              subtitle: 'Gatillo',
+              subtitle: _actionLabel('R'),
               active: _btnRActive,
               colors: const [Color(0xFFFF9100), Color(0xFFD64D18)],
               onDown: () => setState(() => _btnRActive = true),
@@ -2054,7 +2083,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             button(
               VrJoystickControl.y,
               title: 'Y',
-              subtitle: 'Alternar',
+              subtitle: _actionLabel('Y'),
               active: _btnYActive,
               colors: const [Color(0xFFFFD54F), Color(0xFFF59E0B)],
               textColor: const Color(0xFF211500),
@@ -2064,7 +2093,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             button(
               VrJoystickControl.x,
               title: 'X',
-              subtitle: 'Acción',
+              subtitle: _actionLabel('X'),
               active: _btnXActive,
               colors: const [Color(0xFF2979FF), Color(0xFF1555BA)],
               onDown: () => setState(() => _btnXActive = true),
@@ -2073,7 +2102,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             button(
               VrJoystickControl.b,
               title: 'B',
-              subtitle: 'Atrás / Home',
+              subtitle: _actionLabel('B'),
               active: _btnBActive,
               colors: const [Color(0xFFFF5252), Color(0xFFB71C45)],
               onDown: () => setState(() => _btnBActive = true),
@@ -2082,7 +2111,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             button(
               VrJoystickControl.a,
               title: 'A',
-              subtitle: 'Seleccionar',
+              subtitle: _actionLabel('A'),
               active: _btnAActive,
               colors: const [Color(0xFF10B981), Color(0xFF087848)],
               onDown: () => setState(() => _btnAActive = true),

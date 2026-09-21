@@ -78,4 +78,75 @@ void main() {
       );
     },
   );
+
+  group('button captions', () {
+    test('round trip known keys, drop unknown ones, cap length', () {
+      const request = VrControllerModeRequest(
+        mode: RemoteControllerMode.joystick,
+        revision: 3,
+        actions: {
+          'A': 'Disparar',
+          'x': ' Cambiar arma ',
+          'GRIP': 'Abrir puerta',
+          'Z': 'no existe',
+          'Y': '',
+          'L': 'Una etiqueta larguísima que no cabe en un botón',
+        },
+      );
+      final json = request.toJson();
+      final parsed = VrControllerModeRequest.tryParse(jsonEncode(json))!;
+      expect(parsed.actions, {
+        'A': 'Disparar',
+        'X': 'Cambiar arma',
+        'GRIP': 'Abrir puerta',
+        'L': 'Una etiqueta larguísima',
+      });
+      expect(
+        parsed.actions['L']!.length,
+        lessThanOrEqualTo(VrControllerModeRequest.maxActionLength),
+      );
+    });
+
+    test('are optional on the wire and ignored when malformed', () {
+      const plain = VrControllerModeRequest(
+        mode: RemoteControllerMode.driving,
+        revision: 1,
+      );
+      expect(plain.toJson().containsKey('actions'), isFalse);
+      final base = plain.toJson();
+      for (final actions in [
+        null,
+        'text',
+        7,
+        [],
+        {'A': 1},
+        {'A': null},
+      ]) {
+        final parsed = VrControllerModeRequest.tryParse({
+          ...base,
+          'actions': actions,
+        });
+        expect(parsed, isNotNull, reason: '$actions');
+        expect(parsed!.actions, isEmpty, reason: '$actions');
+      }
+    });
+
+    test('hostile keys cannot reach the layout', () {
+      final parsed = VrControllerModeRequest.tryParse({
+        ...const VrControllerModeRequest(
+          mode: RemoteControllerMode.joystick,
+          revision: 1,
+        ).toJson(),
+        'actions': {
+          '__proto__': 'x',
+          'constructor': 'y',
+          'A<script>': 'z',
+          'B': '<b>Atrás</b>',
+        },
+      })!;
+      expect(parsed.actions.keys, ['B']);
+      // Captions are plain text; rendering must never interpret markup.
+      expect(parsed.actions['B'], '<b>Atrás</b>');
+    });
+  });
 }
