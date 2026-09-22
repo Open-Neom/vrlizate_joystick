@@ -67,6 +67,8 @@ VrPairingPayload parseVrControllerPairingCode(
 /// Pair a native smartphone controller without leaving the app for a browser.
 /// Camera access starts only while this page is open on Android/iOS. Other
 /// platforms and denied permissions retain explicit paste/manual entry.
+/// This route requests portrait; the controller requests landscape on entry.
+/// The host owns restoring its orientation when the scanner is popped.
 class VrControllerPairingPage extends StatefulWidget {
   const VrControllerPairingPage({
     super.key,
@@ -113,6 +115,7 @@ class _VrControllerPairingPageState extends State<VrControllerPairingPage>
     _foreground =
         WidgetsBinding.instance.lifecycleState == null ||
         WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+    _applyScannerOrientation();
     final native =
         !kIsWeb &&
         (defaultTargetPlatform == TargetPlatform.android ||
@@ -137,9 +140,20 @@ class _VrControllerPairingPageState extends State<VrControllerPairingPage>
       _routeCurrent = current;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _syncCamera();
-        if (current) _openControllerIfReady();
+        if (current) {
+          _applyScannerOrientation();
+          _openControllerIfReady();
+        }
       });
     }
+  }
+
+  void _applyScannerOrientation() {
+    if (_disposed || !_foreground || !_routeCurrent || _navigated) return;
+    unawaited(
+      SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]),
+    );
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
   }
 
   void _showError(String message) {
@@ -174,7 +188,10 @@ class _VrControllerPairingPageState extends State<VrControllerPairingPage>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _foreground = state == AppLifecycleState.resumed;
     _syncCamera();
-    if (_foreground) _openControllerIfReady();
+    if (_foreground) {
+      _applyScannerOrientation();
+      _openControllerIfReady();
+    }
   }
 
   Future<void> _closeCamera() => _cameraClose ??= () async {

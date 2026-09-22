@@ -2,6 +2,7 @@
 // No phone/server/camera connection is opened. Normal test runs write nothing.
 // flutter test --no-pub test/phone_controller_layout_preview_test.dart \
 //   --dart-define=VRLIZATE_JOYSTICK_PREVIEW=/tmp/vrlizate-joystick-layout.png
+// Add --dart-define=VRLIZATE_DRIVING_PREVIEW=true for the driving profile.
 import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' as ui;
@@ -14,6 +15,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vrlizate_joystick/vrlizate_joystick.dart';
 
 const _output = String.fromEnvironment('VRLIZATE_JOYSTICK_PREVIEW');
+const _driving = bool.fromEnvironment('VRLIZATE_DRIVING_PREVIEW');
 
 Future<void> _loadFonts() async {
   final configFile = File('.dart_tool/package_config.json').absolute;
@@ -86,7 +88,12 @@ void main() {
         child: MaterialApp(
           debugShowCheckedModeBanner: false,
           theme: ThemeData.dark(useMaterial3: true),
-          home: const PhoneControllerPage(targetHost: '192.168.1.20'),
+          home: const PhoneControllerPage(
+            targetHost: '192.168.1.20',
+            initialMode: _driving
+                ? RemoteControllerMode.driving
+                : RemoteControllerMode.joystick,
+          ),
         ),
       ),
     );

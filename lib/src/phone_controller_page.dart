@@ -26,7 +26,7 @@ import 'vr_controller_link.dart';
 /// Main modes:
 /// 1. [RemoteControllerMode.joystick]: Virtual 2D analog thumbstick for smooth 3D walking/strafe
 ///    locomotion + ergonomic Gamepad button cluster (A, B, Trigger, Grip, Recenter).
-/// 2. [RemoteControllerMode.driving]: Calibrated wheel or touch steering/pedals.
+/// 2. [RemoteControllerMode.driving]: Same controls, with calibrated gyro steering.
 /// The joystick keeps its laser pad. A legacy laser initial mode is normalized
 /// to joystick; the laser wire enum remains compatible with older controllers.
 ///
@@ -51,6 +51,17 @@ class PhoneControllerPage extends StatefulWidget {
   final String? connectionLabel;
   final Duration connectionTimeout;
 
+  /// Called after a connected/authenticated link is installed. Hosts may use
+  /// this to remember the invitation in platform-backed secure storage. A null
+  /// target identifies the external provider; otherwise it is the actual
+  /// authenticated Wi-Fi destination, including a user-selected override.
+  final ValueChanged<VrControllerConnectionTarget?>? onConnected;
+
+  /// Credentials were explicitly rejected. The host should forget any saved
+  /// invitation matching this target and offer a fresh QR, rather than retry an
+  /// expired token. Null identifies the external provider, as in [onConnected].
+  final ValueChanged<VrControllerConnectionTarget?>? onSessionExpired;
+
   const PhoneControllerPage({
     super.key,
     this.initialMode = RemoteControllerMode.joystick,
@@ -63,46 +74,12 @@ class PhoneControllerPage extends StatefulWidget {
     this.linkConnector,
     this.connectionLabel,
     this.connectionTimeout = const Duration(seconds: 4),
+    this.onConnected,
+    this.onSessionExpired,
   });
 
   @override
   State<PhoneControllerPage> createState() => _PhoneControllerPageState();
-}
-
-class _SteeringWheelPainter extends CustomPainter {
-  final Color color;
-  const _SteeringWheelPainter(this.color);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final center = Offset(size.width / 2, size.height / 2);
-    final radius = size.shortestSide * 0.43;
-    final paint = Paint()
-      ..color = color
-      ..strokeWidth = radius * 0.16
-      ..strokeCap = StrokeCap.round
-      ..style = PaintingStyle.stroke;
-    canvas.drawCircle(center, radius, paint);
-    canvas.drawCircle(center, radius * 0.22, paint);
-    for (final angle in [0.0, math.pi, math.pi / 2]) {
-      final direction = Offset(math.cos(angle), math.sin(angle));
-      canvas.drawLine(
-        center + direction * radius * 0.24,
-        center + direction * radius * 0.92,
-        paint,
-      );
-    }
-    paint.color = Colors.white;
-    canvas.drawLine(
-      center - Offset(0, radius * 0.83),
-      center - Offset(0, radius * 1.08),
-      paint,
-    );
-  }
-
-  @override
-  bool shouldRepaint(_SteeringWheelPainter oldDelegate) =>
-      oldDelegate.color != color;
 }
 
 class _PhoneControllerPageState extends State<PhoneControllerPage>
@@ -117,6 +94,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   StreamSubscription<GyroscopeEvent>? _gyroSub;
   Timer? _streamTimer;
   Timer? _connectionTimeout;
+  Timer? _reconnectTimer;
   Timer? _recenterResetTimer;
   Timer? _drivingActionTimer;
   Completer<VrControllerLink>? _pendingConnection;
@@ -129,6 +107,16 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   String? _discoveredHost;
   late int _targetPort;
   int _connectionGeneration = 0;
+  bool _reconnectEnabled = false;
+  int _reconnectAttempt = 0;
+  static const _reconnectDelays = [
+    Duration(milliseconds: 500),
+    Duration(seconds: 1),
+    Duration(seconds: 2),
+    Duration(seconds: 4),
+    Duration(seconds: 8),
+    Duration(seconds: 10),
+  ];
   int _socketGeneration = 0;
   int _surfaceEpoch = 0;
   // mounted remains true while descendants dispose their gesture recognizers.
@@ -161,6 +149,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   VrJoystickGeometry? _joystickGeometry;
   final Map<VrJoystickControl, Path> _joystickLocalPaths = {};
   VrControllerConnectionTarget? _lastTarget;
+  VrControllerConnectionTarget? _socketTarget;
   String _status = 'Buscando visor en la red Wi-Fi...';
 
   late RemoteControllerMode _activeMode;
@@ -169,7 +158,6 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   VrMotionCapability _motionCapability = VrMotionCapability.checking;
   int? _lastMotionUs;
   int _lastDrivingTickUs = 0;
-  bool _preferTouchSteering = false;
 
   // Dual Joystick state
   double _stickX = 0.0;
@@ -228,8 +216,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   bool _btnGripActive = false;
   Timer? _gripHoldTimer;
 
-  // Gyroscope 3DoF state
+  // Laser aim belongs to touch; wheel motion must never rotate the pointer.
   vm.Quaternion _orientation = vm.Quaternion.identity();
+  vm.Quaternion _wheelOrientation = vm.Quaternion.identity();
   final vm.Vector3 _angularVelocity = vm.Vector3.zero();
   DateTime? _lastGyroTime;
   int _sequence = 0;
@@ -238,6 +227,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    _isForeground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
+    _reconnectEnabled =
+        widget.autoConnect &&
+        (widget.linkConnector != null || widget.targetHost?.isNotEmpty == true);
     _activeMode = widget.initialMode == RemoteControllerMode.laser
         ? RemoteControllerMode.joystick
         : widget.initialMode;
@@ -416,8 +410,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 _lastGyroTime = null;
                 return;
               }
-              final now = DateTime.now();
-              _angularVelocity.setValues(event.x, event.y, event.z);
+              final now = event.timestamp;
               if (_lastGyroTime != null) {
                 final dt =
                     (now.difference(_lastGyroTime!).inMicroseconds) / 1e6;
@@ -427,12 +420,13 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   if (angle > 1e-4) {
                     final axis = omega.normalized();
                     final deltaQ = vm.Quaternion.axisAngle(axis, angle);
-                    _orientation = (_orientation * deltaQ).normalized();
+                    _wheelOrientation = (_wheelOrientation * deltaQ)
+                        .normalized();
                   }
                 }
               }
               _lastGyroTime = now;
-              _steering.updateOrientation(_orientation);
+              _steering.updateOrientation(_wheelOrientation);
             },
             onError: (_) {
               _angularVelocity.setZero();
@@ -471,9 +465,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           _activeMode == RemoteControllerMode.driving &&
           _steering.motionAvailable;
       _motionCapability = capability;
-      _steering.setMotionAvailable(
-        capability == VrMotionCapability.available && !_preferTouchSteering,
-      );
+      _steering.setMotionAvailable(capability == VrMotionCapability.available);
       if (capability == VrMotionCapability.unavailable) {
         _angularVelocity.setZero();
         _lastGyroTime = null;
@@ -499,7 +491,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           ? RemoteControllerMode.joystick
           : mode;
       _steering.setPaused(false);
-      _steering.calibrate(_orientation);
+      _steering.calibrate(_wheelOrientation);
       _lastDrivingTickUs = _controllerClock.elapsedMicroseconds;
     });
     _hapticClick();
@@ -507,7 +499,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   void _centerSteering() {
-    setState(() => _steering.calibrate(_orientation));
+    setState(() => _steering.calibrate(_wheelOrientation));
     _hapticClick();
     _sendState();
   }
@@ -516,6 +508,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     final paused = !_steering.state.paused;
     setState(() {
       _releaseInputs();
+      _surfaceEpoch++;
       _steering.setPaused(paused);
     });
     if (paused) {
@@ -574,7 +567,6 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       final qPitch = vm.Quaternion.axisAngle(vm.Vector3(1, 0, 0), _laserPitch);
       _orientation = (qYaw * qPitch).normalized();
       _angularVelocity.setZero();
-      _lastGyroTime = null;
     });
     _sendState();
   }
@@ -614,8 +606,75 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
   }
 
-  Future<void> _connect() async {
-    if (!mounted || !_isForeground || _isConnecting) return;
+  bool get _canReconnect =>
+      mounted &&
+      _surfaceMounted &&
+      _isForeground &&
+      _reconnectEnabled &&
+      !_isConnected &&
+      !_isConnecting;
+
+  void _scheduleReconnect({bool immediately = false}) {
+    if (!_canReconnect || _reconnectTimer != null) return;
+    if (!immediately && _reconnectAttempt >= _reconnectDelays.length) {
+      setState(() {
+        _status =
+            'Visor no disponible. Vuelve a la app o pulsa CONECTAR para reintentar.';
+      });
+      return;
+    }
+    final delay = immediately
+        ? Duration.zero
+        : _reconnectDelays[_reconnectAttempt++];
+    _reconnectTimer = Timer(delay, () {
+      _reconnectTimer = null;
+      if (_canReconnect) unawaited(_connect(automatic: true));
+    });
+  }
+
+  void _stopAutomaticReconnect() {
+    _reconnectEnabled = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+  }
+
+  void _editConnectionTarget() {
+    _stopAutomaticReconnect();
+    if (_isConnecting) {
+      _cancelPendingConnection();
+      _isConnecting = false;
+    }
+  }
+
+  static bool _isSessionExpired(Object error) =>
+      (error is VrControllerConnectionException && error.isSessionExpired) ||
+      (error is WebSocketException &&
+          (error.httpStatusCode == HttpStatus.unauthorized ||
+              error.httpStatusCode == HttpStatus.forbidden));
+
+  static bool _canRetryConnection(Object error) {
+    if (_isSessionExpired(error)) return false;
+    if (error is VrControllerConnectionException) return error.canRetry;
+    if (error is TimeoutException || error is SocketException) return true;
+    if (error is WebSocketException) {
+      final status = error.httpStatusCode;
+      return status == null ||
+          status == HttpStatus.requestTimeout ||
+          status == HttpStatus.tooManyRequests ||
+          status >= 500;
+    }
+    // Unknown provider failures may be permission/configuration errors. The
+    // provider must classify them before we repeat a platform prompt.
+    return false;
+  }
+
+  Future<void> _connect({bool automatic = false}) async {
+    if (!mounted || !_surfaceMounted || !_isForeground || _isConnecting) {
+      return;
+    }
+    if (automatic && !_canReconnect) return;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     VrControllerConnectionTarget? target;
     try {
       if (widget.linkConnector == null || _useWifiOverride) {
@@ -626,18 +685,22 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           sessionToken: _lastTarget?.token ?? widget.sessionToken,
           transportType: _lastTarget == null
               ? (_useWifiOverride
-                  ? VrTransportType.localSocket
-                  : widget.transportType)
+                    ? VrTransportType.localSocket
+                    : widget.transportType)
               : VrTransportType.localSocket,
         );
       }
     } on FormatException catch (error) {
+      _stopAutomaticReconnect();
       setState(() => _status = error.message);
       return;
     } on UnsupportedError catch (error) {
+      _stopAutomaticReconnect();
       setState(() => _status = error.message ?? 'Transporte pendiente.');
       return;
     }
+    if (!automatic) _reconnectAttempt = 0;
+    _reconnectEnabled = true;
     final generation = ++_connectionGeneration;
     _releaseInputs(send: true);
     final previous = _socket;
@@ -660,9 +723,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         return;
       }
       _socket = socket;
+      _socketTarget = target;
       _socketGeneration = generation;
       _hostModeSession.reset();
-    _hostActions = const {};
+      _hostActions = const {};
+      _reconnectAttempt = 0;
       if (target != null) {
         _lastTarget = target;
         _targetPort = target.port;
@@ -687,10 +752,15 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _linkSubscription = socket.messages.listen(
         (data) => _onHostMessage(data, socket, generation),
         onDone: () => _onDisconnected(socket),
-        onError: (_) => _onDisconnected(socket),
+        onError: (Object error) => _onDisconnected(socket, error: error),
         cancelOnError: true,
       );
       _sendState();
+      // The callback is observational; a host storage failure must not tear
+      // down the authenticated controller transport.
+      if (_isConnected && identical(_socket, socket)) {
+        _notifySessionCallback(() => widget.onConnected?.call(target));
+      }
     } catch (e) {
       if (mounted && generation == _connectionGeneration) {
         _connectionGeneration++;
@@ -699,15 +769,39 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         _linkSubscription?.cancel();
         _linkSubscription = null;
         if (failedLink != null) unawaited(_closeLink(failedLink));
+        final expired = _isSessionExpired(e);
+        if (!_canRetryConnection(e)) _stopAutomaticReconnect();
         setState(() {
           _isConnected = false;
           _isConnecting = false;
           // Exceptions can contain the authenticated URL; don't echo secrets.
-          _status = widget.linkConnector != null
+          _status = expired
+              ? 'El vínculo del visor caducó. Escanea un QR nuevo para conectar.'
+              : widget.linkConnector != null && !_useWifiOverride
               ? 'No se pudo vincular por $_externalConnectionLabel. Revisa el visor, los permisos y vuelve a intentar.'
               : 'No se pudo vincular. Verifica el enlace del visor y la red Wi-Fi.';
         });
+        if (expired) {
+          _notifySessionCallback(() => widget.onSessionExpired?.call(target));
+        }
+        _scheduleReconnect();
       }
+    }
+  }
+
+  void _notifySessionCallback(VoidCallback? callback) {
+    try {
+      callback?.call();
+    } catch (error, stack) {
+      FlutterError.reportError(
+        FlutterErrorDetails(
+          exception: error,
+          stack: stack,
+          context: ErrorDescription(
+            'while updating a saved controller session',
+          ),
+        ),
+      );
     }
   }
 
@@ -776,7 +870,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           _pendingConnection = null;
           if (!socket.isOpen) {
             unawaited(_closeLink(socket));
-            completion.completeError(StateError('Controller link is closed'));
+            completion.completeError(
+              const VrControllerConnectionException(
+                'Controller link is closed',
+              ),
+            );
             return;
           }
           completion.complete(socket);
@@ -811,9 +909,17 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     } catch (_) {}
   }
 
-  void _onDisconnected(VrControllerLink socket) {
+  void _onDisconnected(VrControllerLink socket, {Object? error}) {
     if (!mounted || !_surfaceMounted || !identical(_socket, socket)) return;
+    final target = _socketTarget;
+    final expired = error != null && _isSessionExpired(error);
+    final permanent =
+        (error is VrControllerConnectionException && !error.canRetry) ||
+        (socket is VrWebSocketControllerLink &&
+            socket.socket.closeCode == WebSocketStatus.policyViolation);
+    if (expired || permanent) _stopAutomaticReconnect();
     _socket = null;
+    _socketTarget = null;
     _linkSubscription?.cancel();
     _linkSubscription = null;
     unawaited(_closeLink(socket));
@@ -828,9 +934,16 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _surfaceEpoch++;
       _isConnected = false;
       _isConnecting = false;
-      _status =
-          'Desconectado del visor. Puedes reconectar con el mismo enlace.';
+      _status = expired
+          ? 'El vínculo del visor caducó. Escanea un QR nuevo para conectar.'
+          : !_reconnectEnabled
+          ? 'Desconectado del visor. Revisa el vínculo y pulsa CONECTAR.'
+          : 'Desconectado del visor. Recuperando el vínculo...';
     });
+    if (expired) {
+      _notifySessionCallback(() => widget.onSessionExpired?.call(target));
+    }
+    _scheduleReconnect();
   }
 
   void _releaseInputs({bool send = false}) {
@@ -871,6 +984,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _shakeDetector.reset();
     _isForeground = state == AppLifecycleState.resumed;
     if (!_isForeground) {
+      _reconnectTimer?.cancel();
+      _reconnectTimer = null;
       _cancelPendingConnection();
       setState(() {
         if (_activeMode == RemoteControllerMode.driving) {
@@ -884,6 +999,13 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     } else {
       _lastGyroTime = null;
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      final socket = _socket;
+      if (socket != null && !socket.isOpen) _onDisconnected(socket);
+      _reconnectAttempt = 0;
+      // A surviving link receives neutral state immediately. A suspended or
+      // lost link gets one fresh retry cycle using the same in-memory pairing.
+      _sendState(force: true);
+      _scheduleReconnect(immediately: true);
     }
   }
 
@@ -963,7 +1085,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _laserSlideNormX = 0.0;
       _laserSlideNormY = 0.0;
       _lastGyroTime = null;
-      _steering.calibrate(_orientation);
+      _steering.calibrate(_wheelOrientation);
       _recenterTriggered = true;
     });
     _hapticMedium();
@@ -1004,6 +1126,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   void dispose() {
     _surfaceMounted = false;
     WidgetsBinding.instance.removeObserver(this);
+    _stopAutomaticReconnect();
     _cancelPendingConnection();
     _releaseInputs(send: true);
     _isForeground = false;
@@ -1023,10 +1146,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       });
     }
     _ipController.dispose();
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
+    // The next/current route owns orientation. During replacement this dispose
+    // runs after that route mounted and must not overwrite its portrait lock.
     super.dispose();
   }
 
@@ -1135,7 +1256,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       _buildSettingsModeCard(
                         title: 'CONDUCCIÓN',
                         subtitle:
-                            'Volante calibrable o dirección táctil · L frena / R acelera',
+                            'Mismos botones + giro del teléfono · L frena / R acelera',
                         icon: Icons.sports_motorsports_rounded,
                         isSelected: _activeMode == RemoteControllerMode.driving,
                         onTap: () {
@@ -1169,22 +1290,34 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                           children: [
                             if (widget.linkConnector != null) ...[
                               SegmentedButton<bool>(
-                                key: const ValueKey('controller_transport_selector'),
+                                key: const ValueKey(
+                                  'controller_transport_selector',
+                                ),
                                 segments: const [
                                   ButtonSegment(
                                     value: false,
-                                    icon: Icon(Icons.bluetooth_rounded, size: 16),
-                                    label: Text('Bluetooth LE', style: TextStyle(fontSize: 11)),
+                                    icon: Icon(
+                                      Icons.bluetooth_rounded,
+                                      size: 16,
+                                    ),
+                                    label: Text(
+                                      'Bluetooth LE',
+                                      style: TextStyle(fontSize: 11),
+                                    ),
                                   ),
                                   ButtonSegment(
                                     value: true,
                                     icon: Icon(Icons.wifi_rounded, size: 16),
-                                    label: Text('Wi-Fi local', style: TextStyle(fontSize: 11)),
+                                    label: Text(
+                                      'Wi-Fi local',
+                                      style: TextStyle(fontSize: 11),
+                                    ),
                                   ),
                                 ],
                                 selected: {_useWifiOverride},
                                 onSelectionChanged: (val) {
                                   final next = val.single;
+                                  _editConnectionTarget();
                                   setModalState(() => _useWifiOverride = next);
                                   setState(() => _useWifiOverride = next);
                                 },
@@ -1194,9 +1327,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                             Row(
                               children: [
                                 Expanded(
-                                  child: (widget.linkConnector != null && !_useWifiOverride)
+                                  child:
+                                      (widget.linkConnector != null &&
+                                          !_useWifiOverride)
                                       ? Column(
-                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
                                           children: [
                                             Text(
                                               _externalConnectionLabel,
@@ -1218,8 +1354,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                                         )
                                       : TextField(
                                           controller: _ipController,
-                                          onChanged: (_) =>
-                                              _targetEdited = true,
+                                          onChanged: (_) {
+                                            _editConnectionTarget();
+                                            setState(
+                                              () => _targetEdited = true,
+                                            );
+                                          },
                                           style: const TextStyle(
                                             color: Colors.white,
                                             fontSize: 13,
@@ -1463,7 +1603,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   @override
   Widget build(BuildContext context) {
-    if (_activeMode == RemoteControllerMode.joystick) {
+    if (_activeMode != RemoteControllerMode.laser) {
       // Bands reach the available display edges. Insets protect labels and
       // central settings only, never add a dead footer beneath X/A.
       return Scaffold(
@@ -1547,7 +1687,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   child: switch (_activeMode) {
                     RemoteControllerMode.joystick => _buildJoystickLayout(),
                     RemoteControllerMode.laser => _buildLaserPointerLayout(),
-                    RemoteControllerMode.driving => _buildDrivingLayout(),
+                    RemoteControllerMode.driving => _buildJoystickLayout(),
                   },
                 ),
               ),
@@ -1687,230 +1827,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   // ─── Modo Joystick Virtual Layout ────────────────────────────────────────
 
-  Widget _buildDrivingLayout() {
-    final surfaceEpoch = _surfaceEpoch;
-    final driving = _steering.state;
-    final usesMotion = _steering.motionAvailable;
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final compact = constraints.maxHeight < 190;
-        return Row(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Expanded(
-              flex: 2,
-              child: _buildButton(
-                title: 'L · FRENO',
-                subtitle: 'Mantén para frenar',
-                icon: Icons.back_hand_rounded,
-                isActive: _btnLActive,
-                colors: const [Color(0xFFDC2626), Color(0xFF9F1239)],
-                onDown: () => setState(() {
-                  _btnLActive = !driving.paused;
-                }),
-                onUp: () => setState(() => _btnLActive = false),
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              flex: 5,
-              child: Column(
-                children: [
-                  Row(
-                    children: [
-                      IconButton(
-                        tooltip: 'Reiniciar carrera',
-                        onPressed: () {
-                          setState(() {
-                            _steering.setPaused(true);
-                            _releaseInputs();
-                          });
-                          _pulseDrivingAction(reset: true);
-                        },
-                        icon: const Icon(Icons.replay, color: Colors.white70),
-                      ),
-                      Expanded(
-                        child: TextButton(
-                          onPressed: _centerSteering,
-                          child: const FittedBox(
-                            fit: BoxFit.scaleDown,
-                            child: Text(
-                              'CENTRAR VOLANTE',
-                              style: TextStyle(fontSize: 11),
-                            ),
-                          ),
-                        ),
-                      ),
-                      Expanded(
-                        child: TextButton(
-                          onPressed: _toggleDrivingPause,
-                          child: FittedBox(
-                            fit: BoxFit.scaleDown,
-                            child: Text(
-                              driving.paused ? 'CONTINUAR' : 'PAUSAR',
-                              style: const TextStyle(fontSize: 11),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  Expanded(
-                    child: FittedBox(
-                      child: Transform.rotate(
-                        key: const ValueKey('driving_wheel_rotation'),
-                        // Flutter canvas +angle is clockwise: keep this positive.
-                        // The 3D cockpit has a different projected X convention.
-                        angle: driving.steering * math.pi / 4,
-                        child: CustomPaint(
-                          size: const Size.square(100),
-                          painter: _SteeringWheelPainter(
-                            driving.paused ? Colors.grey : Colors.cyan,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  if (!compact)
-                    Text(
-                      driving.paused
-                          ? 'PAUSA · pedales liberados'
-                          : usesMotion
-                          ? 'Gira ±55° · centro suave · derecha positiva'
-                          : 'DIRECCIÓN TÁCTIL · sin giroscopio necesario',
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        color: Colors.white70,
-                        fontSize: 10,
-                      ),
-                    ),
-                  Slider(
-                    key: const ValueKey('driving_steering_slider'),
-                    value: driving.steering,
-                    min: -1,
-                    max: 1,
-                    label: 'Dirección',
-                    onChanged: driving.paused
-                        ? null
-                        : (value) {
-                            if (!_acceptsSurfaceInput(surfaceEpoch)) return;
-                            setState(() => _steering.setTouchSteering(value));
-                            _sendState();
-                          },
-                    onChangeEnd: (_) {
-                      if (!_acceptsSurfaceInput(surfaceEpoch)) return;
-                      setState(() {
-                        // Return from touch to the current hand pose without a
-                        // sudden full-lock turn. The touch slider springs back.
-                        _steering.calibrate(_orientation);
-                      });
-                      _sendState();
-                    },
-                  ),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextButton(
-                          onPressed:
-                              _motionCapability != VrMotionCapability.available
-                              ? null
-                              : () {
-                                  setState(() {
-                                    _preferTouchSteering =
-                                        !_preferTouchSteering;
-                                    _steering.setMotionAvailable(
-                                      !_preferTouchSteering,
-                                    );
-                                  });
-                                },
-                          child: Text(
-                            usesMotion ? 'USAR TÁCTIL' : 'USAR GIRO',
-                            style: const TextStyle(fontSize: 10),
-                          ),
-                        ),
-                      ),
-                      Expanded(
-                        child: SizedBox(
-                          height: 42,
-                          child: _buildButton(
-                            title: 'ATRÁS / HOME',
-                            subtitle: 'B',
-                            icon: Icons.home_rounded,
-                            isActive: _btnBActive,
-                            colors: const [
-                              Color(0xFF7C3AED),
-                              Color(0xFF4338CA),
-                            ],
-                            onDown: () => setState(() {
-                              _steering.setPaused(true);
-                              _releaseInputs();
-                              _btnBActive = true;
-                            }),
-                            onUp: () => setState(() => _btnBActive = false),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              flex: 2,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  SizedBox(
-                    height: 56,
-                    child: FilledButton(
-                      key: const ValueKey('driving_menu_select'),
-                      onPressed: _selectDrivingMenu,
-                      style: FilledButton.styleFrom(
-                        backgroundColor: const Color(0xFF10B981),
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                      ),
-                      child: const FittedBox(
-                        fit: BoxFit.scaleDown,
-                        child: Text(
-                          'A · ELEGIR',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 16,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Expanded(
-                    child: _buildButton(
-                      key: const ValueKey('driving_accelerator'),
-                      title: 'R · ACELERAR',
-                      subtitle: 'Mantén para acelerar',
-                      icon: Icons.speed_rounded,
-                      isActive: _btnRActive,
-                      colors: const [Color(0xFF059669), Color(0xFF0891B2)],
-                      onDown: () => setState(() {
-                        _btnRActive = !driving.paused;
-                      }),
-                      onUp: () => setState(() => _btnRActive = false),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
   Widget _buildJoystickLayout() {
+    final driving = _activeMode == RemoteControllerMode.driving;
     final surfaceEpoch = _surfaceEpoch;
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -2019,6 +1937,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   if (movement) {
                     _stickX = x;
                     _stickY = y;
+                    if (driving && !_steering.motionAvailable) {
+                      _steering.setTouchSteering(x);
+                    }
                   } else {
                     _lookX = x;
                     _lookY = y;
@@ -2030,6 +1951,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   if (movement) {
                     _stickX = 0;
                     _stickY = 0;
+                    if (driving) _steering.setTouchSteering(null);
                   } else {
                     _lookX = 0;
                     _lookY = 0;
@@ -2068,7 +1990,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               subtitle: _actionLabel('L'),
               active: _btnLActive,
               colors: const [Color(0xFF00A7B5), Color(0xFF395AB5)],
-              onDown: () => setState(() => _btnLActive = true),
+              onDown: () => setState(
+                () => _btnLActive = !driving || !_steering.state.paused,
+              ),
               onUp: () => setState(() => _btnLActive = false),
             ),
             button(
@@ -2077,7 +2001,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               subtitle: _actionLabel('R'),
               active: _btnRActive,
               colors: const [Color(0xFFFF9100), Color(0xFFD64D18)],
-              onDown: () => setState(() => _btnRActive = true),
+              onDown: () => setState(
+                () => _btnRActive = !driving || !_steering.state.paused,
+              ),
               onUp: () => setState(() => _btnRActive = false),
             ),
             button(
@@ -2096,7 +2022,18 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               subtitle: _actionLabel('X'),
               active: _btnXActive,
               colors: const [Color(0xFF2979FF), Color(0xFF1555BA)],
-              onDown: () => setState(() => _btnXActive = true),
+              onDown: () {
+                if (driving) {
+                  setState(() {
+                    _steering.setPaused(true);
+                    _releaseInputs();
+                    _surfaceEpoch++;
+                  });
+                  _pulseDrivingAction(reset: true);
+                } else {
+                  setState(() => _btnXActive = true);
+                }
+              },
               onUp: () => setState(() => _btnXActive = false),
             ),
             button(
@@ -2105,7 +2042,13 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               subtitle: _actionLabel('B'),
               active: _btnBActive,
               colors: const [Color(0xFFFF5252), Color(0xFFB71C45)],
-              onDown: () => setState(() => _btnBActive = true),
+              onDown: () => setState(() {
+                if (driving) {
+                  _steering.setPaused(true);
+                  _releaseInputs();
+                }
+                _btnBActive = true;
+              }),
               onUp: () => setState(() => _btnBActive = false),
             ),
             button(
@@ -2114,7 +2057,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               subtitle: _actionLabel('A'),
               active: _btnAActive,
               colors: const [Color(0xFF10B981), Color(0xFF087848)],
-              onDown: () => setState(() => _btnAActive = true),
+              onDown: driving
+                  ? _selectDrivingMenu
+                  : () => setState(() => _btnAActive = true),
               onUp: () => setState(() => _btnAActive = false),
             ),
             stick(VrJoystickControl.moveStick, true),
@@ -2130,12 +2075,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               rect: geometry[VrJoystickControl.recenter],
               child: _buildButton(
                 key: const ValueKey('joystick_recenter'),
-                title: 'RECENTRAR VISTA',
-                subtitle: 'Centrar horizonte y mira',
+                title: driving ? 'CENTRAR VOLANTE' : 'RECENTRAR VISTA',
+                subtitle: driving
+                    ? 'Teléfono recto = dirección al centro'
+                    : 'Centrar horizonte y mira',
                 icon: Icons.filter_center_focus_rounded,
                 isActive: _recenterTriggered,
                 colors: const [Color(0xFFE17815), Color(0xFFB43A77)],
-                onDown: _recenterController,
+                onDown: driving ? _centerSteering : _recenterController,
                 onUp: () {},
               ),
             ),
@@ -2148,7 +2095,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               right: constraints.maxWidth - geometry.centerPanel.right + 6,
               bottom: 0,
               height: geometry.footerHeight,
-              child: _buildJoystickStatus(),
+              child: driving ? _buildDrivingStatus() : _buildJoystickStatus(),
             ),
           ],
         );
@@ -2258,6 +2205,45 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     ),
   );
 
+  Widget _buildDrivingStatus() => Column(
+    mainAxisAlignment: MainAxisAlignment.center,
+    children: [
+      const FittedBox(
+        fit: BoxFit.scaleDown,
+        child: Text(
+          'L · FRENO    R · ACELERAR    A · ELEGIR',
+          style: TextStyle(color: Colors.white70, fontSize: 9),
+        ),
+      ),
+      FittedBox(
+        fit: BoxFit.scaleDown,
+        child: Text(
+          _steering.state.paused
+              ? 'PAUSA · pedales liberados'
+              : _steering.motionAvailable
+              ? 'Gira el teléfono para mover el volante'
+              : 'DIRECCIÓN TÁCTIL · joystick izquierdo',
+          style: const TextStyle(color: Color(0xFF10B981), fontSize: 9),
+        ),
+      ),
+      SizedBox(
+        height: 30,
+        child: TextButton(
+          onPressed: _toggleDrivingPause,
+          style: TextButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            minimumSize: Size.zero,
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+          child: Text(
+            _steering.state.paused ? 'CONTINUAR' : 'PAUSAR',
+            style: const TextStyle(fontSize: 10),
+          ),
+        ),
+      ),
+    ],
+  );
+
   Widget _buildJoystickStatus() => IgnorePointer(
     child: Padding(
       padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
@@ -2351,7 +2337,6 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             _isLaserSlideActive = false;
             _btnGripActive = false;
             _angularVelocity.setZero();
-            _lastGyroTime = null;
           });
           if (hadGrip && _hapticsEnabled) {
             HapticFeedback.mediumImpact();

@@ -185,6 +185,80 @@ void main() {
   });
 
   testWidgets(
+    'scanner owns portrait only while its route is current and resumed',
+    (tester) async {
+      const portraitSize = Size(360, 800);
+      await tester.binding.setSurfaceSize(portraitSize);
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final camera = _FakeCamera();
+      final orientations = <Object?>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+            if (call.method == 'SystemChrome.setPreferredOrientations') {
+              orientations.add(call.arguments);
+            }
+            return null;
+          });
+      final navigation = GlobalKey<NavigatorState>();
+      await tester.pumpWidget(
+        MaterialApp(
+          navigatorKey: navigation,
+          home: VrControllerPairingPage(cameraFactory: () => camera),
+        ),
+      );
+      await _settle(tester);
+      expect(orientations.last, ['DeviceOrientation.portraitUp']);
+      final preview = tester.getRect(
+        find.byKey(const ValueKey('fake_camera_preview')),
+      );
+      final viewport = Offset.zero & portraitSize;
+      expect(viewport.contains(preview.topLeft), isTrue);
+      expect(
+        viewport.contains(preview.bottomRight),
+        isTrue,
+        reason: 'The whole QR preview must be visible on a portrait phone.',
+      );
+
+      orientations.clear();
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      await tester.pump();
+      expect(orientations, isEmpty);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await _settle(tester);
+      expect(orientations.last, ['DeviceOrientation.portraitUp']);
+
+      unawaited(
+        navigation.currentState!.push(
+          MaterialPageRoute<void>(
+            builder: (_) => const Scaffold(body: Text('covering_route')),
+          ),
+        ),
+      );
+      await _settle(tester);
+      orientations.clear();
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await _settle(tester);
+      expect(orientations, isEmpty);
+
+      navigation.currentState!.pop();
+      await _settle(tester);
+      expect(orientations.last, ['DeviceOrientation.portraitUp']);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _flush(tester);
+    },
+  );
+
+  testWidgets(
     'camera starts only after opening page; duplicate QR opens once after stop/dispose',
     (tester) async {
       final camera = _FakeCamera()

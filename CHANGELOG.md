@@ -1,6 +1,17 @@
 # Changelog
 
-## 0.2.0 — Unreleased / Sin publicar
+## 0.2.0 - 2026-09-22
+
+- Request portrait while the QR scanner is the active route; the controller
+  requests landscape on entry. Do not overwrite a replacement route's
+  orientation when an old controller disposes after its navigation animation.
+
+- Recover transient native-controller disconnections with six bounded retries;
+  pause releases input while preserving a live link, and resume rearms recovery.
+  Cancel obsolete attempts on destination changes and reject stale completions.
+- Add authenticated-target callbacks for host-owned invitation storage and
+  receiver telemetry for input age, accepted/rejected states, watchdog releases
+  and disconnect reasons. Input age uses local time and is not RTT.
 
 - Prefer Wi-Fi/hotspot LAN addresses for pairing; never advertise cellular,
   VPN or loopback addresses. Refresh the advertised address without rotating

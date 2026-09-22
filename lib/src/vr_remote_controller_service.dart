@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:vector_math/vector_math.dart' as vm;
@@ -20,6 +21,39 @@ import 'vr_controller_link.dart';
 export 'vr_controller_mode.dart';
 
 enum _ControllerWireFormat { json, binaryPose }
+
+/// Local reasons only; never contains transport URLs, tokens or error text.
+enum VrControllerDisconnectReason {
+  connectionClosed,
+  transportError,
+  inputLimitExceeded,
+  replaced,
+  serviceStopped,
+}
+
+/// A cheap, immutable snapshot of receiver-side controller health.
+///
+/// Counters accumulate for the service's lifetime, including reconnects.
+/// [inputAge] uses only the visor's monotonic clock: it is time since the last
+/// accepted state on the current link, not network latency or remote clock age.
+@immutable
+class VrControllerTelemetry {
+  const VrControllerTelemetry({
+    required this.isConnected,
+    required this.inputAge,
+    required this.acceptedStates,
+    required this.rejectedStates,
+    required this.watchdogNeutralizations,
+    required this.lastDisconnectReason,
+  });
+
+  final bool isConnected;
+  final Duration? inputAge;
+  final int acceptedStates;
+  final int rejectedStates;
+  final int watchdogNeutralizations;
+  final VrControllerDisconnectReason? lastDisconnectReason;
+}
 
 /// Orientation, analog thumbstick and button state emitted by the remote smartphone controller.
 class RemoteControllerState {
@@ -147,6 +181,7 @@ class VrRemoteControllerService {
   VrControllerLink? _client;
   StreamSubscription<Object?>? _clientSubscription;
   final Stopwatch _clock = Stopwatch()..start();
+  final int Function()? _nowMicroseconds;
   Future<bool>? _startOperation;
   bool _isRunning = false;
   bool _disposed = false;
@@ -159,6 +194,11 @@ class VrRemoteControllerService {
   int? _lastSequence;
   _ControllerWireFormat? _wireFormat;
   int? _lastStateReceivedUs;
+  int? _lastAcceptedStateUs;
+  int _acceptedStates = 0;
+  int _rejectedStates = 0;
+  int _watchdogNeutralizations = 0;
+  VrControllerDisconnectReason? _lastDisconnectReason;
   int _rateWindowStartUs = 0;
   int _rateWindowCount = 0;
   VrControllerModeRequest _modeRequest = const VrControllerModeRequest(
@@ -178,7 +218,9 @@ class VrRemoteControllerService {
     @visibleForTesting
     Future<Iterable<VrLocalAddressCandidate>> Function()?
     localAddressCandidates,
+    @visibleForTesting int Function()? nowMicroseconds,
   }) : sessionToken = sessionToken ?? _createSessionToken(),
+       _nowMicroseconds = nowMicroseconds,
        _localAddressCandidates =
            localAddressCandidates ?? _systemLocalAddressCandidates {
     if (inputTimeout <= Duration.zero || watchdogInterval <= Duration.zero) {
@@ -231,6 +273,22 @@ class VrRemoteControllerService {
   String? get localIp => _localIp;
   RemoteControllerState get latestState => _latestState;
 
+  int get _nowUs => _nowMicroseconds?.call() ?? _clock.elapsedMicroseconds;
+
+  VrControllerTelemetry get telemetry {
+    final received = _lastAcceptedStateUs;
+    return VrControllerTelemetry(
+      isConnected: isConnected,
+      inputAge: received == null
+          ? null
+          : Duration(microseconds: math.max(0, _nowUs - received)),
+      acceptedStates: _acceptedStates,
+      rejectedStates: _rejectedStates,
+      watchdogNeutralizations: _watchdogNeutralizations,
+      lastDisconnectReason: _lastDisconnectReason,
+    );
+  }
+
   RemoteControllerMode get recommendedMode => _modeRequest.mode;
 
   /// Requests a controller layout for the active app, optionally with what
@@ -279,7 +337,10 @@ class VrRemoteControllerService {
     try {
       client.add(jsonEncode(_modeRequest.toJson()));
     } catch (_) {
-      _disconnectClient(client);
+      _disconnectClient(
+        client,
+        reason: VrControllerDisconnectReason.transportError,
+      );
     }
   }
 
@@ -478,9 +539,9 @@ class VrRemoteControllerService {
     _inputWatchdog ??= Timer.periodic(watchdogInterval, (_) {
       final received = _lastStateReceivedUs;
       if (received != null &&
-          _clock.elapsedMicroseconds - received >=
-              inputTimeout.inMicroseconds) {
+          _nowUs - received >= inputTimeout.inMicroseconds) {
         _lastStateReceivedUs = null;
+        _watchdogNeutralizations++;
         _releaseInputs();
       }
     });
@@ -510,13 +571,15 @@ class VrRemoteControllerService {
     _wireFormat = null;
     _fallbackSequence = 0;
     _lastStateReceivedUs = null;
-    _rateWindowStartUs = _clock.elapsedMicroseconds;
+    _lastAcceptedStateUs = null;
+    _rateWindowStartUs = _nowUs;
     _rateWindowCount = 0;
     _acceptedModeRevision = null;
     _modeControlSupported = false;
     _releaseInputs(controllerVisible: true);
     if (previous == null) _connectionController.add(true);
     if (previous != null) {
+      _lastDisconnectReason = VrControllerDisconnectReason.replaced;
       unawaited(
         _closeLink(
           previous,
@@ -533,7 +596,7 @@ class VrRemoteControllerService {
     _clientSubscription = socket.messages.listen(
       (data) {
         if (!identical(socket, _client) || _disposed) return;
-        final now = _clock.elapsedMicroseconds;
+        final now = _nowUs;
         if (now - _rateWindowStartUs >= Duration.microsecondsPerSecond) {
           _rateWindowStartUs = now;
           _rateWindowCount = 0;
@@ -544,15 +607,20 @@ class VrRemoteControllerService {
             (isBinary
                 ? data.length > VrRemoteBinaryCodec.posePacketLength
                 : (data is! String || data.length > _maxMessageCharacters))) {
+          _rejectedStates++;
           _disconnectClient(
             socket,
             closeCode: WebSocketStatus.policyViolation,
             closeReason: 'Input limit exceeded',
+            reason: VrControllerDisconnectReason.inputLimitExceeded,
           );
           return;
         }
         if (isBinary) {
-          if (_wireFormat == _ControllerWireFormat.json) return;
+          if (_wireFormat == _ControllerWireFormat.json) {
+            _rejectedStates++;
+            return;
+          }
           try {
             final bytes = data is Uint8List ? data : Uint8List.fromList(data);
             final pose = const VrRemoteBinaryCodec().decodePose(bytes);
@@ -560,7 +628,10 @@ class VrRemoteControllerService {
               // Serial-number arithmetic: duplicates, stale frames and the
               // ambiguous half-range are rejected, including around 65535→0.
               final advance = (pose.sequence - _lastSequence!) & 0xFFFF;
-              if (advance == 0 || advance >= 0x8000) return;
+              if (advance == 0 || advance >= 0x8000) {
+                _rejectedStates++;
+                return;
+              }
             }
             final buttons = pose.buttonsBitset;
             final bool trigger = (buttons & 0x0001) != 0;
@@ -602,18 +673,29 @@ class VrRemoteControllerService {
               mode: RemoteControllerMode.joystick,
             );
 
+            _lastAcceptedStateUs = now;
+            _acceptedStates++;
             _stateController.add(_latestState);
-          } catch (_) {}
+          } catch (_) {
+            _rejectedStates++;
+          }
           return;
         }
-        if (_wireFormat == _ControllerWireFormat.binaryPose) return;
+        if (_wireFormat == _ControllerWireFormat.binaryPose) {
+          _rejectedStates++;
+          return;
+        }
         try {
           final decoded = jsonDecode(data as String);
-          if (decoded is! Map<String, dynamic>) return;
+          if (decoded is! Map<String, dynamic>) {
+            _rejectedStates++;
+            return;
+          }
           final json = decoded;
           final sequence = _optionalCounter(json, 'sequence');
           if (_lastSequence != null &&
               (sequence == null || sequence <= _lastSequence!)) {
+            _rejectedStates++;
             return;
           }
           final timestampUs = _optionalCounter(json, 'timestampUs');
@@ -722,7 +804,10 @@ class VrRemoteControllerService {
           };
           final drivingPaused = json['drivingPaused'] == true;
           final hostModeRevision = _optionalCounter(json, 'hostModeRevision');
-          if (!_acceptsModeState(json, hostModeRevision, mode)) return;
+          if (!_acceptsModeState(json, hostModeRevision, mode)) {
+            _rejectedStates++;
+            return;
+          }
           final drivingActive =
               mode == RemoteControllerMode.driving && !drivingPaused;
           double drivingAxis(String key, double min) => drivingActive
@@ -781,11 +866,18 @@ class VrRemoteControllerService {
             mode: mode,
           );
 
+          _lastAcceptedStateUs = now;
+          _acceptedStates++;
           _stateController.add(_latestState);
-        } catch (_) {}
+        } catch (_) {
+          _rejectedStates++;
+        }
       },
       onDone: () => _disconnectClient(socket),
-      onError: (_) => _disconnectClient(socket),
+      onError: (_) => _disconnectClient(
+        socket,
+        reason: VrControllerDisconnectReason.transportError,
+      ),
       cancelOnError: true,
     );
     _sendControllerMode();
@@ -855,13 +947,17 @@ class VrRemoteControllerService {
     VrControllerLink socket, {
     int? closeCode,
     String? closeReason,
+    VrControllerDisconnectReason reason =
+        VrControllerDisconnectReason.connectionClosed,
   }) {
     if (!identical(socket, _client)) return;
+    _lastDisconnectReason = reason;
     _client = null;
     _clientSubscription?.cancel();
     _clientSubscription = null;
     unawaited(_closeLink(socket, closeCode, closeReason));
     _lastStateReceivedUs = null;
+    _lastAcceptedStateUs = null;
     _releaseInputs();
     if (!_disposed) _connectionController.add(false);
   }
@@ -1274,7 +1370,11 @@ class VrRemoteControllerService {
     _beaconSocket = null;
     final client = _client;
     if (client != null) {
-      _disconnectClient(client, closeCode: WebSocketStatus.goingAway);
+      _disconnectClient(
+        client,
+        closeCode: WebSocketStatus.goingAway,
+        reason: VrControllerDisconnectReason.serviceStopped,
+      );
     }
     unawaited(_server?.close(force: true));
     _server = null;

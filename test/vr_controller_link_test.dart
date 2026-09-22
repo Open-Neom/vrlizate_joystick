@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -238,6 +239,82 @@ void main() {
     await disconnect;
     expect(link.closeCode, 1008);
     expect(service.latestState.isNeutralized, isTrue);
+    expect(service.telemetry.rejectedStates, 1);
+    expect(
+      service.telemetry.lastDisconnectReason,
+      VrControllerDisconnectReason.inputLimitExceeded,
+    );
+  });
+
+  testWidgets('telemetry measures local age, rejected input and watchdog once', (
+    tester,
+  ) async {
+    var nowUs = 0;
+    final service = VrRemoteControllerService(
+      nowMicroseconds: () => nowUs,
+      inputTimeout: const Duration(milliseconds: 50),
+      watchdogInterval: const Duration(milliseconds: 10),
+    );
+    addTearDown(service.dispose);
+    final first = _Link();
+    service.attachControllerLink(first, sessionToken: service.sessionToken);
+    expect(service.telemetry.isConnected, isTrue);
+    expect(service.telemetry.inputAge, isNull);
+    expect(service.telemetry.acceptedStates, 0);
+    // A sender clock far ahead must never become a negative/network "latency".
+    first.inbound.add(
+      '{"sequence":1,"timestampUs":9000000000000000,"btnA":true}',
+    );
+    await tester.pump();
+    expect(service.telemetry.inputAge, Duration.zero);
+    expect(service.telemetry.acceptedStates, 1);
+    nowUs = 40000;
+    first.inbound.add('{"sequence":1,"btnA":false}'); // Duplicate.
+    first.inbound.add('{"sequence":2,"stickX":"not a number"}');
+    await tester.pump(const Duration(milliseconds: 10));
+    expect(service.telemetry.inputAge, const Duration(milliseconds: 40));
+    expect(service.telemetry.rejectedStates, 2);
+    expect(service.latestState.btnA, isTrue);
+    final snapshot = service.telemetry;
+    nowUs = 50000;
+    await tester.pump(const Duration(milliseconds: 10));
+    expect(service.latestState.isNeutralized, isTrue);
+    expect(service.telemetry.watchdogNeutralizations, 1);
+    expect(service.telemetry.inputAge, const Duration(milliseconds: 50));
+    expect(snapshot.inputAge, const Duration(milliseconds: 40));
+    nowUs = 150000;
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(service.telemetry.watchdogNeutralizations, 1);
+    first.inbound.add('{"sequence":2}');
+    await tester.pump();
+    expect(service.telemetry.acceptedStates, 2);
+    expect(service.telemetry.inputAge, Duration.zero);
+    final replacement = _Link();
+    service.attachControllerLink(
+      replacement,
+      sessionToken: service.sessionToken,
+    );
+    expect(service.telemetry.inputAge, isNull);
+    expect(service.telemetry.acceptedStates, 2);
+    expect(
+      service.telemetry.lastDisconnectReason,
+      VrControllerDisconnectReason.replaced,
+    );
+    replacement.inbound.addError(StateError('private transport detail'));
+    await tester.pump();
+    expect(service.telemetry.isConnected, isFalse);
+    expect(service.telemetry.inputAge, isNull);
+    expect(
+      service.telemetry.lastDisconnectReason,
+      VrControllerDisconnectReason.transportError,
+    );
+    service.attachControllerLink(_Link(), sessionToken: service.sessionToken);
+    service.stop();
+    expect(
+      service.telemetry.lastDisconnectReason,
+      VrControllerDisconnectReason.serviceStopped,
+    );
+    service.dispose();
   });
 
   testWidgets('native external link bypasses IP, exchanges A/B and mode ACK', (
@@ -368,9 +445,8 @@ void main() {
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
     await tester.pump();
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
-    await tester.pump();
-    await tester.tap(find.text('CONECTAR'));
-    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 1));
+    // Resuming now recovers the cancelled attempt without requiring a tap.
     expect(attempts, 2);
     final active = _Link();
     second.complete(active);
@@ -384,6 +460,245 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(milliseconds: 200));
     expect(active.closeCount, 1);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('transport loss retries with a neutral new session', (
+    tester,
+  ) async {
+    final links = <_Link>[];
+    final authenticated = <VrControllerConnectionTarget?>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PhoneControllerPage(
+          autoConnect: true,
+          onConnected: authenticated.add,
+          linkConnector: () async {
+            final link = _Link();
+            links.add(link);
+            return link;
+          },
+        ),
+      ),
+    );
+    await tester.pump();
+    final held = await tester.startGesture(tester.getCenter(find.text('A')));
+    await tester.pump(const Duration(milliseconds: 110));
+    expect(
+      links.single.sent
+          .map((p) => jsonDecode(p as String))
+          .any((p) => p['btnA'] == true),
+      isTrue,
+    );
+    await links.single.close();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 499));
+    expect(links, hasLength(1));
+    await tester.pump(const Duration(milliseconds: 1));
+    await tester.pump();
+    expect(links, hasLength(2));
+    expect(authenticated, [null, null]);
+    final first = jsonDecode(links.last.sent.first as String);
+    expect(first['sequence'], 0);
+    for (final button in [
+      'btnA',
+      'btnB',
+      'btnX',
+      'btnY',
+      'btnL',
+      'btnR',
+      'btnGrip',
+    ]) {
+      expect(first[button], isFalse, reason: button);
+    }
+    expect(first['stickX'], 0);
+    expect(first['stickY'], 0);
+    expect(first['lookX'], 0);
+    expect(first['lookY'], 0);
+    await held.up();
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(links.last.closeCount, 1);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('a controller created while paused waits for resume to connect', (
+    tester,
+  ) async {
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    final link = _Link();
+    var attempts = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PhoneControllerPage(
+          autoConnect: true,
+          linkConnector: () async {
+            attempts++;
+            return link;
+          },
+        ),
+      ),
+    );
+    await tester.pump(const Duration(seconds: 10));
+    expect(attempts, 0);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(attempts, 1);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(link.closeCount, 1);
+  });
+
+  testWidgets('background keeps a live link and resume recovers a lost one', (
+    tester,
+  ) async {
+    final links = <_Link>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PhoneControllerPage(
+          autoConnect: true,
+          linkConnector: () async {
+            final link = _Link();
+            links.add(link);
+            return link;
+          },
+        ),
+      ),
+    );
+    await tester.pump();
+    final held = await tester.startGesture(tester.getCenter(find.text('A')));
+    await tester.pump(const Duration(milliseconds: 110));
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    await tester.pump();
+    expect(links.single.closeCount, 0);
+    expect(jsonDecode(links.single.sent.last as String)['btnA'], isFalse);
+    final sentInBackground = links.single.sent.length;
+    await tester.pump(const Duration(seconds: 2));
+    expect(links.single.sent.length, sentInBackground);
+    await links.single.close();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 20));
+    expect(links, hasLength(1), reason: 'Never reconnect while suspended');
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump(const Duration(milliseconds: 1));
+    await tester.pump();
+    expect(links, hasLength(2));
+    expect(jsonDecode(links.last.sent.first as String)['btnA'], isFalse);
+    await held.up();
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('retry backoff is bounded and resets on returning to the app', (
+    tester,
+  ) async {
+    var attempts = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PhoneControllerPage(
+          autoConnect: true,
+          linkConnector: () async {
+            attempts++;
+            throw const SocketException('Network unavailable');
+          },
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(attempts, 1);
+    for (final delay in [500, 1000, 2000, 4000, 8000, 10000]) {
+      final before = attempts;
+      await tester.pump(Duration(milliseconds: delay - 1));
+      expect(attempts, before);
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(attempts, before + 1);
+    }
+    await tester.pump(const Duration(minutes: 1));
+    expect(attempts, 7);
+    expect(find.textContaining('Visor no disponible'), findsOneWidget);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(attempts, 8);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(minutes: 1));
+    expect(attempts, 8, reason: 'Leaving the controller cancels recovery');
+    expect(tester.takeException(), isNull);
+  });
+
+  for (final error in [
+    const WebSocketException('token must not be shown', 401),
+    const WebSocketException('token must not be shown', 403),
+    const VrControllerConnectionException(
+      'token must not be shown',
+      isSessionExpired: true,
+    ),
+    const VrControllerConnectionException('permission denied', canRetry: false),
+  ]) {
+    testWidgets('permanent rejection does not retry: $error', (tester) async {
+      var attempts = 0;
+      var expired = 0;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: PhoneControllerPage(
+            autoConnect: true,
+            onSessionExpired: (target) {
+              expect(target, isNull);
+              expired++;
+            },
+            linkConnector: () async {
+              attempts++;
+              throw error;
+            },
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(minutes: 1));
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      await tester.pump();
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pump();
+      expect(attempts, 1);
+      expect(
+        expired,
+        error is VrControllerConnectionException && !error.isSessionExpired
+            ? 0
+            : 1,
+      );
+      expect(find.textContaining('token must not be shown'), findsNothing);
+      await tester.pumpWidget(const SizedBox.shrink());
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets('switching transport cancels an automatic reconnect', (
+    tester,
+  ) async {
+    var attempts = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PhoneControllerPage(
+          autoConnect: true,
+          connectionLabel: 'Bluetooth LE',
+          linkConnector: () async {
+            attempts++;
+            throw const SocketException('Network unavailable');
+          },
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.settings_rounded));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.tap(find.text('Wi-Fi local'));
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 30));
+    expect(attempts, 1);
+    await tester.pumpWidget(const SizedBox.shrink());
     expect(tester.takeException(), isNull);
   });
 
