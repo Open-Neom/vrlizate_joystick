@@ -1,7 +1,11 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vrlizate/vrlizate.dart';
@@ -9,6 +13,26 @@ import 'package:vrlizate_joystick/src/vr_controller_region.dart';
 import 'package:vrlizate_joystick/vrlizate_joystick.dart';
 
 class _RealHttpOverrides extends HttpOverrides {}
+
+class _CapturedControllerLink implements VrControllerLink {
+  final inbound = StreamController<Object?>();
+  final packets = <Map<String, dynamic>>[];
+  bool _open = true;
+
+  @override
+  bool get isOpen => _open;
+  @override
+  Stream<Object?> get messages => inbound.stream;
+  @override
+  void add(Object data) =>
+      packets.add(jsonDecode(data as String) as Map<String, dynamic>);
+  @override
+  Future<void> close([int? code, String? reason]) async {
+    if (!_open) return;
+    _open = false;
+    await inbound.close();
+  }
+}
 
 Future<void> _pumpUntil(
   WidgetTester tester,
@@ -30,8 +54,10 @@ Future<void> _pumpUntil(
 
 Offset _buttonPoint(WidgetTester tester, String button) {
   final finder = find.byKey(ValueKey('joystick_button_$button'));
-  final region = tester.widget<VrControllerRegion>(finder);
-  return tester.getTopLeft(finder) + region.labelPosition;
+  final region = tester.widget(finder);
+  return region is VrControllerRegion
+      ? tester.getTopLeft(finder) + region.labelPosition
+      : tester.getCenter(finder);
 }
 
 void main() {
@@ -500,62 +526,111 @@ void main() {
     (const Size(640, 360), const EdgeInsets.only(left: 48), 1.3),
     (const Size(640, 360), const EdgeInsets.only(right: 48), 1.3),
   ]) {
-    testWidgets('driving preserves dual layout at $size, $insets, $scale', (
-      tester,
-    ) async {
-      tester.view.physicalSize = size;
-      tester.view.devicePixelRatio = 1;
-      addTearDown(tester.view.resetPhysicalSize);
-      addTearDown(tester.view.resetDevicePixelRatio);
-      Widget controller(RemoteControllerMode mode) => MaterialApp(
-        builder: (context, child) => MediaQuery(
-          data: MediaQuery.of(context).copyWith(
-            size: size,
-            padding: insets,
-            viewPadding: insets,
-            textScaler: TextScaler.linear(scale),
+    testWidgets(
+      'driving pedals fit without touch steering at $size, $insets, $scale',
+      (tester) async {
+        tester.view.physicalSize = size;
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        final previewPath =
+            Platform.environment['VRLIZATE_DRIVING_PREVIEW_PATH'];
+        final previewFont = Platform.environment['VRLIZATE_PREVIEW_FONT'];
+        final capturePreview =
+            size == const Size(800, 360) &&
+            previewPath?.isNotEmpty == true &&
+            previewFont?.isNotEmpty == true;
+        if (capturePreview) {
+          await tester.runAsync(() async {
+            final bytes = await File(previewFont!).readAsBytes();
+            final loader = FontLoader('DrivingPreview')
+              ..addFont(Future.value(bytes.buffer.asByteData()));
+            await loader.load();
+          });
+        }
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: ThemeData(
+              fontFamily: capturePreview ? 'DrivingPreview' : null,
+            ),
+            builder: (context, child) => MediaQuery(
+              data: MediaQuery.of(context).copyWith(
+                size: size,
+                padding: insets,
+                viewPadding: insets,
+                textScaler: TextScaler.linear(scale),
+              ),
+              child: child!,
+            ),
+            home: const RepaintBoundary(
+              key: ValueKey('driving_layout_capture'),
+              child: PhoneControllerPage(
+                targetHost: '127.0.0.1',
+                initialMode: RemoteControllerMode.driving,
+              ),
+            ),
           ),
-          child: child!,
-        ),
-        home: PhoneControllerPage(targetHost: '127.0.0.1', initialMode: mode),
-      );
-      await tester.pumpWidget(controller(RemoteControllerMode.joystick));
-      await tester.pump();
-      final keys = [
-        for (final button in ['L', 'R', 'Y', 'X', 'B', 'A'])
-          'joystick_button_$button',
-        'joystick_move_stick',
-        'joystick_look_stick',
-        'joystick_recenter',
-        'laser_slide_pad',
-      ];
-      final originalBounds = {
-        for (final key in keys) key: tester.getRect(find.byKey(ValueKey(key))),
-      };
-      await tester.pumpWidget(const SizedBox.shrink());
-      await tester.pumpWidget(controller(RemoteControllerMode.driving));
-      await tester.pump();
-      for (final key in keys) {
-        final finder = find.byKey(ValueKey(key));
-        expect(finder, findsOneWidget);
-        expect(tester.getRect(finder), originalBounds[key], reason: key);
-      }
-      expect(find.byType(VirtualThumbstick), findsNWidgets(2));
-      expect(find.text('CENTRAR VOLANTE'), findsOneWidget);
-      expect(find.text('PAUSAR').hitTestable(), findsOneWidget);
-      final pause = tester.getRect(find.text('PAUSAR'));
-      final leftStick = originalBounds['joystick_move_stick']!;
-      final rightStick = originalBounds['joystick_look_stick']!;
-      expect(pause.left, greaterThan(leftStick.right));
-      expect(pause.right, lessThan(rightStick.left));
-      expect(pause.bottom, lessThanOrEqualTo(size.height));
-      expect(tester.takeException(), isNull);
-      await tester.pumpWidget(const SizedBox.shrink());
-      expect(tester.takeException(), isNull);
-    });
+        );
+        await tester.pump();
+        for (final key in [
+          for (final button in ['L', 'R', 'Y', 'X', 'B', 'A'])
+            'joystick_button_$button',
+          'driving_throttle_pedal',
+          'driving_brake_pedal',
+          'driving_wheel',
+          'joystick_recenter',
+        ]) {
+          final finder = find.byKey(ValueKey(key));
+          expect(finder, findsOneWidget);
+          final bounds = tester.getRect(finder);
+          expect(bounds.left, greaterThanOrEqualTo(insets.left));
+          expect(bounds.right, lessThanOrEqualTo(size.width - insets.right));
+          expect(bounds.top, greaterThanOrEqualTo(0));
+          expect(bounds.bottom, lessThanOrEqualTo(size.height));
+        }
+        final wheel = tester.getRect(
+          find.byKey(const ValueKey('driving_wheel')),
+        );
+        final brake = tester.getRect(
+          find.byKey(const ValueKey('driving_brake_pedal')),
+        );
+        final throttle = tester.getRect(
+          find.byKey(const ValueKey('driving_throttle_pedal')),
+        );
+        expect(brake.right, lessThan(wheel.left));
+        expect(throttle.left, greaterThan(wheel.right));
+        expect(brake.height, greaterThan(100));
+        expect(throttle.height, greaterThan(100));
+        expect(find.byType(VirtualThumbstick), findsNothing);
+        expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
+        expect(find.text('CENTRAR VOLANTE'), findsOneWidget);
+        expect(find.text('PAUSAR').hitTestable(), findsOneWidget);
+        expect(tester.takeException(), isNull);
+        if (capturePreview) {
+          final boundary = tester.renderObject<RenderRepaintBoundary>(
+            find.byKey(const ValueKey('driving_layout_capture')),
+          );
+          await tester.runAsync(() async {
+            final image = await boundary.toImage(pixelRatio: 1);
+            try {
+              final bytes = await image.toByteData(
+                format: ui.ImageByteFormat.png,
+              );
+              await File(
+                previewPath!,
+              ).writeAsBytes(bytes!.buffer.asUint8List());
+            } finally {
+              image.dispose();
+            }
+          });
+        }
+        await tester.pumpWidget(const SizedBox.shrink());
+        expect(tester.takeException(), isNull);
+      },
+    );
   }
 
-  testWidgets('driving A selects once per press and clears old pedals', (
+  testWidgets('driving A pauses and resumes once while clearing old pedals', (
     tester,
   ) async {
     await tester.binding.setSurfaceSize(const Size(800, 360));
@@ -583,26 +658,18 @@ void main() {
           service.latestState.mode == RemoteControllerMode.driving &&
           find.text('CENTRAR VOLANTE').evaluate().isNotEmpty,
     );
-    expect(service.latestState.drivingPaused, isTrue);
+    expect(service.latestState.drivingPaused, isFalse);
     final states = <RemoteControllerState>[];
     final subscription = service.onState.listen(states.add);
     addTearDown(subscription.cancel);
-    await tester.tapAt(_buttonPoint(tester, 'A'));
-    await _pumpUntil(tester, () => service.latestState.btnA);
-    expect(service.latestState.drivingPaused, isFalse);
-    expect(service.latestState.throttle, 0);
-    expect(service.latestState.brake, 0);
-    await tester.pump(const Duration(milliseconds: 180));
-    await _pumpUntil(tester, () => !service.latestState.btnA);
-
     final throttle = await tester.startGesture(
-      _buttonPoint(tester, 'R'),
+      tester.getCenter(find.byKey(const ValueKey('driving_throttle_pedal'))),
       pointer: 1,
     );
     await tester.pump(const Duration(milliseconds: 110));
     await _pumpUntil(tester, () => service.latestState.throttle > .05);
     final brake = await tester.startGesture(
-      _buttonPoint(tester, 'L'),
+      tester.getCenter(find.byKey(const ValueKey('driving_brake_pedal'))),
       pointer: 2,
     );
     await tester.pump(const Duration(milliseconds: 110));
@@ -610,8 +677,8 @@ void main() {
 
     states.clear();
     await tester.tapAt(_buttonPoint(tester, 'A'), pointer: 3);
-    await _pumpUntil(tester, () => service.latestState.btnA);
-    expect(service.latestState.drivingPaused, isFalse);
+    await _pumpUntil(tester, () => service.latestState.drivingPaused);
+    expect(service.latestState.btnA, isFalse);
     expect(service.latestState.throttle, 0);
     expect(service.latestState.brake, 0);
     expect(service.latestState.btnL || service.latestState.btnR, isFalse);
@@ -621,10 +688,14 @@ void main() {
     await brake.cancel();
     await tester.pump(const Duration(milliseconds: 200));
     await _pumpUntil(tester, () => !service.latestState.btnA);
-    expect(service.latestState.drivingPaused, isFalse);
+    expect(service.latestState.drivingPaused, isTrue);
     expect(service.latestState.throttle, 0);
     expect(service.latestState.brake, 0);
-    expect(states.any((state) => state.drivingPaused), isFalse);
+    expect(states.any((state) => state.drivingPaused), isTrue);
+    await tester.tapAt(_buttonPoint(tester, 'A'));
+    await _pumpUntil(tester, () => !service.latestState.drivingPaused);
+    await tester.pump(const Duration(milliseconds: 180));
+    await _pumpUntil(tester, () => !service.latestState.btnA);
     var edges = 0;
     var previousA = false;
     for (final state in states) {
@@ -637,7 +708,7 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('unavailable gyro falls back to usable touch mode', (
+  testWidgets('unavailable gyro keeps joystick mode but warns in driving', (
     tester,
   ) async {
     await tester.pumpWidget(
@@ -667,144 +738,164 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 350));
     expect(find.byKey(const ValueKey('joystick_button_R')), findsOneWidget);
-    expect(find.textContaining('DIRECCIÓN TÁCTIL'), findsOneWidget);
-    expect(find.byKey(const ValueKey('laser_slide_pad')), findsOneWidget);
+    expect(
+      find.text('SIN GIROSCOPIO · DIRECCIÓN NO DISPONIBLE'),
+      findsOneWidget,
+    );
+    expect(find.byType(VirtualThumbstick), findsNothing);
+    expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
+    expect(
+      find.byKey(const ValueKey('driving_throttle_pedal')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('driving_brake_pedal')), findsOneWidget);
     await tester.pumpWidget(const SizedBox.shrink());
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets(
-    'driving touch and pedals reach real server and pause immediately',
-    (tester) async {
-      await tester.binding.setSurfaceSize(const Size(800, 360));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
-      final service = VrRemoteControllerService(
-        inputTimeout: const Duration(seconds: 10),
-      );
-      addTearDown(service.dispose);
-      expect(await tester.runAsync(() => service.startServer(port: 0)), isTrue);
-      service.requestControllerMode(RemoteControllerMode.driving);
-      await tester.pumpWidget(
-        MaterialApp(
-          home: PhoneControllerPage(
-            initialMode: RemoteControllerMode.driving,
-            targetHost: '127.0.0.1',
-            targetPort: service.serverPort!,
-            sessionToken: service.sessionToken,
-            autoConnect: true,
-          ),
+  testWidgets('driving pedals are separate from views and pause immediately', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(800, 360));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final service = VrRemoteControllerService(
+      inputTimeout: const Duration(seconds: 10),
+    );
+    addTearDown(service.dispose);
+    expect(await tester.runAsync(() => service.startServer(port: 0)), isTrue);
+    service.requestControllerMode(RemoteControllerMode.driving);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PhoneControllerPage(
+          initialMode: RemoteControllerMode.driving,
+          targetHost: '127.0.0.1',
+          targetPort: service.serverPort!,
+          sessionToken: service.sessionToken,
+          autoConnect: true,
         ),
-      );
-      await _pumpUntil(
-        tester,
-        () =>
-            service.isConnected &&
-            find.text('CONTINUAR').evaluate().isNotEmpty &&
-            service.latestState.mode == RemoteControllerMode.driving &&
-            service.latestState.drivingPaused,
-      );
-      expect(service.latestState.throttle, 0);
-      expect(service.latestState.btnA, isFalse);
-      await tester.tap(find.text('CONTINUAR'));
-      await _pumpUntil(tester, () => !service.latestState.drivingPaused);
-      final observed = <RemoteControllerState>[];
-      final subscription = service.onState.listen(observed.add);
-      addTearDown(subscription.cancel);
+      ),
+    );
+    await _pumpUntil(
+      tester,
+      () =>
+          service.isConnected &&
+          find.text('CONTINUAR').evaluate().isNotEmpty &&
+          service.latestState.mode == RemoteControllerMode.driving &&
+          service.latestState.drivingPaused,
+    );
+    expect(service.latestState.throttle, 0);
+    expect(service.latestState.btnA, isFalse);
+    await tester.tap(find.text('CONTINUAR'));
+    await _pumpUntil(tester, () => !service.latestState.drivingPaused);
+    final observed = <RemoteControllerState>[];
+    final subscription = service.onState.listen(observed.add);
+    addTearDown(subscription.cancel);
 
-      final stick = find.byKey(const ValueKey('joystick_move_stick'));
-      final steering = await tester.startGesture(
-        tester.getCenter(stick),
-        pointer: 1,
-      );
-      await steering.moveBy(const Offset(65, 0));
-      await _pumpUntil(tester, () => service.latestState.steering > 0.2);
-      final accelerator = await tester.startGesture(
-        _buttonPoint(tester, 'R'),
-        pointer: 2,
-      );
-      await tester.pump(const Duration(milliseconds: 110));
-      await _pumpUntil(tester, () => service.latestState.throttle > 0.1);
-      expect(service.latestState.mode, RemoteControllerMode.driving);
-      expect(service.latestState.btnR, isTrue);
-      expect(service.latestState.stickX, greaterThan(0.2));
-      expect(service.latestState.laserSlideActive, isFalse);
-      await steering.up();
-      await _pumpUntil(tester, () => service.latestState.steering == 0);
+    expect(find.byType(VirtualThumbstick), findsNothing);
+    final wheel = find.byKey(const ValueKey('driving_wheel'));
+    await tester.drag(wheel, const Offset(65, 0), warnIfMissed: false);
+    await tester.pump(const Duration(milliseconds: 110));
+    expect(service.latestState.steering, 0);
+    expect(service.latestState.stickX, 0);
+    expect(service.latestState.stickY, 0);
+    final accelerator = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('driving_throttle_pedal'))),
+      pointer: 2,
+    );
+    await tester.pump(const Duration(milliseconds: 110));
+    await _pumpUntil(tester, () => service.latestState.throttle > 0.1);
+    expect(service.latestState.mode, RemoteControllerMode.driving);
+    expect(service.latestState.btnR, isFalse);
+    final view = await tester.startGesture(
+      _buttonPoint(tester, 'R'),
+      pointer: 3,
+    );
+    await tester.pump(const Duration(milliseconds: 110));
+    await _pumpUntil(tester, () => service.latestState.btnR);
+    expect(service.latestState.throttle, greaterThan(0.1));
+    expect(service.latestState.brake, 0);
+    await view.up();
+    await _pumpUntil(tester, () => !service.latestState.btnR);
+    expect(service.latestState.throttle, greaterThan(0.1));
 
-      // Shake cannot recenter the visor while steering. Explicit wheel centering
-      // also calibrates locally instead of emitting the global recenter flag.
-      tester.binding.channelBuffers.push(
-        'dev.fluttercommunity.plus/sensors/accelerometer',
-        const StandardMethodCodec().encodeSuccessEnvelope(<double>[
-          30,
-          0,
-          0,
-          10000,
-        ]),
-        (_) {},
-      );
-      await tester.tap(find.text('CENTRAR VOLANTE'), pointer: 10);
-      await tester.pump();
-      expect(observed.any((state) => state.recenter), isFalse);
+    // Shake cannot recenter the visor while steering. Explicit wheel centering
+    // also calibrates locally instead of emitting the global recenter flag.
+    tester.binding.channelBuffers.push(
+      'dev.fluttercommunity.plus/sensors/accelerometer',
+      const StandardMethodCodec().encodeSuccessEnvelope(<double>[
+        30,
+        0,
+        0,
+        10000,
+      ]),
+      (_) {},
+    );
+    await tester.tap(find.text('CENTRAR VOLANTE'), pointer: 10);
+    await tester.pump();
+    expect(observed.any((state) => state.recenter), isFalse);
 
-      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
-      await _pumpUntil(tester, () => service.latestState.drivingPaused);
-      expect(service.latestState.throttle, 0);
-      expect(service.latestState.brake, 0);
-      expect(service.latestState.btnR, isFalse);
-      expect(service.latestState.steering, 0);
-      await accelerator.up();
-      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
-      await tester.pump();
-      expect(find.text('CONTINUAR'), findsOneWidget);
-      expect(service.latestState.drivingPaused, isTrue);
-      await tester.tap(find.text('CONTINUAR'));
-      await _pumpUntil(tester, () => !service.latestState.drivingPaused);
-      expect(service.latestState.throttle, 0);
-      expect(service.latestState.btnA, isTrue);
-      tester.binding.channelBuffers.push(
-        'dev.fluttercommunity.plus/sensors/gyroscope',
-        const StandardMethodCodec().encodeSuccessEnvelope(<double>[
-          0,
-          0,
-          0,
-          10000,
-        ]),
-        (_) {},
-      );
-      await _pumpUntil(tester, () => service.latestState.motionAvailable);
-      final resumedPedal = await tester.startGesture(
-        _buttonPoint(tester, 'R'),
-        pointer: 20,
-      );
-      await tester.pump(const Duration(milliseconds: 110));
-      await _pumpUntil(tester, () => service.latestState.throttle > 0.1);
-      tester.binding.channelBuffers.push(
-        'dev.fluttercommunity.plus/sensors/gyroscope',
-        const StandardMethodCodec().encodeErrorEnvelope(code: 'SENSOR_LOST'),
-        (_) {},
-      );
-      await _pumpUntil(tester, () => service.latestState.drivingPaused);
-      expect(service.latestState.throttle, 0);
-      expect(service.latestState.motionAvailable, isFalse);
-      await resumedPedal.up();
-      await tester.tapAt(_buttonPoint(tester, 'X'));
-      await _pumpUntil(tester, () => service.latestState.btnX);
-      expect(service.latestState.drivingPaused, isTrue);
-      expect(service.latestState.btnA, isFalse);
-      await tester.pump(const Duration(milliseconds: 160));
-      await _pumpUntil(tester, () => !service.latestState.btnX);
-      final home = await tester.startGesture(_buttonPoint(tester, 'B'));
-      await tester.pump(const Duration(milliseconds: 110));
-      await _pumpUntil(tester, () => service.latestState.btnB);
-      expect(service.latestState.drivingPaused, isTrue);
-      expect(service.latestState.throttle, 0);
-      await home.up();
-      await tester.pumpWidget(const SizedBox.shrink());
-      await _pumpUntil(tester, () => !service.isConnected);
-      expect(tester.takeException(), isNull);
-    },
-  );
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await _pumpUntil(tester, () => service.latestState.drivingPaused);
+    expect(service.latestState.throttle, 0);
+    expect(service.latestState.brake, 0);
+    expect(service.latestState.btnR, isFalse);
+    expect(service.latestState.steering, 0);
+    await accelerator.up();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump();
+    expect(find.text('CONTINUAR'), findsOneWidget);
+    expect(service.latestState.drivingPaused, isTrue);
+    await tester.tap(find.text('CONTINUAR'));
+    await _pumpUntil(tester, () => !service.latestState.drivingPaused);
+    expect(service.latestState.throttle, 0);
+    expect(service.latestState.btnA, isTrue);
+    tester.binding.channelBuffers.push(
+      'dev.fluttercommunity.plus/sensors/gyroscope',
+      const StandardMethodCodec().encodeSuccessEnvelope(<double>[
+        0,
+        0,
+        0,
+        10000,
+      ]),
+      (_) {},
+    );
+    await _pumpUntil(tester, () => service.latestState.motionAvailable);
+    final resumedPedal = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('driving_throttle_pedal'))),
+      pointer: 20,
+    );
+    await tester.pump(const Duration(milliseconds: 110));
+    await _pumpUntil(tester, () => service.latestState.throttle > 0.1);
+    tester.binding.channelBuffers.push(
+      'dev.fluttercommunity.plus/sensors/gyroscope',
+      const StandardMethodCodec().encodeErrorEnvelope(code: 'SENSOR_LOST'),
+      (_) {},
+    );
+    await _pumpUntil(tester, () => service.latestState.drivingPaused);
+    expect(service.latestState.throttle, 0);
+    expect(service.latestState.motionAvailable, isFalse);
+    expect(
+      find.text('SIN GIROSCOPIO · DIRECCIÓN NO DISPONIBLE'),
+      findsOneWidget,
+    );
+    expect(find.byType(VirtualThumbstick), findsNothing);
+    await resumedPedal.up();
+    await tester.tapAt(_buttonPoint(tester, 'X'));
+    await _pumpUntil(tester, () => service.latestState.btnX);
+    expect(service.latestState.drivingPaused, isTrue);
+    expect(service.latestState.btnA, isFalse);
+    await tester.pump(const Duration(milliseconds: 160));
+    await _pumpUntil(tester, () => !service.latestState.btnX);
+    final home = await tester.startGesture(_buttonPoint(tester, 'B'));
+    await tester.pump(const Duration(milliseconds: 110));
+    await _pumpUntil(tester, () => service.latestState.btnB);
+    expect(service.latestState.drivingPaused, isTrue);
+    expect(service.latestState.throttle, 0);
+    await home.up();
+    await tester.pumpWidget(const SizedBox.shrink());
+    await _pumpUntil(tester, () => !service.isConnected);
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets('legacy laser initial mode opens the full joystick', (
     tester,
@@ -889,43 +980,139 @@ void main() {
     expect(service.latestState.lookX, 0);
     expect(service.latestState.lookY, 0);
 
-    // Touch aim changes its own quaternion without replacing the wheel pose.
-    final pad = find.byKey(const ValueKey('laser_slide_pad'));
-    final aim = await tester.startGesture(tester.getCenter(pad));
-    await aim.moveBy(const Offset(20, -20));
-    await _pumpUntil(tester, () => service.latestState.laserX > .1);
+    // The wheel is feedback only. Neither dragging it nor a view button can
+    // replace the sensor, move the player, or rotate the visor/laser.
+    await tester.drag(
+      find.byKey(const ValueKey('driving_wheel')),
+      const Offset(40, -20),
+      warnIfMissed: false,
+    );
+    await tester.pump(const Duration(milliseconds: 100));
     expect(service.latestState.steering, closeTo(rightSteering, 1e-6));
-    final laserPose = service.latestState.orientation.clone();
-    await aim.up();
+    expect(find.byType(VirtualThumbstick), findsNothing);
+    expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
+    final view = await tester.startGesture(_buttonPoint(tester, 'L'));
+    await tester.pump(const Duration(milliseconds: 110));
+    await _pumpUntil(tester, () => service.latestState.btnL);
+    expect(service.latestState.throttle, 0);
+    expect(service.latestState.brake, 0);
+    await view.up();
     for (var i = 0; i < 24; i++) {
       await gyro(3);
     }
     await _pumpUntil(tester, () => service.latestState.steering < -.4);
-    expect(service.latestState.orientation.x, closeTo(laserPose.x, 1e-6));
-    expect(service.latestState.orientation.y, closeTo(laserPose.y, 1e-6));
-    expect(service.latestState.orientation.z, closeTo(laserPose.z, 1e-6));
+    expect(service.latestState.orientation.x, closeTo(0, 1e-6));
+    expect(service.latestState.orientation.y, closeTo(0, 1e-6));
+    expect(service.latestState.orientation.z, closeTo(0, 1e-6));
     expect(service.latestState.lookX, 0);
     expect(service.latestState.lookY, 0);
-
-    // With a working gyro, the existing movement stick cannot steal steering.
-    final stick = tester.widget<VirtualThumbstick>(
-      find.byKey(const ValueKey('joystick_move_stick')),
-    );
-    stick.onChanged(.9, 0);
-    await _pumpUntil(tester, () => service.latestState.stickX > .8);
-    expect(service.latestState.steering, lessThan(-.4));
-    stick.onRelease!();
+    expect(service.latestState.stickX, 0);
+    expect(service.latestState.stickY, 0);
     await tester.tap(find.text('CENTRAR VOLANTE'));
     await _pumpUntil(tester, () => service.latestState.steering == 0);
     expect(service.latestState.recenter, isFalse);
-    expect(service.latestState.orientation.y, closeTo(laserPose.y, 1e-6));
+    expect(service.latestState.orientation.y, closeTo(0, 1e-6));
     await tester.pumpWidget(const SizedBox.shrink());
     await _pumpUntil(tester, () => !service.isConnected);
     expect(tester.takeException(), isNull);
   });
 
   testWidgets(
-    'host mode changes release held controls and enter driving paused',
+    'matching driving UI still neutralizes new host modes and fresh sessions',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(800, 360));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final link = _CapturedControllerLink();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: PhoneControllerPage(
+            initialMode: RemoteControllerMode.driving,
+            linkConnector: () async => link,
+            autoConnect: true,
+          ),
+        ),
+      );
+      await _pumpUntil(tester, () => link.packets.isNotEmpty);
+      Future<Map<String, dynamic>> request(
+        int revision,
+        RemoteControllerMode mode,
+      ) async {
+        link.inbound.add(
+          jsonEncode(
+            VrControllerModeRequest(
+              mode: mode,
+              revision: revision,
+              actions: const {'R': 'Vista +'},
+            ).toJson(),
+          ),
+        );
+        await _pumpUntil(
+          tester,
+          () => link.packets.any(
+            (packet) => packet['hostModeRevision'] == revision,
+          ),
+        );
+        return link.packets.firstWhere(
+          (packet) => packet['hostModeRevision'] == revision,
+        );
+      }
+
+      // Even if the UI already matches, the first host request preserves the
+      // reconnect pause and acknowledges with neutral controls.
+      final first = await request(1, RemoteControllerMode.driving);
+      expect(first['drivingPaused'], isTrue);
+      expect(first['throttle'], 0);
+      await tester.tap(find.text('CONTINUAR'));
+      await tester.pump(const Duration(milliseconds: 180));
+      final pedal = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey('driving_throttle_pedal'))),
+      );
+      await tester.pump(const Duration(milliseconds: 110));
+      await _pumpUntil(
+        tester,
+        () => (link.packets.last['throttle'] as num) > .05,
+      );
+      final captions = await request(2, RemoteControllerMode.driving);
+      expect(captions['throttle'], greaterThan(.05));
+
+      await request(3, RemoteControllerMode.joystick);
+      expect(find.byType(VirtualThumbstick), findsNWidgets(2));
+      await pedal.up();
+      // The user can preselect driving locally before the host enters Riviera.
+      await tester.tap(find.byTooltip('Ajustes y Modo'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('CONDUCCIÓN'));
+      await tester.pumpAndSettle();
+      final held = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey('driving_throttle_pedal'))),
+      );
+      await tester.pump(const Duration(milliseconds: 110));
+      await _pumpUntil(
+        tester,
+        () => (link.packets.last['throttle'] as num) > .05,
+      );
+      final changedHost = await request(4, RemoteControllerMode.driving);
+      expect(changedHost['throttle'], 0);
+      expect(changedHost['brake'], 0);
+      expect(changedHost['steering'], 0);
+      expect(changedHost['drivingTilt'], 0);
+      expect(changedHost['stickX'], 0);
+      expect(changedHost['stickY'], 0);
+      expect(changedHost['drivingPaused'], isFalse);
+      await held.up();
+      await request(5, RemoteControllerMode.joystick);
+      expect(find.byType(VirtualThumbstick), findsNWidgets(2));
+      expect(
+        find.byKey(const ValueKey('driving_throttle_pedal')),
+        findsNothing,
+      );
+      await tester.pumpWidget(const SizedBox.shrink());
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'fresh foreground driving mode is neutral and ready without synthesizing A',
     (tester) async {
       await tester.binding.setSurfaceSize(const Size(800, 360));
       addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -977,13 +1164,17 @@ void main() {
         tester,
         () =>
             drivingPackets.isNotEmpty &&
-            find.text('CONTINUAR').evaluate().isNotEmpty,
+            find.text('PAUSAR').evaluate().isNotEmpty,
       );
-      expect(find.byKey(const ValueKey('laser_slide_pad')), findsOneWidget);
-      // The first accepted ACK and following packets must not start a race,
-      // carry an old grip or throttle, or synthesize a recenter command.
+      expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
+      expect(
+        find.byKey(const ValueKey('driving_throttle_pedal')),
+        findsOneWidget,
+      );
+      expect(find.byType(VirtualThumbstick), findsNothing);
+      // The first ACK is ready but cannot carry old inputs or synthesize A.
       for (final state in drivingPackets) {
-        expect(state.drivingPaused, isTrue);
+        expect(state.drivingPaused, isFalse);
         expect(state.steering, 0);
         expect(state.throttle, 0);
         expect(state.brake, 0);
@@ -999,6 +1190,15 @@ void main() {
       await oldButtonGesture.up();
       await tester.pump(const Duration(milliseconds: 200));
       expect(service.latestState.btnA || service.latestState.btnGrip, isFalse);
+      expect(service.latestState.drivingPaused, isFalse);
+
+      await tester.tap(find.text('PAUSAR'));
+      await _pumpUntil(tester, () => service.latestState.drivingPaused);
+      service.requestControllerMode(
+        RemoteControllerMode.driving,
+        actions: const {'R': 'Siguiente vista'},
+      );
+      await tester.pump(const Duration(milliseconds: 200));
       expect(service.latestState.drivingPaused, isTrue);
 
       // A live socket remains valid across suspension even though pending
@@ -1013,8 +1213,15 @@ void main() {
       );
       expect(service.latestState.btnA || service.latestState.btnGrip, isFalse);
       expect(service.latestState.stickX, 0);
+      service.requestControllerMode(RemoteControllerMode.driving);
+      await _pumpUntil(
+        tester,
+        () => service.latestState.mode == RemoteControllerMode.driving,
+      );
+      expect(service.latestState.drivingPaused, isTrue);
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       await tester.pump();
+      expect(service.latestState.drivingPaused, isTrue);
       expect(find.text('A'), findsOneWidget);
       await tester.pumpWidget(const SizedBox.shrink());
       await _pumpUntil(tester, () => !service.isConnected);
@@ -1225,7 +1432,14 @@ void main() {
         ),
       ),
     );
-    await _pumpUntil(tester, () => service.isConnected);
+    // Server-side WS acceptance happens before the phone finishes connecting
+    // and releases the previous surface. Start the gesture only after its
+    // first full snapshot, otherwise the connection reset cancels that tap.
+    await _pumpUntil(
+      tester,
+      () => service.isConnected && service.telemetry.acceptedStates > 0,
+      reason: 'first ready controller snapshot',
+    );
     final left = await tester.startGesture(
       tester.getCenter(find.text('L')),
       pointer: 1,

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Pace native controller traffic: unchanged state uses a 200 ms keepalive and
+  BLE analog changes are capped at 30 Hz. Buttons, neutral releases, mode ACKs
+  and lifecycle safety snapshots bypass pacing; the 500 ms watchdog remains.
+- Continue transient reconnection attempts at a capped 10-second delay while
+  foreground, instead of abandoning a valid pairing after six attempts.
+- Repaint driving telemetry only when values change and at most 30 Hz.
+
 ## 0.2.0 - 2026-09-22
 
 - Request portrait while the QR scanner is the active route; the controller

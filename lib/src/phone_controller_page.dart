@@ -20,13 +20,15 @@ import 'vr_joystick_geometry.dart';
 import 'vr_controller_region.dart';
 import 'vr_controller_shake_detector.dart';
 import 'vr_controller_link.dart';
+import 'vr_controller_state_pacer.dart';
 
 /// Native Smartphone VR Controller & Joystick Screen.
 ///
 /// Main modes:
 /// 1. [RemoteControllerMode.joystick]: Virtual 2D analog thumbstick for smooth 3D walking/strafe
 ///    locomotion + ergonomic Gamepad button cluster (A, B, Trigger, Grip, Recenter).
-/// 2. [RemoteControllerMode.driving]: Same controls, with calibrated gyro steering.
+/// 2. [RemoteControllerMode.driving]: Motion-only steering and inclination,
+///    separate accelerator/brake pedals, and L/R camera-view buttons.
 /// The joystick keeps its laser pad. A legacy laser initial mode is normalized
 /// to joystick; the laser wire enum remains compatible with older controllers.
 ///
@@ -123,6 +125,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   // Those recognizers can synchronously call onTapCancel under the tree lock.
   bool _surfaceMounted = true;
   final _hostModeSession = VrControllerModeSession();
+  RemoteControllerMode? _lastHostMode;
 
   /// Per-button captions sent by the host for the active experience; empty
   /// means the generic role labels. Keyed A/B/X/Y/L/R/GRIP.
@@ -158,6 +161,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   VrMotionCapability _motionCapability = VrMotionCapability.checking;
   int? _lastMotionUs;
   int _lastDrivingTickUs = 0;
+  int _lastDrivingPaintUs = 0;
+  VrSteeringState? _lastPaintedDrivingState;
+  bool _throttlePedalHeld = false;
+  bool _brakePedalHeld = false;
+  final _statePacer = VrControllerStatePacer();
 
   // Dual Joystick state
   double _stickX = 0.0;
@@ -272,22 +280,28 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   void _startShakeDetection() {
     try {
-      _accelSub = accelerometerEventStream().listen((AccelerometerEvent event) {
-        if (!mounted ||
-            !_isForeground ||
-            _settingsOpen ||
-            !_shakeToToggleEnabled) {
-          return;
-        }
-        if (_shakeDetector.addSample(
-          event.x,
-          event.y,
-          event.z,
-          _controllerClock.elapsedMicroseconds,
-        )) {
-          _onShakeDetected();
-        }
-      }, onError: (_) {});
+      _accelSub =
+          accelerometerEventStream(
+            samplingPeriod: const Duration(milliseconds: 20),
+          ).listen((AccelerometerEvent event) {
+            if (!mounted || !_isForeground) return;
+            // Driving tilt remains available when shake-to-hide is disabled.
+            _steering.updateGravity(
+              event.x,
+              event.y,
+              event.z,
+              _controllerClock.elapsedMicroseconds,
+            );
+            if (_settingsOpen || !_shakeToToggleEnabled) return;
+            if (_shakeDetector.addSample(
+              event.x,
+              event.y,
+              event.z,
+              _controllerClock.elapsedMicroseconds,
+            )) {
+              _onShakeDetected();
+            }
+          }, onError: (_) => _steering.clearGravity());
     } catch (_) {}
   }
 
@@ -438,7 +452,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _setMotionCapability(VrMotionCapability.unavailable);
     }
 
-    // Send state periodically at 60 FPS
+    // Sample controls at 60 Hz. The sender paces analog updates and keeps idle
+    // links alive without serializing/transmitting identical state each tick.
     _streamTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
       if (!mounted || !_isForeground) return;
       final now = _controllerClock.elapsedMicroseconds;
@@ -447,11 +462,22 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       }
       if (_activeMode == RemoteControllerMode.driving) {
         _steering.setPedals(
-          throttlePressed: _btnRActive,
-          brakePressed: _btnLActive,
+          throttlePressed: _throttlePedalHeld,
+          brakePressed: _brakePedalHeld,
         );
         _steering.advance((now - _lastDrivingTickUs) / 1e6);
-        setState(() {});
+        final driving = _steering.state;
+        final painted = _lastPaintedDrivingState;
+        if (now - _lastDrivingPaintUs >= 33333 &&
+            (painted == null ||
+                driving.steering != painted.steering ||
+                driving.throttle != painted.throttle ||
+                driving.brake != painted.brake ||
+                driving.paused != painted.paused)) {
+          _lastDrivingPaintUs = now;
+          _lastPaintedDrivingState = driving;
+          setState(() {});
+        }
       }
       _lastDrivingTickUs = now;
       _sendState();
@@ -616,16 +642,15 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   void _scheduleReconnect({bool immediately = false}) {
     if (!_canReconnect || _reconnectTimer != null) return;
-    if (!immediately && _reconnectAttempt >= _reconnectDelays.length) {
-      setState(() {
-        _status =
-            'Visor no disponible. Vuelve a la app o pulsa CONECTAR para reintentar.';
-      });
-      return;
-    }
+    // A visor can stay asleep/out of range longer than the initial backoff.
+    // Keep trying at the capped interval while this controller is foreground;
+    // explicit rejection, editing the target or leaving still cancels recovery.
     final delay = immediately
         ? Duration.zero
-        : _reconnectDelays[_reconnectAttempt++];
+        : _reconnectDelays[_reconnectAttempt];
+    if (!immediately && _reconnectAttempt < _reconnectDelays.length - 1) {
+      _reconnectAttempt++;
+    }
     _reconnectTimer = Timer(delay, () {
       _reconnectTimer = null;
       if (_canReconnect) unawaited(_connect(automatic: true));
@@ -726,6 +751,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _socketTarget = target;
       _socketGeneration = generation;
       _hostModeSession.reset();
+      _lastHostMode = null;
       _hostActions = const {};
       _reconnectAttempt = 0;
       if (target != null) {
@@ -733,6 +759,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         _targetPort = target.port;
       }
       _sequence = 0;
+      _statePacer.reset();
       _releaseInputs();
       _surfaceEpoch++;
       if (_activeMode == RemoteControllerMode.driving) {
@@ -812,14 +839,20 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         !identical(_socket, socket)) {
       return;
     }
+    final hadHostRequest = _hostModeSession.revision != null;
+    final previousHostMode = _lastHostMode;
     final request = _hostModeSession.accept(data);
     if (request == null) return;
-    if (request.mode == _activeMode) {
-      // Same layout, new captions: relabel without dropping held inputs.
+    _lastHostMode = request.mode;
+    if (hadHostRequest &&
+        previousHostMode == request.mode &&
+        request.mode == _activeMode) {
+      // An acknowledged host mode gets captions without dropping held inputs.
       setState(() => _hostActions = request.actions);
       _sendState(force: true);
       return;
     }
+    final preservePause = request.mode == _activeMode && _steering.state.paused;
     // Mode requests are scoped to this authenticated socket. Send no packet
     // between accepting its revision and installing a completely neutral mode.
     setState(() {
@@ -827,10 +860,16 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _releaseInputs();
       _surfaceEpoch++;
       _activeMode = request.mode;
-      _steering.setPaused(request.mode == RemoteControllerMode.driving);
+      // A genuinely new experience opens ready, with all controls released.
+      // A fresh socket or manually matching layout still needs a neutral ACK.
+      // Matching layouts preserve a prior pause, including after reconnect.
+      _steering.setPaused(
+        request.mode == RemoteControllerMode.driving &&
+            (!_isForeground || preservePause),
+      );
       _lastDrivingTickUs = _controllerClock.elapsedMicroseconds;
       _status = request.mode == RemoteControllerMode.driving
-          ? 'Conducción lista · pulsa CONTINUAR para iniciar'
+          ? 'Conducción lista · gira o inclina el teléfono'
           : 'Joystick listo · puntero y botones disponibles';
     });
     // Even while backgrounded the host must receive a neutral mode ACK.
@@ -925,7 +964,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     unawaited(_closeLink(socket));
     _socketGeneration = 0;
     _hostModeSession.reset();
+    _lastHostMode = null;
     _hostActions = const {};
+    _statePacer.reset();
     if (_activeMode == RemoteControllerMode.driving) {
       _steering.setPaused(true);
     }
@@ -971,6 +1012,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _btnLActive = false;
     _btnRActive = false;
     _btnGripActive = false;
+    _throttlePedalHeld = false;
+    _brakePedalHeld = false;
     _gripHoldTimer?.cancel();
     _gripHoldTimer = null;
     _angularVelocity.setZero();
@@ -1011,12 +1054,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   void _sendState({bool force = false}) {
     final ws = _socket;
-    final driving = _steering.state;
     if (ws != null && ws.isOpen && _isConnected && (_isForeground || force)) {
-      final payload = jsonEncode({
-        'sequence': _sequence++,
+      final driving = _steering.state;
+      final isDriving = _activeMode == RemoteControllerMode.driving;
+      final state = <String, Object?>{
         'hostModeRevision': _hostModeSession.revision,
-        'timestampUs': DateTime.now().microsecondsSinceEpoch,
         'qx': _orientation.x,
         'qy': _orientation.y,
         'qz': _orientation.z,
@@ -1024,16 +1066,16 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         'wx': _angularVelocity.x,
         'wy': _angularVelocity.y,
         'wz': _angularVelocity.z,
-        'stickX': _stickX,
-        'stickY': _stickY,
-        'tx': _stickX,
-        'ty': _stickY,
-        'lookX': _lookX,
-        'lookY': _lookY,
-        'turn': _lookX,
-        'turnRate': _lookX,
-        'pitchRate': _lookY,
-        'lookPitch': _lookY,
+        'stickX': isDriving ? 0.0 : _stickX,
+        'stickY': isDriving ? 0.0 : _stickY,
+        'tx': isDriving ? 0.0 : _stickX,
+        'ty': isDriving ? 0.0 : _stickY,
+        'lookX': isDriving ? 0.0 : _lookX,
+        'lookY': isDriving ? 0.0 : _lookY,
+        'turn': isDriving ? 0.0 : _lookX,
+        'turnRate': isDriving ? 0.0 : _lookX,
+        'pitchRate': isDriving ? 0.0 : _lookY,
+        'lookPitch': isDriving ? 0.0 : _lookY,
         'laserX': _laserStickX,
         'laserY': _laserStickY,
         'laserSlideActive': _isLaserSlideActive,
@@ -1042,7 +1084,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         'recenter': _recenterTriggered,
         'controllerVisible': _controllerVisible,
         'rangeMeters': 0.55,
-        'trigger': _triggerActive || _btnRActive,
+        'trigger': _triggerActive || (!isDriving && _btnRActive),
         'action': _actionActive || _btnBActive,
         'btnA': _btnAActive,
         'btnB': _btnBActive,
@@ -1055,6 +1097,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         'steering': _activeMode == RemoteControllerMode.driving
             ? driving.steering
             : 0.0,
+        'drivingTilt': _activeMode == RemoteControllerMode.driving
+            ? _steering.drivingTiltAt(_controllerClock.elapsedMicroseconds)
+            : 0.0,
         'throttle': _activeMode == RemoteControllerMode.driving
             ? driving.throttle
             : 0.0,
@@ -1064,6 +1109,21 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         'drivingPaused':
             _activeMode == RemoteControllerMode.driving && driving.paused,
         'motionAvailable': _motionCapability == VrMotionCapability.available,
+      };
+      if (!_statePacer.shouldSend(
+        state,
+        nowUs: _controllerClock.elapsedMicroseconds,
+        bluetooth:
+            widget.transportType == VrTransportType.bluetoothLe &&
+            !_useWifiOverride,
+        force: force,
+      )) {
+        return;
+      }
+      final payload = jsonEncode({
+        ...state,
+        'sequence': _sequence++,
+        'timestampUs': DateTime.now().microsecondsSinceEpoch,
       });
 
       try {
@@ -1256,7 +1316,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       _buildSettingsModeCard(
                         title: 'CONDUCCIÓN',
                         subtitle:
-                            'Mismos botones + giro del teléfono · L frena / R acelera',
+                            'Giroscopio + inclinación · pedales · L/R vistas',
                         icon: Icons.sports_motorsports_rounded,
                         isSelected: _activeMode == RemoteControllerMode.driving,
                         onTap: () {
@@ -1610,7 +1670,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         backgroundColor: const Color(0xFF080816),
         body: KeyedSubtree(
           key: ValueKey('controller_surface_$_surfaceEpoch'),
-          child: _buildJoystickLayout(),
+          child: _activeMode == RemoteControllerMode.driving
+              ? _buildDrivingLayout()
+              : _buildJoystickLayout(),
         ),
       );
     }
@@ -1687,7 +1749,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   child: switch (_activeMode) {
                     RemoteControllerMode.joystick => _buildJoystickLayout(),
                     RemoteControllerMode.laser => _buildLaserPointerLayout(),
-                    RemoteControllerMode.driving => _buildJoystickLayout(),
+                    RemoteControllerMode.driving => _buildDrivingLayout(),
                   },
                 ),
               ),
@@ -1825,6 +1887,238 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     );
   }
 
+  Widget _buildDrivingLayout() {
+    Widget control(
+      String letter,
+      String caption,
+      bool active,
+      VoidCallback onDown,
+      VoidCallback onUp,
+    ) => _buildButton(
+      key: ValueKey('joystick_button_$letter'),
+      title: letter,
+      subtitle: caption,
+      icon: Icons.sports_motorsports_rounded,
+      isActive: active,
+      emphasizeTitle: true,
+      colors: const [Color(0xFF20364D), Color(0xFF142135)],
+      onDown: onDown,
+      onUp: onUp,
+    );
+
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.all(8),
+        child: Column(
+          children: [
+            SizedBox(
+              height: 32,
+              child: Row(
+                children: [
+                  IconButton(
+                    tooltip: 'Salir del mando',
+                    padding: EdgeInsets.zero,
+                    icon: const Icon(Icons.arrow_back, color: Colors.white70),
+                    onPressed: () => Navigator.of(context).maybePop(),
+                  ),
+                  const Expanded(
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        'CONDUCCIÓN · VRLIZATE',
+                        style: TextStyle(
+                          color: Color(0xFF00E5FF),
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16,
+                        ),
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: _isConnecting ? null : _connect,
+                    child: Text(_isConnected ? 'RECONECTAR' : 'CONECTAR'),
+                  ),
+                  IconButton(
+                    tooltip: 'Ajustes y Modo',
+                    padding: EdgeInsets.zero,
+                    icon: const Icon(
+                      Icons.settings_rounded,
+                      color: Color(0xFF00E5FF),
+                    ),
+                    onPressed: _openSettings,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 6),
+            Expanded(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Expanded(
+                    flex: 3,
+                    child: _buildButton(
+                      key: const ValueKey('driving_brake_pedal'),
+                      title: 'FRENAR',
+                      subtitle: 'Freno / reversa',
+                      icon: Icons.arrow_downward_rounded,
+                      emphasizeTitle: true,
+                      isActive: _brakePedalHeld,
+                      colors: const [Color(0xFFDD4848), Color(0xFF7E2547)],
+                      onDown: () => setState(
+                        () => _brakePedalHeld = !_steering.state.paused,
+                      ),
+                      onUp: () => setState(() => _brakePedalHeld = false),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    flex: 4,
+                    child: Column(
+                      children: [
+                        SizedBox(
+                          height: 36,
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: control(
+                                  'L',
+                                  'Vista −',
+                                  _btnLActive,
+                                  () => setState(() => _btnLActive = true),
+                                  () => setState(() => _btnLActive = false),
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: control(
+                                  'R',
+                                  'Vista +',
+                                  _btnRActive,
+                                  () => setState(() => _btnRActive = true),
+                                  () => setState(() => _btnRActive = false),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Expanded(
+                          child: Semantics(
+                            label: 'Volante por giroscopio, sin control táctil',
+                            child: IgnorePointer(
+                              key: const ValueKey('driving_wheel'),
+                              child: CustomPaint(
+                                painter: _DrivingWheelPainter(
+                                  angle:
+                                      _steering.state.steering *
+                                      _steering.rangeRadians,
+                                  available: _steering.motionAvailable,
+                                ),
+                                child: const SizedBox.expand(),
+                              ),
+                            ),
+                          ),
+                        ),
+                        SizedBox(
+                          height: 34,
+                          width: double.infinity,
+                          child: _buildButton(
+                            key: const ValueKey('joystick_recenter'),
+                            title: 'CENTRAR VOLANTE',
+                            subtitle: 'Sostén tu postura neutra',
+                            icon: Icons.filter_center_focus_rounded,
+                            isActive: false,
+                            colors: const [
+                              Color(0xFF1F5765),
+                              Color(0xFF20364D),
+                            ],
+                            onDown: _centerSteering,
+                            onUp: () {},
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    flex: 3,
+                    child: _buildButton(
+                      key: const ValueKey('driving_throttle_pedal'),
+                      title: 'ACELERAR',
+                      subtitle: 'Mantén presionado',
+                      icon: Icons.arrow_upward_rounded,
+                      emphasizeTitle: true,
+                      isActive: _throttlePedalHeld,
+                      colors: const [Color(0xFF119D78), Color(0xFF096249)],
+                      onDown: () => setState(
+                        () => _throttlePedalHeld = !_steering.state.paused,
+                      ),
+                      onUp: () => setState(() => _throttlePedalHeld = false),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 6),
+            SizedBox(
+              height: 36,
+              child: Row(
+                children: [
+                  Expanded(
+                    child: control('X', _actionLabel('X'), _btnXActive, () {
+                      setState(() {
+                        _steering.setPaused(true);
+                        _releaseInputs();
+                        _surfaceEpoch++;
+                      });
+                      _pulseDrivingAction(reset: true);
+                    }, () => setState(() => _btnXActive = false)),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: control(
+                      'Y',
+                      _actionLabel('Y'),
+                      _btnYActive,
+                      () => setState(() => _btnYActive = true),
+                      () => setState(() => _btnYActive = false),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: control(
+                      'A',
+                      'Pausa / seguir',
+                      _btnAActive,
+                      _toggleDrivingPause,
+                      () {},
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: control(
+                      'B',
+                      _actionLabel('B'),
+                      _btnBActive,
+                      () => setState(() {
+                        _steering.setPaused(true);
+                        _releaseInputs();
+                        _btnBActive = true;
+                      }),
+                      () => setState(() => _btnBActive = false),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            SizedBox(height: 38, child: _buildDrivingStatus()),
+          ],
+        ),
+      ),
+    );
+  }
+
   // ─── Modo Joystick Virtual Layout ────────────────────────────────────────
 
   Widget _buildJoystickLayout() {
@@ -1937,9 +2231,6 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   if (movement) {
                     _stickX = x;
                     _stickY = y;
-                    if (driving && !_steering.motionAvailable) {
-                      _steering.setTouchSteering(x);
-                    }
                   } else {
                     _lookX = x;
                     _lookY = y;
@@ -1951,7 +2242,6 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   if (movement) {
                     _stickX = 0;
                     _stickY = 0;
-                    if (driving) _steering.setTouchSteering(null);
                   } else {
                     _lookX = 0;
                     _lookY = 0;
@@ -2077,7 +2367,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 key: const ValueKey('joystick_recenter'),
                 title: driving ? 'CENTRAR VOLANTE' : 'RECENTRAR VISTA',
                 subtitle: driving
-                    ? 'Teléfono recto = dirección al centro'
+                    ? 'Sostén tu postura neutra y pulsa'
                     : 'Centrar horizonte y mira',
                 icon: Icons.filter_center_focus_rounded,
                 isActive: _recenterTriggered,
@@ -2205,41 +2495,44 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     ),
   );
 
-  Widget _buildDrivingStatus() => Column(
-    mainAxisAlignment: MainAxisAlignment.center,
+  Widget _buildDrivingStatus() => Row(
     children: [
-      const FittedBox(
-        fit: BoxFit.scaleDown,
-        child: Text(
-          'L · FRENO    R · ACELERAR    A · ELEGIR',
-          style: TextStyle(color: Colors.white70, fontSize: 9),
+      Expanded(
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                _motionCapability == VrMotionCapability.checking
+                    ? 'COMPROBANDO GIROSCOPIO'
+                    : _steering.motionAvailable
+                    ? 'GIRA EL TELÉFONO PARA DIRIGIR'
+                    : 'SIN GIROSCOPIO · DIRECCIÓN NO DISPONIBLE',
+                style: TextStyle(
+                  color: _steering.motionAvailable
+                      ? const Color(0xFF10B981)
+                      : Colors.amber,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              Text(
+                _steering.state.paused
+                    ? 'PAUSA · controles liberados'
+                    : _steering.motionAvailable
+                    ? 'Inclina adelante: acelera · atrás: frena/reversa'
+                    : 'Los pedales funcionan; la dirección requiere sensor',
+                style: const TextStyle(color: Colors.white70, fontSize: 10),
+              ),
+            ],
+          ),
         ),
       ),
-      FittedBox(
-        fit: BoxFit.scaleDown,
-        child: Text(
-          _steering.state.paused
-              ? 'PAUSA · pedales liberados'
-              : _steering.motionAvailable
-              ? 'Gira el teléfono para mover el volante'
-              : 'DIRECCIÓN TÁCTIL · joystick izquierdo',
-          style: const TextStyle(color: Color(0xFF10B981), fontSize: 9),
-        ),
-      ),
-      SizedBox(
-        height: 30,
-        child: TextButton(
-          onPressed: _toggleDrivingPause,
-          style: TextButton.styleFrom(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            minimumSize: Size.zero,
-            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          ),
-          child: Text(
-            _steering.state.paused ? 'CONTINUAR' : 'PAUSAR',
-            style: const TextStyle(fontSize: 10),
-          ),
-        ),
+      const SizedBox(width: 8),
+      TextButton(
+        onPressed: _toggleDrivingPause,
+        child: Text(_steering.state.paused ? 'CONTINUAR' : 'PAUSAR'),
       ),
     ],
   );
@@ -2882,4 +3175,42 @@ class _LaserSlidePadPainter extends CustomPainter {
         oldDelegate.isActive != isActive ||
         oldDelegate.isGrip != isGrip;
   }
+}
+
+/// Feedback only: touching the wheel cannot produce a steering command.
+class _DrivingWheelPainter extends CustomPainter {
+  final double angle;
+  final bool available;
+
+  const _DrivingWheelPainter({required this.angle, required this.available});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final radius = math.min(size.width, size.height) * .40;
+    if (radius <= 0) return;
+    final paint = Paint()
+      ..color = available ? const Color(0xFF00E5FF) : Colors.white30
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = math.max(3, radius * .10)
+      ..strokeCap = StrokeCap.round;
+    canvas.save();
+    canvas.translate(size.width / 2, size.height / 2);
+    canvas.rotate(angle);
+    canvas.drawCircle(Offset.zero, radius, paint);
+    for (final theta in [0.0, math.pi, math.pi / 2]) {
+      canvas.drawLine(
+        Offset(math.cos(theta), math.sin(theta)) * radius * .22,
+        Offset(math.cos(theta), math.sin(theta)) * radius * .85,
+        paint,
+      );
+    }
+    canvas.drawCircle(Offset.zero, radius * .18, paint);
+    paint.color = available ? Colors.white : Colors.white38;
+    canvas.drawLine(Offset(0, -radius), Offset(0, -radius * .83), paint);
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_DrivingWheelPainter oldDelegate) =>
+      oldDelegate.angle != angle || oldDelegate.available != available;
 }

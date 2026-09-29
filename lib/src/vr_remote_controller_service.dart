@@ -89,6 +89,11 @@ class RemoteControllerState {
 
   /// Driving-only controls; positive steering turns right. Legacy defaults 0.
   final double steering;
+
+  /// Calibrated screen inclination: forward positive, backward negative.
+  /// Native senders only; old/browser clients and safety releases default 0.
+  /// This is not [orientation], which belongs to touch laser aiming.
+  final double drivingTilt;
   final double throttle;
   final double brake;
   final bool drivingPaused;
@@ -131,6 +136,7 @@ class RemoteControllerState {
     this.recenter = false,
     this.controllerVisible = true,
     this.steering = 0,
+    this.drivingTilt = 0,
     this.throttle = 0,
     this.brake = 0,
     this.drivingPaused = false,
@@ -206,6 +212,10 @@ class VrRemoteControllerService {
     revision: 0,
   );
   int? _acceptedModeRevision;
+
+  // Only a caption update on an acknowledged, unchanged layout may carry
+  // held controls into its ACK. This permission belongs to the current link.
+  int? _heldCaptionAckRevision;
   bool _modeControlSupported = false;
 
   static const int _maxMessageCharacters = 4096;
@@ -314,11 +324,17 @@ class VrRemoteControllerService {
     final clean = VrControllerModeRequest.sanitizeActions(actions);
     final sameMode = mode == _modeRequest.mode;
     if (sameMode && _sameActions(clean, _modeRequest.actions)) return;
+    final preserveHeldAck =
+        sameMode &&
+        _client != null &&
+        _acceptedModeRevision == _modeRequest.revision &&
+        _latestState.mode == mode;
     _modeRequest = VrControllerModeRequest(
       mode: mode,
       revision: _modeRequest.revision + 1,
       actions: clean,
     );
+    _heldCaptionAckRevision = preserveHeldAck ? _modeRequest.revision : null;
     if (!sameMode) _releaseInputs();
     _sendControllerMode();
   }
@@ -575,6 +591,7 @@ class VrRemoteControllerService {
     _rateWindowStartUs = _nowUs;
     _rateWindowCount = 0;
     _acceptedModeRevision = null;
+    _heldCaptionAckRevision = null;
     _modeControlSupported = false;
     _releaseInputs(controllerVisible: true);
     if (previous == null) _connectionController.add(true);
@@ -732,6 +749,7 @@ class VrRemoteControllerService {
             'aimX',
             'aimY',
             'steering',
+            'drivingTilt',
             'throttle',
             'brake',
           ]) {
@@ -858,6 +876,9 @@ class VrRemoteControllerService {
             recenter: recenter,
             controllerVisible: json['controllerVisible'] as bool? ?? true,
             steering: drivingAxis('steering', -1),
+            drivingTilt: json['motionAvailable'] == true
+                ? drivingAxis('drivingTilt', -1)
+                : 0,
             throttle: drivingAxis('throttle', 0),
             brake: drivingAxis('brake', 0),
             drivingPaused: drivingPaused,
@@ -893,9 +914,9 @@ class VrRemoteControllerService {
     if (revision != _modeRequest.revision) return false;
     if (_acceptedModeRevision == revision) return true;
     if (mode != _modeRequest.mode) return false;
-    if (mode == RemoteControllerMode.driving && json['drivingPaused'] != true) {
-      return false;
-    }
+    if (_heldCaptionAckRevision == revision) return true;
+    // A new foreground experience may acknowledge ready-to-drive. The full
+    // neutral check below still rejects held pedals, sticks and buttons.
     for (final key in const [
       'trigger',
       'action',
@@ -928,6 +949,7 @@ class VrRemoteControllerService {
       'aimX',
       'aimY',
       'steering',
+      'drivingTilt',
       'throttle',
       'brake',
     ]) {
@@ -953,6 +975,7 @@ class VrRemoteControllerService {
     if (!identical(socket, _client)) return;
     _lastDisconnectReason = reason;
     _client = null;
+    _heldCaptionAckRevision = null;
     _clientSubscription?.cancel();
     _clientSubscription = null;
     unawaited(_closeLink(socket, closeCode, closeReason));
@@ -1109,8 +1132,8 @@ class VrRemoteControllerService {
       <button id="btnGrip" class="game-btn btn-grip">AGARRE / MENÚ</button>
       <div id="driveControls" style="display:none">
         <button id="driveToggle" class="game-btn btn-a">CONTINUAR (A)</button>
-        <button id="btnThrottle" class="game-btn btn-a">R · ACELERAR</button>
-        <button id="btnBrake" class="game-btn btn-b">L · FRENAR</button>
+        <button id="btnThrottle" class="game-btn btn-a">R · SIGUIENTE VISTA</button>
+        <button id="btnBrake" class="game-btn btn-b">L · VISTA ANTERIOR</button>
       </div>
     </div>
   </div>
@@ -1136,7 +1159,7 @@ class VrRemoteControllerService {
     function applyActions(actions) {
       const clean = {};
       if (actions && typeof actions === 'object') {
-        for (const key of ['A', 'B', 'GRIP']) {
+        for (const key of ['A', 'B', 'L', 'R', 'GRIP']) {
           const value = actions[key];
           if (typeof value === 'string' && value.trim()) clean[key] = value.trim().slice(0, 24);
         }
@@ -1144,11 +1167,16 @@ class VrRemoteControllerService {
       document.getElementById('btnA').innerText = 'A · ' + (clean.A || defaultCaptions.A).toUpperCase();
       document.getElementById('btnB').innerText = 'B · ' + (clean.B || defaultCaptions.B).toUpperCase();
       document.getElementById('btnGrip').innerText = (clean.GRIP || defaultCaptions.GRIP).toUpperCase();
+      document.getElementById('btnThrottle').innerText = 'R · ' + (clean.R || 'SIGUIENTE VISTA').toUpperCase();
+      document.getElementById('btnBrake').innerText = 'L · ' + (clean.L || 'VISTA ANTERIOR').toUpperCase();
     }
     function setMode(newMode) {
       if (newMode !== 'joystick' && newMode !== 'driving') return;
-      releaseInputs(false);
-      mode = newMode;
+      if (mode !== newMode) {
+        releaseInputs(false);
+        mode = newMode;
+        drivingPaused = newMode === 'driving' ? document.hidden : true;
+      }
       updateModeUi();
       sendState();
     }
@@ -1156,7 +1184,7 @@ class VrRemoteControllerService {
     function updateModeUi() {
       const driving = mode === 'driving';
       document.getElementById('tabJoy').className = mode === 'joystick' ? 'tab active' : 'tab';
-      document.getElementById('modeHint').innerText = driving ? 'Volante táctil · desliza izquierda/derecha' : 'La app activa el volante';
+      document.getElementById('modeHint').innerText = driving ? 'Stick ↑ acelera · ↓ frena/reversa · ↔ gira · L/R vista' : 'La app activa el volante';
       document.getElementById('driveControls').style.display = driving ? 'block' : 'none';
       document.getElementById('btnA').style.display = 'flex';
       document.getElementById('btnGrip').style.display = driving ? 'none' : 'flex';
@@ -1178,7 +1206,10 @@ class VrRemoteControllerService {
 
       socket.onopen = () => {
         if (ws !== socket) return;
-        setMode('joystick');
+        // Keep the current mode so reconnecting cannot look like a fresh
+        // driving transition and clear the safety pause.
+        releaseInputs(false);
+        updateModeUi();
         document.getElementById('status').innerText = '✅ CONECTADO AL VISOR';
         document.getElementById('status').style.color = '#10B981';
         sendState();
@@ -1193,7 +1224,7 @@ class VrRemoteControllerService {
             (request.mode !== 'joystick' && request.mode !== 'driving') ||
             (hostModeRevision !== null && request.revision <= hostModeRevision)) return;
         hostModeRevision = request.revision;
-        setMode(request.mode); // First ACK is always fully released/paused.
+        setMode(request.mode); // A mode transition ACK is always fully released.
         applyActions(request.actions);
       };
 
@@ -1305,8 +1336,8 @@ class VrRemoteControllerService {
         ws.send(JSON.stringify({
           mode,
           hostModeRevision,
-          stickX: mode === 'driving' ? 0 : stickX,
-          stickY: mode === 'driving' ? 0 : stickY,
+          stickX: mode === 'driving' && drivingPaused ? 0 : stickX,
+          stickY: mode === 'driving' && drivingPaused ? 0 : stickY,
           btnA,
           btnB,
           btnGrip,

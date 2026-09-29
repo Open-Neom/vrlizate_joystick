@@ -34,8 +34,16 @@ resources. Compatibility with every old phone or browser is **not** guaranteed.
   never recenters the visor; the labelled recenter button remains explicit.
 - **VirtualThumbstick Widget:** Highly customizable 2D analog on-screen joystick with spring return, deadzone threshold, and cyberpunk styling.
 - **WebSocket Streaming:** Full-state JSON with authenticated pairing tokens.
-  Native state refresh runs every 16 ms, plus input-change sends; the simpler
-  browser fallback refreshes held state every 100 ms.
+  Native controls are sampled every 16 ms. Unchanged state is sent every 200 ms;
+  continuous BLE analog changes are capped at 30 Hz, and Wi-Fi at the 16 ms
+  sampling interval. Button edges, neutral releases and mode acknowledgements
+  are immediate. The simpler browser fallback refreshes held state every 100 ms.
+- **Connection recovery:** Transient failures retry while the controller is
+  foreground, with delays capped at 10 seconds. Backgrounding releases inputs
+  and preserves a surviving link; resuming retries immediately. Rejected or
+  expired credentials require fresh pairing. The receiver still neutralizes
+  stale controls after 500 ms; reconnection does not replay held input. OS app
+  termination/radio suspension can still close the underlying connection.
 - **QR Pairing Dialog:** One-tap pairing workflow using `vrlizate://pair?...` canonical URIs.
 - **Driving profile:** Calibrated screen-normal steering, touch fallback,
   independent held accelerator/brake, explicit pause/resume and A for selecting

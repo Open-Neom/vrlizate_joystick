@@ -8,6 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vrlizate/vrlizate.dart';
 import 'package:vrlizate_joystick/vrlizate_joystick.dart';
+import 'package:vrlizate_joystick/src/vr_controller_state_pacer.dart';
 
 class _Link implements VrControllerLink {
   final inbound = StreamController<Object?>();
@@ -384,6 +385,38 @@ void main() {
   });
 
   testWidgets(
+    'paced held input stays live but silence still releases at 500 ms',
+    (tester) async {
+      var nowUs = 0;
+      final service = VrRemoteControllerService(nowMicroseconds: () => nowUs);
+      final link = _Link();
+      final pacer = VrControllerStatePacer();
+      service.attachControllerLink(link, sessionToken: service.sessionToken);
+      var sequence = 0;
+      for (var tick = 0; tick < 63; tick++) {
+        nowUs = tick * 16000;
+        final state = <String, Object?>{'btnA': true};
+        if (pacer.shouldSend(state, nowUs: nowUs, bluetooth: true)) {
+          link.inbound.add(jsonEncode({...state, 'sequence': sequence++}));
+        }
+        await tester.pump(const Duration(milliseconds: 16));
+        expect(service.latestState.btnA, isTrue);
+        expect(service.latestState.isNeutralized, isFalse);
+      }
+      expect(service.telemetry.acceptedStates, 5);
+      expect(service.telemetry.watchdogNeutralizations, 0);
+      nowUs += 500000;
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(service.latestState.btnA, isFalse);
+      expect(service.latestState.isNeutralized, isTrue);
+      expect(service.telemetry.watchdogNeutralizations, 1);
+      expect(service.isConnected, isTrue);
+      service.dispose();
+      await tester.pump();
+    },
+  );
+
+  testWidgets(
     'external late connector closes after timeout and after dispose',
     (tester) async {
       final pending = Completer<VrControllerLink>();
@@ -590,7 +623,7 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('retry backoff is bounded and resets on returning to the app', (
+  testWidgets('retry delay is capped and recovery survives a long absence', (
     tester,
   ) async {
     var attempts = 0;
@@ -614,17 +647,25 @@ void main() {
       await tester.pump(const Duration(milliseconds: 1));
       expect(attempts, before + 1);
     }
-    await tester.pump(const Duration(minutes: 1));
-    expect(attempts, 7);
-    expect(find.textContaining('Visor no disponible'), findsOneWidget);
+    // A headset may be unavailable for longer than the old six-retry window.
+    for (var i = 0; i < 6; i++) {
+      final before = attempts;
+      await tester.pump(const Duration(milliseconds: 9999));
+      expect(attempts, before);
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(attempts, before + 1);
+    }
+    expect(attempts, 13);
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
     await tester.pump();
+    await tester.pump(const Duration(minutes: 1));
+    expect(attempts, 13, reason: 'Suspension cancels automatic attempts');
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await tester.pump(const Duration(milliseconds: 1));
-    expect(attempts, 8);
+    expect(attempts, 14);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(minutes: 1));
-    expect(attempts, 8, reason: 'Leaving the controller cancels recovery');
+    expect(attempts, 14, reason: 'Leaving the controller cancels recovery');
     expect(tester.takeException(), isNull);
   });
 

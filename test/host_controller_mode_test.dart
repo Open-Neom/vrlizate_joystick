@@ -115,6 +115,8 @@ void main() {
     final socket = await connect();
     send(socket, 0, 0, 'joystick');
     await _until(() => !service.latestState.isNeutralized);
+    send(socket, 1, 0, 'joystick', pressed: true);
+    await _until(() => service.latestState.btnA);
     service.requestControllerMode(
       RemoteControllerMode.joystick,
       actions: const {'A': 'Disparar', 'X': 'Cambiar arma'},
@@ -125,6 +127,24 @@ void main() {
     expect(messages.last.actions, {'A': 'Disparar', 'X': 'Cambiar arma'});
     // Same layout: the host keeps the live state instead of neutralizing.
     expect(service.latestState.isNeutralized, isFalse);
+    expect(service.latestState.btnA, isTrue);
+    final acceptedBeforeAck = service.telemetry.acceptedStates;
+    send(socket, 2, 1, 'joystick', pressed: true);
+    await _until(
+      () => service.telemetry.acceptedStates == acceptedBeforeAck + 1,
+    );
+    expect(service.latestState.btnA, isTrue);
+    // Queued state from before the relabel cannot override the new revision.
+    final rejectedBeforeStale = service.telemetry.rejectedStates;
+    send(socket, 3, 0, 'joystick');
+    await _until(
+      () => service.telemetry.rejectedStates == rejectedBeforeStale + 1,
+    );
+    expect(service.latestState.btnA, isTrue);
+    send(socket, 4, 1, 'joystick');
+    await _until(() => !service.latestState.btnA);
+    send(socket, 5, 1, 'joystick', pressed: true);
+    await _until(() => service.latestState.btnA);
     // Identical captions again: nothing new on the wire.
     service.requestControllerMode(
       RemoteControllerMode.joystick,
@@ -143,6 +163,109 @@ void main() {
     expect(service.latestState.isNeutralized, isTrue);
   });
 
+  test('driving caption ACK preserves a held pedal on the same link', () async {
+    service.requestControllerMode(RemoteControllerMode.driving);
+    final socket = await connect();
+    send(socket, 0, 1, 'driving');
+    await _until(() => !service.latestState.isNeutralized);
+    send(socket, 1, 1, 'driving', pressed: true);
+    await _until(() => service.latestState.throttle == 1);
+    service.requestControllerMode(
+      RemoteControllerMode.driving,
+      actions: const {'R': 'Accelerate'},
+    );
+    await _until(() => messages.length == 2);
+    final acceptedBeforeAck = service.telemetry.acceptedStates;
+    send(socket, 2, 2, 'driving', pressed: true);
+    await _until(
+      () => service.telemetry.acceptedStates == acceptedBeforeAck + 1,
+    );
+    expect(service.latestState.throttle, 1);
+    expect(service.latestState.btnR, isTrue);
+  });
+
+  test('initial caption request still needs a neutral ACK', () async {
+    service.requestControllerMode(
+      RemoteControllerMode.joystick,
+      actions: const {'A': 'Fire'},
+    );
+    final socket = await connect();
+    send(socket, 0, 1, 'joystick', pressed: true);
+    await _until(() => service.telemetry.rejectedStates == 1);
+    expect(service.latestState.isNeutralized, isTrue);
+    send(socket, 1, 1, 'joystick');
+    await _until(() => !service.latestState.isNeutralized);
+    expect(service.latestState.btnA, isFalse);
+  });
+
+  test('caption update before a mode ACK does not bypass neutral', () async {
+    final socket = await connect();
+    send(socket, 0, 0, 'joystick');
+    await _until(() => !service.latestState.isNeutralized);
+    service.requestControllerMode(RemoteControllerMode.driving);
+    service.requestControllerMode(
+      RemoteControllerMode.driving,
+      actions: const {'R': 'Accelerate'},
+    );
+    await _until(() => messages.length == 3);
+    send(socket, 1, 2, 'driving', pressed: true);
+    await _until(() => service.telemetry.rejectedStates == 1);
+    expect(service.latestState.isNeutralized, isTrue);
+    send(socket, 2, 2, 'driving');
+    await _until(() => !service.latestState.isNeutralized);
+    expect(service.latestState.throttle, 0);
+  });
+
+  test('reconnecting invalidates a pending held caption ACK', () async {
+    service.requestControllerMode(RemoteControllerMode.driving);
+    var socket = await connect();
+    send(socket, 0, 1, 'driving');
+    await _until(() => !service.latestState.isNeutralized);
+    send(socket, 1, 1, 'driving', pressed: true);
+    await _until(() => service.latestState.throttle == 1);
+    service.requestControllerMode(
+      RemoteControllerMode.driving,
+      actions: const {'R': 'Accelerate'},
+    );
+    await _until(() => messages.length == 2);
+    await socket.close();
+    await _until(() => !service.isConnected);
+    socket = await connect();
+    expect(messages.last.revision, 2);
+    final rejectedBeforeAck = service.telemetry.rejectedStates;
+    send(socket, 0, 2, 'driving', pressed: true);
+    await _until(
+      () => service.telemetry.rejectedStates == rejectedBeforeAck + 1,
+    );
+    expect(service.latestState.isNeutralized, isTrue);
+    expect(service.latestState.throttle, 0);
+    send(socket, 1, 2, 'driving');
+    await _until(() => !service.latestState.isNeutralized);
+    send(socket, 2, 2, 'driving', pressed: true);
+    await _until(() => service.latestState.throttle == 1);
+  });
+
+  test('caption request after a manual layout change needs neutral', () async {
+    final socket = await connect();
+    send(socket, 0, 0, 'joystick');
+    await _until(() => !service.latestState.isNeutralized);
+    send(socket, 1, 0, 'driving', pressed: true);
+    await _until(() => service.latestState.throttle == 1);
+    service.requestControllerMode(
+      RemoteControllerMode.joystick,
+      actions: const {'A': 'Fire'},
+    );
+    await _until(() => messages.length == 2);
+    send(socket, 2, 1, 'joystick', pressed: true);
+    await _until(() => service.telemetry.rejectedStates == 1);
+    expect(service.latestState.btnA, isFalse);
+    send(socket, 3, 1, 'joystick');
+    await _until(
+      () => service.latestState.mode == RemoteControllerMode.joystick,
+    );
+    expect(service.latestState.btnA, isFalse);
+  });
+
   test(
     'Riviera enter/exit rejects stale and held ACK until neutral without auto-accelerating',
     () async {
@@ -151,13 +274,13 @@ void main() {
       await _until(() => !service.latestState.isNeutralized);
       service.requestControllerMode(RemoteControllerMode.driving);
       await _until(() => messages.length == 2);
-      send(socket, 1, 1, 'driving', paused: true);
+      send(socket, 1, 1, 'driving');
       await _until(
         () =>
             service.latestState.mode == RemoteControllerMode.driving &&
             !service.latestState.isNeutralized,
       );
-      expect(service.latestState.drivingPaused, isTrue);
+      expect(service.latestState.drivingPaused, isFalse);
       expect(service.latestState.throttle, 0);
       send(socket, 2, 1, 'driving', pressed: true);
       await _until(() => service.latestState.throttle == 1);
@@ -197,6 +320,25 @@ void main() {
       await _until(() => service.latestState.btnA);
     },
   );
+
+  test('ready driving ACK still rejects a held stick before neutral', () async {
+    service.requestControllerMode(RemoteControllerMode.driving);
+    final socket = await connect();
+    socket.add(
+      jsonEncode({
+        'sequence': 0,
+        'hostModeRevision': 1,
+        'mode': 'driving',
+        'drivingPaused': false,
+        'stickY': 1,
+      }),
+    );
+    send(socket, 1, 1, 'driving');
+    await _until(() => !service.latestState.isNeutralized);
+    expect(service.latestState.drivingPaused, isFalse);
+    expect(service.latestState.stickY, 0);
+    expect(states.every((state) => state.stickY == 0), isTrue);
+  });
 
   test(
     'reconnect resends current driving request and requires a fresh paused ACK',

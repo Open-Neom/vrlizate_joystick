@@ -4,9 +4,113 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vector_math/vector_math.dart';
 import 'package:vrlizate_joystick/vrlizate_joystick.dart';
 
+class _GravitySamples {
+  _GravitySamples(this.controller);
+  final VrSteeringController controller;
+  int nowUs = 0;
+
+  double hold(double elevation, {double flip = 1, double wheel = 0}) {
+    final angle = elevation * math.pi / 180;
+    for (var i = 0; i < 80; i++) {
+      nowUs += 20000;
+      controller.updateGravity(
+        flip * 9.81 * math.cos(angle) * math.cos(wheel),
+        9.81 * math.cos(angle) * math.sin(wheel),
+        9.81 * math.sin(angle),
+        nowUs,
+      );
+    }
+    return controller.drivingTiltAt(nowUs);
+  }
+}
+
 void main() {
   Quaternion twist(double radians) =>
       Quaternion.axisAngle(Vector3(0, 0, 1), radians);
+
+  test(
+    'physical tilt is calibrated, deliberate and equal in landscape flips',
+    () {
+      for (final flip in [-1.0, 1.0]) {
+        final controller = VrSteeringController()..setMotionAvailable(true);
+        final samples = _GravitySamples(controller);
+        expect(samples.hold(15, flip: flip), 0);
+        expect(
+          samples.hold(24, flip: flip),
+          0,
+        ); // Below the 10 degree deadzone.
+        expect(samples.hold(36, flip: flip), closeTo(math.pow(.5, 1.35), .001));
+        expect(samples.hold(47, flip: flip), closeTo(1, .001));
+        expect(samples.hold(-17, flip: flip), closeTo(-1, .001));
+      }
+    },
+  );
+
+  test('turning the wheel cannot become a physical accelerator', () {
+    final controller = VrSteeringController()..setMotionAvailable(true);
+    final samples = _GravitySamples(controller);
+    samples.hold(25);
+    for (final wheel in [-.95, -.5, .5, .95]) {
+      expect(samples.hold(25, wheel: wheel), 0);
+    }
+    controller.calibrate(Quaternion.identity());
+    expect(samples.hold(55), 0);
+    expect(samples.hold(23), closeTo(-1, .001));
+  });
+
+  test(
+    'impact rejects tilt until fresh samples settle, not just elapsed time',
+    () {
+      final controller = VrSteeringController()..setMotionAvailable(true);
+      final samples = _GravitySamples(controller);
+      samples.hold(0);
+      expect(samples.hold(35), 1);
+      controller.updateGravity(24, 0, 0, ++samples.nowUs);
+      expect(controller.drivingTiltAt(samples.nowUs), 0);
+      controller.updateGravity(8, 0, 5.5, ++samples.nowUs);
+      expect(controller.drivingTiltAt(samples.nowUs + 250000), 0);
+      expect(samples.hold(35), 1);
+    },
+  );
+
+  test('no sensor, stale samples and recovery never replay tilt', () {
+    final controller = VrSteeringController();
+    final samples = _GravitySamples(controller);
+    expect(samples.hold(0), 0);
+    expect(samples.hold(35), 0);
+    controller.setMotionAvailable(true);
+    expect(samples.hold(15), 0);
+    expect(samples.hold(50), 1);
+    samples.nowUs += 400001;
+    expect(controller.drivingTiltAt(samples.nowUs), 0);
+    expect(samples.hold(50), 0); // Recovered posture becomes neutral.
+    expect(samples.hold(15), -1);
+    controller.setMotionAvailable(false);
+    expect(controller.drivingTiltAt(samples.nowUs), 0);
+  });
+
+  test('pause, release and sensor errors require fresh neutral posture', () {
+    final controller = VrSteeringController()..setMotionAvailable(true);
+    final samples = _GravitySamples(controller);
+    samples.hold(0);
+    expect(samples.hold(35), 1);
+    controller.setPaused(true);
+    expect(samples.hold(-20), 0);
+    controller.setPaused(false);
+    expect(samples.hold(-20), 0);
+    expect(samples.hold(15), 1);
+    controller.release();
+    expect(controller.drivingTiltAt(samples.nowUs), 0);
+    expect(samples.hold(15), 0);
+    expect(samples.hold(-20), -1);
+    controller.clearGravity();
+    expect(controller.drivingTiltAt(samples.nowUs), 0);
+    expect(samples.hold(-20), 0);
+    for (final x in [0.0, double.nan, double.infinity]) {
+      controller.updateGravity(x, 0, 0, ++samples.nowUs);
+      expect(controller.drivingTiltAt(samples.nowUs), 0);
+    }
+  });
 
   test('clockwise screen twist turns right in both landscape orientations', () {
     for (final landscape in [-math.pi / 2, math.pi / 2]) {

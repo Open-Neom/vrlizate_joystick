@@ -158,6 +158,7 @@ void main() {
           'sequence': 0,
           'mode': 'driving',
           'steering': -0.7,
+          'drivingTilt': -0.45,
           'throttle': 0.6,
           'brake': 0.2,
           'motionAvailable': true,
@@ -169,6 +170,7 @@ void main() {
         () => service.latestState.mode == RemoteControllerMode.driving,
       );
       expect(service.latestState.steering, -0.7);
+      expect(service.latestState.drivingTilt, -0.45);
       expect(service.latestState.throttle, 0.6);
       expect(service.latestState.brake, 0.2);
       expect(service.latestState.motionAvailable, isTrue);
@@ -179,12 +181,15 @@ void main() {
           'sequence': 1,
           'mode': 'driving',
           'steering': 3,
+          'drivingTilt': 2,
+          'motionAvailable': true,
           'throttle': 2,
           'brake': -1,
         }),
       );
       await waitUntil(() => service.latestState.steering == 1);
       expect(service.latestState.throttle, 1);
+      expect(service.latestState.drivingTilt, 1);
       expect(service.latestState.brake, 0);
       socket.add(
         jsonEncode({
@@ -192,14 +197,27 @@ void main() {
           'mode': 'driving',
           'drivingPaused': true,
           'steering': 1,
+          'drivingTilt': -1,
+          'motionAvailable': true,
           'throttle': 1,
           'brake': 1,
         }),
       );
       await waitUntil(() => service.latestState.drivingPaused);
       expect(service.latestState.steering, 0);
+      expect(service.latestState.drivingTilt, 0);
       expect(service.latestState.throttle, 0);
       expect(service.latestState.brake, 0);
+      socket.add(
+        jsonEncode({
+          'sequence': 3,
+          'mode': 'driving',
+          'drivingTilt': 1,
+          'motionAvailable': false,
+        }),
+      );
+      await waitUntil(() => !service.latestState.drivingPaused);
+      expect(service.latestState.drivingTilt, 0);
     },
   );
 
@@ -207,10 +225,20 @@ void main() {
     'driving timeout releases pedals and legacy states default to zero',
     () async {
       final socket = await connect();
-      socket.add(jsonEncode({'sequence': 0, 'mode': 'driving', 'throttle': 1}));
+      socket.add(
+        jsonEncode({
+          'sequence': 0,
+          'mode': 'driving',
+          'throttle': 1,
+          'drivingTilt': .8,
+          'motionAvailable': true,
+        }),
+      );
       await waitUntil(() => service.latestState.throttle == 1);
+      expect(service.latestState.drivingTilt, .8);
       await waitUntil(() => service.latestState.drivingPaused);
       expect(service.latestState.throttle, 0);
+      expect(service.latestState.drivingTilt, 0);
       socket.add(
         jsonEncode({'sequence': 1, 'btnA': true, 'steering': 1, 'throttle': 1}),
       );
@@ -220,6 +248,7 @@ void main() {
       expect(service.latestState.throttle, 0);
       expect(service.latestState.drivingPaused, isFalse);
       expect(service.latestState.motionAvailable, isFalse);
+      expect(service.latestState.drivingTilt, 0);
     },
   );
 
@@ -233,6 +262,8 @@ void main() {
       await waitUntil(() => service.latestState.steering == 0.4);
       for (final invalid in [
         '"steering":1e400',
+        '"drivingTilt":1e400',
+        '"drivingTilt":"1"',
         '"throttle":"1"',
         '"brake":false',
         '"drivingPaused":1',

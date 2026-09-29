@@ -4,7 +4,9 @@ import 'vr_controller_mode.dart';
 
 /// Authenticated host-to-controller UI recommendation, not an input event.
 /// The client must release held inputs before acknowledging [revision] in its
-/// next full state as `hostModeRevision`; driving starts paused, never with A.
+/// next full state as `hostModeRevision`. A fresh foreground mode transition
+/// can be ready to drive with neutral controls, never with a synthetic A.
+/// Same-mode updates and reconnections must preserve the client's pause.
 class VrControllerModeRequest {
   const VrControllerModeRequest({
     required this.mode,
