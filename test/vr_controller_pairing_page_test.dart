@@ -123,6 +123,64 @@ void main() {
     expect(invitation.transportType, VrTransportType.localSocket);
   });
 
+  test(
+    'a Bluetooth-only scanner rejects LAN invitations with the right hint',
+    () {
+      expect(
+        () => parseVrControllerPairingCode(
+          _code,
+          supportedTransports: const {VrTransportType.bluetoothLe},
+        ),
+        throwsA(
+          isA<FormatException>().having(
+            (error) => error.message,
+            'Bluetooth recovery',
+            contains('Escanea el QR Bluetooth'),
+          ),
+        ),
+      );
+    },
+  );
+
+  testWidgets(
+    'Bluetooth instructions and QR route never offer a LAN connection',
+    (tester) async {
+      final camera = _FakeCamera();
+      final accepted = <VrPairingPayload>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: VrControllerPairingPage(
+            cameraFactory: () => camera,
+            supportedTransports: const {VrTransportType.bluetoothLe},
+            controllerBuilder: (_, invitation) {
+              accepted.add(invitation);
+              return const Scaffold(body: Text('Bluetooth controller'));
+            },
+          ),
+        ),
+      );
+      await _settle(tester);
+      expect(
+        find.textContaining('Activa Bluetooth en ambos teléfonos'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('misma red Wi-Fi'), findsNothing);
+      camera.detections.add(_code);
+      await _settle(tester);
+      expect(accepted, isEmpty);
+      expect(find.textContaining('Escanea el QR Bluetooth'), findsOneWidget);
+      camera.detections.add(
+        '${_code.replaceFirst('localSocket', 'bluetoothLe')}'
+        '&bleServiceUuid=507163a9-980a-42fd-8914-a9aee10a3b83',
+      );
+      await _settle(tester);
+      expect(accepted.single.transportType, VrTransportType.bluetoothLe);
+      expect(find.text('Bluetooth controller'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox.shrink());
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   test('rejects malformed/foreign/web QR without echoing the secret', () {
     for (final raw in [
       '',

@@ -71,6 +71,11 @@ class RemoteControllerState {
   final bool stickClick;
   final double stickX;
   final double stickY;
+
+  /// Raw left-thumb contact near the outer rim, before the speed ramp.
+  /// Null means a legacy sender/transport; hosts may then infer the rim from
+  /// the conditioned stick magnitude. This is intent, not a turn command.
+  final bool? moveAtEdge;
   final double touchX;
   final double touchY;
   final double turnRate;
@@ -124,6 +129,7 @@ class RemoteControllerState {
     this.stickClick = false,
     this.stickX = 0.0,
     this.stickY = 0.0,
+    this.moveAtEdge,
     this.touchX = 0.0,
     this.touchY = 0.0,
     double turnRate = 0.0,
@@ -217,9 +223,12 @@ class VrRemoteControllerService {
   // held controls into its ACK. This permission belongs to the current link.
   int? _heldCaptionAckRevision;
   bool _modeControlSupported = false;
+  Uri? _castPreviewUri;
 
   static const int _maxMessageCharacters = 4096;
   static const int _maxMessagesPerSecond = 240;
+  // BLE carries a one-byte tag plus up to 1023 UTF-8 bytes per control message.
+  static const int _maxCastPreviewMessageBytes = 1023;
 
   VrRemoteControllerService({
     this.inputTimeout = const Duration(milliseconds: 500),
@@ -268,7 +277,10 @@ class VrRemoteControllerService {
   Stream<RemoteControllerState> get onState => _stateController.stream;
   Stream<bool> get onConnectionChanged => _connectionController.stream;
 
-  bool get isConnected => _client != null;
+  bool _localHandheldActive = false;
+
+  bool get isConnected => _client != null || _localHandheldActive;
+  bool get isLocalHandheldActive => _localHandheldActive;
   bool get isRunning => _isRunning;
   int? get serverPort => _server?.port;
   String? get serverUrl => _isRunning && _localIp != null
@@ -300,6 +312,86 @@ class VrRemoteControllerService {
   }
 
   RemoteControllerMode get recommendedMode => _modeRequest.mode;
+  Map<String, String> get requestedActions => _modeRequest.actions;
+
+  /// Activates or deactivates the built-in single-screen handheld gamepad.
+  void setLocalHandheldActive(bool active) {
+    if (_disposed || _localHandheldActive == active) return;
+    final wasConnected = isConnected;
+    _localHandheldActive = active;
+    if (_client == null) {
+      _latestState = RemoteControllerState(
+        orientation: _latestState.orientation.clone(),
+        mode: _modeRequest.mode,
+        controllerVisible: false,
+      );
+      if (!active && !_disposed) {
+        _stateController.add(_latestState);
+      }
+    }
+    if (wasConnected != isConnected && !_disposed) {
+      _connectionController.add(isConnected);
+    }
+  }
+
+  /// Injects a local touchscreen gamepad snapshot when running in single-screen
+  /// handheld console mode. If an external 2nd smartphone is paired, the
+  /// external controller takes precedence.
+  void emitLocalHandheldState(RemoteControllerState state) {
+    if (_disposed) return;
+    if (!_localHandheldActive) {
+      setLocalHandheldActive(true);
+    }
+    if (_client != null) return;
+    _latestState = state;
+    _lastAcceptedStateUs = _nowUs;
+    _acceptedStates++;
+    _stateController.add(_latestState);
+  }
+
+  /// Announces a separately hosted, read-only preview to the paired controller.
+  ///
+  /// This does not start a LAN server or alter controller input/mode state.
+  /// The host owns the preview lifetime and calls this with null when it stops.
+  /// Only authenticated attached links receive the URI, including its optional
+  /// viewer token. A reconnect receives the current offer after its mode message;
+  /// stopping this service forgets it. Credentials are never logged.
+  void setCastPreviewUri(Uri? uri) {
+    if (_disposed || uri == _castPreviewUri) return;
+    if (uri != null &&
+        ((uri.scheme != 'http' && uri.scheme != 'https') ||
+            uri.host.isEmpty ||
+            uri.userInfo.isNotEmpty ||
+            uri.hasFragment)) {
+      throw ArgumentError(
+        'Preview must be an HTTP(S) URL without user info or fragment.',
+      );
+    }
+    final message = _castPreviewMessage(uri);
+    if (utf8.encode(message).length > _maxCastPreviewMessageBytes) {
+      throw ArgumentError(
+        'Preview announcement exceeds the BLE control limit.',
+      );
+    }
+    _castPreviewUri = uri;
+    _sendCastPreview(message);
+  }
+
+  static String _castPreviewMessage(Uri? uri) =>
+      jsonEncode({'type': 'cast_preview', 'url': uri?.toString()});
+
+  void _sendCastPreview(String message) {
+    final client = _client;
+    if (client == null || _disposed) return;
+    try {
+      client.add(message);
+    } catch (_) {
+      _disconnectClient(
+        client,
+        reason: VrControllerDisconnectReason.transportError,
+      );
+    }
+  }
 
   /// Requests a controller layout for the active app, optionally with what
   /// each button does there ([actions], keyed `A`/`B`/`X`/`Y`/`L`/`R`/`GRIP`)
@@ -307,11 +399,14 @@ class VrRemoteControllerService {
   /// recommendation again. Older clients may ignore this message; modern
   /// clients acknowledge a neutral full state before controls resume.
   ///
-  /// A caption-only change (same mode, new actions) is sent without releasing
+  /// [horizontalLook] opts games such as Doom into horizontal right-stick
+  /// look. Changing this input profile requires a new neutral acknowledgement.
+  /// A caption-only change (same profile, new actions) is sent without releasing
   /// held inputs: it is a relabel, not a layout swap.
   void requestControllerMode(
     RemoteControllerMode mode, {
     Map<String, String> actions = const {},
+    bool horizontalLook = false,
   }) {
     if (mode == RemoteControllerMode.laser) {
       throw ArgumentError.value(
@@ -323,9 +418,11 @@ class VrRemoteControllerService {
     if (_disposed) return;
     final clean = VrControllerModeRequest.sanitizeActions(actions);
     final sameMode = mode == _modeRequest.mode;
-    if (sameMode && _sameActions(clean, _modeRequest.actions)) return;
+    final sameProfile =
+        sameMode && horizontalLook == _modeRequest.horizontalLook;
+    if (sameProfile && _sameActions(clean, _modeRequest.actions)) return;
     final preserveHeldAck =
-        sameMode &&
+        sameProfile &&
         _client != null &&
         _acceptedModeRevision == _modeRequest.revision &&
         _latestState.mode == mode;
@@ -333,9 +430,21 @@ class VrRemoteControllerService {
       mode: mode,
       revision: _modeRequest.revision + 1,
       actions: clean,
+      horizontalLook: horizontalLook,
     );
     _heldCaptionAckRevision = preserveHeldAck ? _modeRequest.revision : null;
-    if (!sameMode) _releaseInputs();
+    if (!sameProfile) {
+      if (_localHandheldActive && _client == null) {
+        _latestState = RemoteControllerState(
+          orientation: _latestState.orientation.clone(),
+          mode: mode,
+          controllerVisible: false,
+        );
+        if (!_disposed) _stateController.add(_latestState);
+      } else {
+        _releaseInputs();
+      }
+    }
     _sendControllerMode();
   }
 
@@ -721,6 +830,7 @@ class VrRemoteControllerService {
             'drivingPaused',
             'motionAvailable',
             'controllerVisible',
+            'moveAtEdge',
           ]) {
             if (json.containsKey(key) && json[key] is! bool) {
               throw FormatException('$key must be a boolean.');
@@ -818,6 +928,7 @@ class VrRemoteControllerService {
           final mode = switch (modeStr) {
             'laser' => RemoteControllerMode.laser,
             'driving' => RemoteControllerMode.driving,
+            'nes' => RemoteControllerMode.nes,
             _ => RemoteControllerMode.joystick,
           };
           final drivingPaused = json['drivingPaused'] == true;
@@ -866,6 +977,7 @@ class VrRemoteControllerService {
             stickClick: stickClick,
             stickX: stickX.clamp(-1.0, 1.0),
             stickY: stickY.clamp(-1.0, 1.0),
+            moveAtEdge: json['moveAtEdge'] as bool?,
             touchX: tx.clamp(-1.0, 1.0),
             touchY: ty.clamp(-1.0, 1.0),
             turnRate: turnRate.clamp(-1.0, 1.0),
@@ -902,6 +1014,8 @@ class VrRemoteControllerService {
       cancelOnError: true,
     );
     _sendControllerMode();
+    final preview = _castPreviewUri;
+    if (preview != null) _sendCastPreview(_castPreviewMessage(preview));
   }
 
   bool _acceptsModeState(
@@ -930,6 +1044,7 @@ class VrRemoteControllerService {
       'stickClick',
       'laserSlideActive',
       'recenter',
+      'moveAtEdge',
     ]) {
       if (json[key] == true) return false;
     }
@@ -1128,7 +1243,7 @@ class VrRemoteControllerService {
     <!-- Buttons right side -->
     <div class="btn-cluster">
       <button id="btnA" class="game-btn btn-a">A · ELEGIR / OK</button>
-      <button id="btnB" class="game-btn btn-b">B · ATRÁS / HOME</button>
+      <button id="btnB" class="game-btn btn-b">B · ATRÁS / CANCELAR</button>
       <button id="btnGrip" class="game-btn btn-grip">AGARRE / MENÚ</button>
       <div id="driveControls" style="display:none">
         <button id="driveToggle" class="game-btn btn-a">CONTINUAR (A)</button>
@@ -1155,7 +1270,7 @@ class VrRemoteControllerService {
 
     // Host captions for the buttons this layout has (A, B, grip). Text only
     // via innerText, known keys only, capped like the native client.
-    const defaultCaptions = { A: 'ELEGIR / OK', B: 'ATRÁS / HOME', GRIP: 'AGARRE / MENÚ' };
+    const defaultCaptions = { A: 'ELEGIR / OK', B: 'ATRÁS / CANCELAR', GRIP: 'AGARRE / MENÚ' };
     function applyActions(actions) {
       const clean = {};
       if (actions && typeof actions === 'object') {
@@ -1171,7 +1286,7 @@ class VrRemoteControllerService {
       document.getElementById('btnBrake').innerText = 'L · ' + (clean.L || 'VISTA ANTERIOR').toUpperCase();
     }
     function setMode(newMode) {
-      if (newMode !== 'joystick' && newMode !== 'driving') return;
+      if (newMode !== 'joystick' && newMode !== 'driving' && newMode !== 'nes') return;
       if (mode !== newMode) {
         releaseInputs(false);
         mode = newMode;
@@ -1183,8 +1298,8 @@ class VrRemoteControllerService {
 
     function updateModeUi() {
       const driving = mode === 'driving';
-      document.getElementById('tabJoy').className = mode === 'joystick' ? 'tab active' : 'tab';
-      document.getElementById('modeHint').innerText = driving ? 'Stick ↑ acelera · ↓ frena/reversa · ↔ gira · L/R vista' : 'La app activa el volante';
+      document.getElementById('tabJoy').className = !driving ? 'tab active' : 'tab';
+      document.getElementById('modeHint').innerText = driving ? 'Stick ↑ acelera · ↓ frena/reversa · ↔ gira · L/R vista' : mode === 'nes' ? 'NES · A acción · GRIP Start · B Home' : 'La app activa el volante';
       document.getElementById('driveControls').style.display = driving ? 'block' : 'none';
       document.getElementById('btnA').style.display = 'flex';
       document.getElementById('btnGrip').style.display = driving ? 'none' : 'flex';
@@ -1221,7 +1336,7 @@ class VrRemoteControllerService {
         try { request = JSON.parse(event.data); } catch (_) { return; }
         if (!request || request.type !== 'vrlizate.controllerMode' || request.version !== 1 ||
             !Number.isSafeInteger(request.revision) || request.revision < 0 ||
-            (request.mode !== 'joystick' && request.mode !== 'driving') ||
+            (request.mode !== 'joystick' && request.mode !== 'driving' && request.mode !== 'nes') ||
             (hostModeRevision !== null && request.revision <= hostModeRevision)) return;
         hostModeRevision = request.revision;
         setMode(request.mode); // A mode transition ACK is always fully released.
@@ -1391,6 +1506,7 @@ class VrRemoteControllerService {
 
   void stop() {
     _lifecycleGeneration++;
+    _castPreviewUri = null;
     _startOperation = null;
     _isRunning = false;
     _inputWatchdog?.cancel();

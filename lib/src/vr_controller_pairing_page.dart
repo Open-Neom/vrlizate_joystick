@@ -46,12 +46,17 @@ VrPairingPayload parseVrControllerPairingCode(
     );
   }
   if (!supportedTransports.contains(payload.transportType)) {
-    final label = payload.transportType == VrTransportType.bluetoothLe
-        ? 'Bluetooth LE'
-        : 'Wi-Fi Direct';
-    throw FormatException(
-      '$label no está disponible en esta app. Usa el emparejamiento Wi-Fi local del visor.',
-    );
+    final label = switch (payload.transportType) {
+      VrTransportType.bluetoothLe => 'Bluetooth LE',
+      VrTransportType.localSocket => 'Wi-Fi local',
+      VrTransportType.wifiDirect => 'Wi-Fi Direct',
+    };
+    final suggestion = supportedTransports.contains(VrTransportType.bluetoothLe)
+        ? 'Escanea el QR Bluetooth del visor.'
+        : supportedTransports.contains(VrTransportType.localSocket)
+        ? 'Usa el emparejamiento Wi-Fi local del visor.'
+        : 'Abre el vínculo desde la app del visor.';
+    throw FormatException('$label no está disponible en esta app. $suggestion');
   }
   if (payload.transportType == VrTransportType.bluetoothLe &&
       !RegExp(
@@ -95,6 +100,28 @@ class VrControllerPairingPage extends StatefulWidget {
 class _VrControllerPairingPageState extends State<VrControllerPairingPage>
     with WidgetsBindingObserver {
   final _link = TextEditingController();
+
+  Set<VrTransportType> get _supportedTransports =>
+      widget.controllerBuilder != null
+      ? widget.supportedTransports
+      : widget.supportedTransports
+            .where((type) => type == VrTransportType.localSocket)
+            .toSet();
+
+  bool get _bluetoothOnly =>
+      _supportedTransports.length == 1 &&
+      _supportedTransports.contains(VrTransportType.bluetoothLe);
+
+  String get _connectionInstructions => _bluetoothOnly
+      ? 'Activa Bluetooth en ambos teléfonos y mantenlos cerca. '
+            'No requiere una red ni internet. El mando se abrirá aquí.'
+      : _supportedTransports.contains(VrTransportType.bluetoothLe)
+      ? 'Escanea el QR Bluetooth o Wi-Fi local del visor. '
+            'El mando usará el transporte indicado en ese vínculo.'
+      : _supportedTransports.isEmpty
+      ? 'Abre el vínculo desde la app del visor para conectar el mando.'
+      : 'Conecta ambos teléfonos a la misma red Wi-Fi. '
+            'El mando se abrirá aquí, sin usar Chrome ni otra cámara.';
   VrPairingCameraSession? _camera;
   StreamSubscription<String>? _codes;
   Future<void> _cameraOperations = Future.value();
@@ -216,9 +243,7 @@ class _VrControllerPairingPageState extends State<VrControllerPairingPage>
     try {
       invitation = parseVrControllerPairingCode(
         raw,
-        supportedTransports: widget.controllerBuilder == null
-            ? const {VrTransportType.localSocket}
-            : widget.supportedTransports,
+        supportedTransports: _supportedTransports,
       );
     } on FormatException catch (error) {
       if (fromCamera) _lastRejectedCode = raw;
@@ -338,7 +363,9 @@ class _VrControllerPairingPageState extends State<VrControllerPairingPage>
       'No se pudo usar la cámara. Puedes pegar el enlace o volver a intentar.',
     null =>
       state.running
-          ? 'Apunta al QR «Mando con app» que aparece en el visor.'
+          ? _bluetoothOnly
+                ? 'Apunta al QR Bluetooth que aparece en el visor.'
+                : 'Apunta al QR «Mando con app» que aparece en el visor.'
           : 'Preparando cámara… Si prefieres, pega el enlace.',
   };
 
@@ -367,10 +394,7 @@ class _VrControllerPairingPageState extends State<VrControllerPairingPage>
                       ),
                     ),
                     const SizedBox(height: 8),
-                    const Text(
-                      'Conecta ambos teléfonos a la misma red Wi-Fi. '
-                      'El mando se abrirá aquí, sin usar Chrome ni otra cámara.',
-                    ),
+                    Text(_connectionInstructions),
                     const SizedBox(height: 20),
                     if (_busy) ...[
                       const Center(child: CircularProgressIndicator()),

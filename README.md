@@ -12,21 +12,64 @@ resources. Compatibility with every old phone or browser is **not** guaranteed.
 - **Native edge-framed landscape controls:** L/R span the top, Y/B the outer sides,
   and X/A the bottom edges and corners. Concave bands frame each circular stick;
   the painted shapes also define the touch regions. Connection/settings and
-  aiming stay in the center, leaving the outer edges for controls. Native
+  experience actions stay in the center, leaving the outer edges for controls. Native
   entry/exit keeps both landscape orientations.
   ES: X abajo izquierda, A abajo derecha, Y lateral izquierdo, B lateral derecho;
   L/R arriba. Son franjas con recorte circular, no botones aislados.
   Y/B keep enlarged outer-edge targets; L/R own the top strips and upper-inner
   circular surrounds next to the central panel. ES: los lóbulos interiores
   superiores pertenecen a L/R; Y/B permanecen en las orillas exteriores.
-  Los sticks y las franjas inferiores X/A no se reducen.
+  El izquierdo conserva su tamaño; el derecho mide el 78% para ampliar el centro.
 - **Dual Analog Virtual Thumbsticks:**
   - **Left Stick:** 3D locomotion / omnidirectional ground navigation $(XZ)$.
-  - **Right Stick:** 360° yaw turn & 180° pitch tilt for looking around and correcting horizon drift.
+  - **Right Control:** `Vista` provides vertical thumb/phone inclination;
+    `Láser` replaces that same circular region with touch aim and hold-to-grip.
+    Switching releases all held inputs and the old gesture before continuing.
+    Walking uses the left stick for heading; native games can request both
+    view axes through `horizontalLook` (see the contract below).
+  - Both use a continuous radial deadzone (10%) and a 1.5 response exponent.
+    A firm, steady hold ramps gain over 1.8 seconds: movement 0.5→1.0 and look
+    0.45→0.8. Small deflections remain precise; release, a turn over 55 degrees
+    from the held direction, backgrounding and profile changes reset the ramp.
+  - Native left-stick rim intent is reported before this speed ramp. Entering
+    the outer 92% sets `moveAtEdge`; returning below 84% or releasing clears it.
+    A walking host can use a sustained rim hold to turn toward the chosen
+    heading while keeping the same progressive movement speed. NES and driving
+    do not request this walking behavior.
+- **Hold-to-look motion:** Press the right stick, including its center, to set
+  the phone's neutral orientation. Deflect the phone and hold that posture to
+  keep turning, even after physical rotation stops. Returning to neutral or
+  releasing stops the motion contribution; each new press sets a new center.
+  The gyro tracks relative orientation and gravity defines the axes in either
+  landscape direction. An angular 3° deadzone and 1.25 response exponent soften
+  the center; 25° reaches the maximum contribution of 0.6. Only output speed
+  saturates: further physical deflection is retained so returning to center
+  works correctly. Thumb input still adds to motion, with combined norm at most
+  1. Stale/failed sensors fall back to thumb and require a new press to rearm.
+  The `Inclinar la vista con el teléfono` setting is enabled by default and saved locally.
+  It applies only to `Vista`, not touch laser, NES or driving. Walking profiles
+  consume only vertical inclination; explicit game profiles can also use yaw.
+  There is no position
+  tracking or absolute compass heading; long holds can accumulate gyro drift.
+  Integration uses sensor timestamps; the local monotonic clock handles
+  freshness, so batched callbacks do not change the measured deflection.
+  A new press recenters this local control without recentering the viewer.
+  Near a 170° physical rotation the gesture disarms to avoid an ambiguous
+  orientation; it needs a fresh press. A completely flat initial phone needs
+  a usable gravity basis first. With an inclined screen, rotation around its
+  normal can contribute yaw, as it has a component around world-up.
 - **Independent Action Buttons:** `A/B/X/Y`, `L` utility and `R` primary trigger.
-- **Touch Aiming Pad:** Touch-only aim and 280 ms hold-to-grip. The pad owns
-  laser orientation during and after release; native joystick packets send
-  zero angular velocity. Gyroscope integration is reserved for driving.
+- **Touch Aiming Pad:** Available in the right control's `Láser` mode, with
+  touch-only aim and 280 ms hold-to-grip. Offset aim is retained after release;
+  switching back to `Vista` centers and releases it for head-gaze selection.
+  Native joystick packets send
+  zero pointer angular velocity. Hold-to-look motion travels in `lookX/lookY`
+  instead, so it never takes over the laser pose or changes the BLE envelope.
+- **Central experience panel:** Shows actual host-provided button actions and
+  the `Vista`/`Láser` selector. It does not currently stream the visor image.
+  A future thumbnail channel must fragment bounded images, discard stale frames
+  and prioritize controls; the current reliable BLE state queue is not a video
+  transport. GPU capture and YouTube composition need device validation.
 - **Shake-to-show/hide:** A deliberate controller shake toggles the viewer's
   controller feedback, in joystick and driving. Gravity-aware detection,
   quiet rearming and a cooldown reject ordinary wheel tilts and repeat toggles.
@@ -48,6 +91,11 @@ resources. Compatibility with every old phone or browser is **not** guaranteed.
 - **Driving profile:** Calibrated screen-normal steering, touch fallback,
   independent held accelerator/brake, explicit pause/resume and A for selecting
   the viewer's world-space menus without pressing the accelerator.
+- **NES profile:** Host-selected classic controller with a digital D-pad,
+  red B/A buttons and Select/Start. A separate Home action saves/exits through
+  the host. The native layout has no look stick or laser pad. Bluetooth is the
+  native pairing flow used by VRlizate; the opt-in browser transport below is
+  retained for SDK compatibility.
 
 ## Quick Start
 
@@ -122,8 +170,25 @@ Si el visor combina A y gatillo como acción primaria, debe detectar el flanco
 del estado combinado para evitar clics duplicados. `laserSlideActive` indica
 que el dedo controla el pad relativo a la cabeza, incluso en el centro; no
 debe confundirse con una pose IMU en el mundo. El mando conserva la última
-orientación del pad al soltar sin aplicar nuevos deltas IMU; el giroscopio
-se reserva para el volante, no para mover el láser.
+orientación del pad al soltar sin aplicar nuevos deltas IMU. El giroscopio
+aporta dirección al volante o giro de vista mientras se pulsa el stick derecho;
+nunca modifica el láser.
+
+`RemoteControllerState.moveAtEdge` is an optional boolean: true/false carries
+the native thumb's raw rim contact, while null identifies an older sender or
+transport so the host can infer intent from the received stick magnitude.
+It never commands a camera rotation itself. The VRlizate BLE adapter negotiates
+`edgeTurnIntent` during mutual authentication, then carries this hint in bit 15
+of the existing 21-byte state. Without agreement the bit stays zero and the hint
+is omitted, preserving compatibility with older receivers. Movement axes and
+their progressive response are unchanged.
+
+An experience can explicitly request `horizontalLook: true` in its controller
+mode request when it needs independent horizontal right-stick turning, such as
+classic Doom. New requests default to false; old messages that omit this field
+keep their previous two-axis look behavior. Changing this profile releases held
+input and requires a neutral acknowledgement, while caption-only updates retain
+their existing behavior.
 
 `controllerVisible` is a boolean desired state (default `true` for legacy
 clients), included in every native snapshot, not a toggle pulse. Watchdog
@@ -163,7 +228,7 @@ confianza. El QR/enlace entrega el token; UDP anuncia el visor sin divulgarlo.
 
 ## Driving / Conducción
 
-Controllers start in **JOYSTICK**, with the laser pad inside that layout, not
+Controllers start in **JOYSTICK / Vista**, with `Láser` available in the same right control, not
 in a separate laser startup screen. The host can recommend **CONDUCCIÓN** for
 Riviera and **JOYSTICK** when leaving it; native settings also allow a manual
 choice. Explicit `PhoneControllerPage(initialMode: RemoteControllerMode.driving)`
@@ -232,8 +297,18 @@ accepting a new start/resume gesture. A recovered held accelerator is not one.
 
 ```dart
 service.requestControllerMode(RemoteControllerMode.driving); // Enter Riviera
+service.requestControllerMode(RemoteControllerMode.nes); // Enter NES runtime
 service.requestControllerMode(RemoteControllerMode.joystick); // Leave demo
 ```
+
+The active experience selects the profile. `nes` uses the existing state fields:
+visible A -> `btnA`, visible B -> `btnX`, Start -> `btnY`, Select -> `btnL`,
+Home -> `btnB`; its D-pad emits `stickX/stickY` in -1/0/1, positive Y upwards.
+Game input and platform navigation therefore stay distinct. Other consoles
+need an implemented layout and tested mapping before requesting a new profile;
+the NES profile does not imply SNES/N64 support. Update both native phones to
+receive this layout; older clients cannot display profiles they do not know.
+The opt-in browser fallback accepts `nes` but retains its generic controls.
 
 The authenticated WebSocket sends a separate command:
 
@@ -251,20 +326,22 @@ neutral acknowledgement. Choosing a manual mode after that acknowledgement is
 allowed; a subsequent host request takes priority. No mode change sends an A
 press or resumes acceleration. Legacy clients without this acknowledgement
 remain readable, but cannot be promised automatic layout changes. The `laser`
-wire enum remains compatible; hosts recommend only joystick/driving.
+wire enum remains compatible; hosts recommend joystick, driving or NES.
 
 Al entrar a Riviera el visor solicita volante; al salir solicita joystick. El
 cambio suelta entradas y deja conducción **pausada**: pulsa CONTINUAR y vuelve
 a presionar los pedales. Los paquetes atrasados no restauran botones sostenidos
-de clientes que reconocen este protocolo. El transporte sigue siendo WS local
-autenticado por token, no TLS ni Bluetooth implementado.
+de clientes que reconocen este protocolo. VRlizate conecta este protocolo por
+su puente Bluetooth; el servicio conserva WS local como transporte opcional
+del SDK.
 
 ## Compatibility / Compatibilidad real
 
 | Profile | Required | Current limitations |
 | --- | --- | --- |
-| Native touch | Host-app-supported Android/iOS, working multitouch, reachable local WebSocket | No gyro/camera needed for touch or a pasted pairing link. This package is not a separate lightweight APK. |
-| Native motion/wheel | Native touch requirements + working gyro stream | Relative gyro drift; no 6DoF. No sensor/denied stream falls back to touch. |
+| Native touch | Host-app-supported Android/iOS, working multitouch, authenticated host link (BLE in VRlizate; optional WebSocket in SDK hosts) | No gyro/camera needed for touch or a pasted pairing link. This package is not a separate lightweight APK. |
+| Native motion look | Native touch requirements + working gyro and accelerometer streams | Relative deflection requests sustained turn while held; gyro drift is possible during long holds. No positional tracking. Missing/stale sensors preserve thumb look and require a fresh press. |
+| Native wheel | Native touch requirements + working gyro stream; accelerometer for tilt pedals | Relative gyro drift; no 6DoF. Missing sensors fall back to touch. |
 | Embedded browser touch | JavaScript, WebSocket, URLSearchParams, touch events, Pointer Events and reachable LAN | Joystick A/B/grip or host-selected touch wheel/pedals, manual feedback toggle; not native layout parity. No certified oldest browser version. |
 | Embedded browser motion | Not implemented in the touch fallback | No gyro aiming or shake detection. Use native controller for motion steering/shake. |
 
@@ -313,3 +390,9 @@ Unit/widget and loopback WebSocket tests do not certify devices. Before release:
 flutter test
 flutter analyze
 ```
+
+## Vista del visor por Wi-Fi
+
+La app puede anunciar `cast_preview` con una URL de `vrlizate_cast` por el enlace autenticado. El mando abre automáticamente una vista monocular en el centro del joystick y en los perfiles NES/conducción. Cerrar la imagen mantiene los controles Bluetooth. Proyectar comparte el enlace/QR con otros navegadores, que reciben los cuadros directamente del visor. El servidor HTTP del mando antiguo no interviene. La sesión y el enlace se mantienen únicamente en memoria y se descartan al perder o cambiar el vínculo.
+
+Primera beta: JPEG a pocos FPS, sin audio ni descubrimiento de televisores. Ver [vrlizate_cast](../vrlizate_cast/README.md).

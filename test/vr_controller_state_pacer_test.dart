@@ -14,6 +14,22 @@ Map<String, Object?> controls({
 };
 
 void main() {
+  test('raw rim entry and exit bypass BLE analog pacing', () {
+    final pacer = VrControllerStatePacer();
+    expect(
+      pacer.shouldSend({'moveAtEdge': false}, nowUs: 0, bluetooth: true),
+      isTrue,
+    );
+    expect(
+      pacer.shouldSend({'moveAtEdge': true}, nowUs: 1000, bluetooth: true),
+      isTrue,
+    );
+    expect(
+      pacer.shouldSend({'moveAtEdge': false}, nowUs: 2000, bluetooth: true),
+      isTrue,
+    );
+  });
+
   test('physical tilt release bypasses BLE analog pacing', () {
     final pacer = VrControllerStatePacer();
     expect(

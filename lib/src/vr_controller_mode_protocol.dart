@@ -12,6 +12,7 @@ class VrControllerModeRequest {
     required this.mode,
     required this.revision,
     this.actions = const {},
+    this.horizontalLook = false,
   });
 
   static const type = 'vrlizate.controllerMode';
@@ -27,7 +28,14 @@ class VrControllerModeRequest {
   final RemoteControllerMode mode;
   final int revision;
 
+  /// Whether the experience needs horizontal right-stick look (e.g. Doom).
+  /// New hosts opt in explicitly; parsing an older host's absent field keeps
+  /// its existing two-axis look behavior. This does not remap action buttons.
+  final bool horizontalLook;
+
   /// What each button does in the active experience, keyed by [actionKeys].
+  /// Keys retain their wire meaning in every layout: NES visible B uses X,
+  /// Start uses Y, Select uses L and Home uses B. Captions never remap inputs.
   /// Optional and version-neutral: a client that predates captions ignores
   /// the field, a host that has none omits it. Empty means "use defaults".
   final Map<String, String> actions;
@@ -37,7 +45,7 @@ class VrControllerModeRequest {
         revision < 0 ||
         revision > maxRevision) {
       throw ArgumentError(
-        'Host mode must be joystick/driving with a safe revision.',
+        'Host mode must be joystick/driving/nes with a safe revision.',
       );
     }
     final clean = sanitizeActions(actions);
@@ -46,6 +54,7 @@ class VrControllerModeRequest {
       'version': version,
       'mode': mode.name,
       'revision': revision,
+      'horizontalLook': horizontalLook,
       if (clean.isNotEmpty) 'actions': clean,
     };
   }
@@ -84,9 +93,14 @@ class VrControllerModeRequest {
       if (revision is! int || revision < 0 || revision > maxRevision) {
         return null;
       }
+      if (value.containsKey('horizontalLook') &&
+          value['horizontalLook'] is! bool) {
+        return null;
+      }
       final mode = switch (value['mode']) {
         'joystick' => RemoteControllerMode.joystick,
         'driving' => RemoteControllerMode.driving,
+        'nes' => RemoteControllerMode.nes,
         _ => null,
       };
       return mode == null
@@ -95,6 +109,7 @@ class VrControllerModeRequest {
               mode: mode,
               revision: revision,
               actions: sanitizeActions(value['actions']),
+              horizontalLook: value['horizontalLook'] as bool? ?? true,
             );
     } on FormatException {
       return null;

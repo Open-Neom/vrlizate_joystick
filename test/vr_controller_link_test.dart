@@ -147,6 +147,76 @@ void main() {
     },
   );
 
+  test(
+    'horizontal look profile changes release input and require neutral ACK',
+    () async {
+      final service = VrRemoteControllerService(
+        inputTimeout: const Duration(seconds: 5),
+      );
+      addTearDown(service.dispose);
+      final link = _Link();
+      service.attachControllerLink(link, sessionToken: service.sessionToken);
+      Map<String, dynamic> command() =>
+          jsonDecode(link.sent.last as String) as Map<String, dynamic>;
+      var sequence = 0;
+      Future<void> send(int revision, {bool held = false}) async {
+        link.inbound.add(
+          jsonEncode({
+            'sequence': sequence++,
+            'hostModeRevision': revision,
+            'mode': 'joystick',
+            'lookX': held ? .7 : 0,
+            'btnA': held,
+          }),
+        );
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      expect(command()['horizontalLook'], isFalse);
+      final originalRevision = command()['revision'] as int;
+      await send(originalRevision);
+      await send(originalRevision, held: true);
+      expect(service.latestState.btnA, isTrue);
+      service.requestControllerMode(
+        RemoteControllerMode.joystick,
+        horizontalLook: true,
+      );
+      final newRevision = command()['revision'] as int;
+      expect(newRevision, originalRevision + 1);
+      expect(command()['horizontalLook'], isTrue);
+      expect(service.latestState.isNeutralized, isTrue);
+      expect(service.latestState.turnRate, 0);
+      await send(originalRevision, held: true);
+      await send(newRevision, held: true);
+      expect(service.latestState.isNeutralized, isTrue);
+      await send(newRevision);
+      expect(service.latestState.isNeutralized, isFalse);
+      await send(newRevision, held: true);
+      expect(service.latestState.turnRate, .7);
+
+      // A true caption-only update preserves the acknowledged input profile.
+      service.requestControllerMode(
+        RemoteControllerMode.joystick,
+        horizontalLook: true,
+        actions: {'A': 'Disparar'},
+      );
+      expect(service.latestState.btnA, isTrue);
+      final captionRevision = command()['revision'] as int;
+      await send(captionRevision, held: true);
+      expect(service.latestState.btnA, isTrue);
+      final count = link.sent.length;
+      service.requestControllerMode(
+        RemoteControllerMode.joystick,
+        horizontalLook: true,
+        actions: {'A': 'Disparar'},
+      );
+      expect(link.sent.length, count);
+      service.requestControllerMode(RemoteControllerMode.joystick);
+      expect(command()['horizontalLook'], isFalse);
+      expect(service.latestState.isNeutralized, isTrue);
+    },
+  );
+
   test('mode commands require neutral ACK over external channel too', () async {
     final service = VrRemoteControllerService();
     addTearDown(service.dispose);
@@ -373,7 +443,11 @@ void main() {
       tester,
       () => service.latestState.mode == RemoteControllerMode.driving,
     );
-    expect(service.latestState.drivingPaused, isTrue);
+    // A fresh foreground recommendation is ready, but carries no held input.
+    // Lifecycle/reconnect recovery still requires an explicit resume.
+    expect(service.latestState.drivingPaused, isFalse);
+    expect(service.latestState.throttle, 0);
+    expect(service.latestState.brake, 0);
     expect(service.latestState.btnA || service.latestState.btnB, isFalse);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(milliseconds: 200));
@@ -797,7 +871,7 @@ void main() {
       expect(find.text('Bluetooth LE'), findsOneWidget);
       expect(find.text('Wi-Fi local'), findsOneWidget);
       expect(
-        find.text('Vínculo directo BLE sin router ni contraseña.'),
+        find.text('Vínculo directo Bluetooth con el visor.'),
         findsOneWidget,
       );
       expect(find.byType(TextField), findsNothing);
@@ -815,7 +889,7 @@ void main() {
 
       expect(find.byType(TextField), findsNothing);
       expect(
-        find.text('Vínculo directo BLE sin router ni contraseña.'),
+        find.text('Vínculo directo Bluetooth con el visor.'),
         findsOneWidget,
       );
 

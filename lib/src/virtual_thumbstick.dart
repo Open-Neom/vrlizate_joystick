@@ -19,10 +19,17 @@ class VirtualThumbstick extends StatefulWidget {
   /// Normalized distance threshold under which output is zeroed.
   final double deadzone;
 
+  /// Constrain both the visible thumb and its output to vertical travel.
+  final bool horizontalEnabled;
+
   /// Callback delivering normalized coordinates:
   /// - `x`: -1.0 (Left) to +1.0 (Right)
   /// - `y`: +1.0 (Forward/Up) to -1.0 (Backward/Down)
   final void Function(double stickX, double stickY) onChanged;
+
+  /// Reports the owning finger's contact immediately, including at the center.
+  /// Additional fingers cannot take over or prolong this contact.
+  final ValueChanged<bool>? onPressed;
 
   /// Optional callback invoked when the stick returns to center.
   final VoidCallback? onRelease;
@@ -38,10 +45,12 @@ class VirtualThumbstick extends StatefulWidget {
     this.size = 150.0,
     this.knobRadius = 28.0,
     this.deadzone = 0.08,
+    this.horizontalEnabled = true,
     this.accentColor = const Color(0xFF00E5FF),
     this.hapticsEnabled = true,
     required this.onChanged,
     this.onRelease,
+    this.onPressed,
   });
 
   @override
@@ -53,6 +62,8 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
   Offset _dragOffset = Offset.zero;
   bool _isDragging = false;
   bool _hasHitBoundary = false;
+  bool _disposed = false;
+  int? _pointer;
 
   late AnimationController _recenterController;
   late Animation<Offset> _recenterAnimation;
@@ -60,49 +71,63 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
   @override
   void initState() {
     super.initState();
-    _recenterController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 120),
-    )..addListener(() {
-        setState(() {
-          _dragOffset = _recenterAnimation.value;
+    _recenterController =
+        AnimationController(
+          vsync: this,
+          duration: const Duration(milliseconds: 120),
+        )..addListener(() {
+          if (_disposed || !mounted) return;
+          setState(() {
+            _dragOffset = _recenterAnimation.value;
+          });
         });
-      });
   }
 
   @override
   void dispose() {
+    // Hit-test routes retain their old Listener until the pointer ends, even
+    // when a mode change or resize has already removed this widget.
+    _disposed = true;
+    _pointer = null;
+    _isDragging = false;
     _recenterController.dispose();
     super.dispose();
   }
 
   double get _maxRadius => (widget.size / 2) - widget.knobRadius;
 
-  void _onPanStart(DragStartDetails details) {
+  void _onPointerDown(PointerDownEvent event) {
+    if (_disposed || !mounted || _pointer != null) return;
+    _pointer = event.pointer;
     _recenterController.stop();
     _isDragging = true;
     _hasHitBoundary = false;
-    _updateOffset(details.localPosition);
-    if (widget.hapticsEnabled) {
+    widget.onPressed?.call(true);
+    if (_disposed || !mounted) return;
+    _updateOffset(event.localPosition);
+    if (!_disposed && mounted && widget.hapticsEnabled) {
       HapticFeedback.selectionClick();
     }
   }
 
-  void _onPanUpdate(DragUpdateDetails details) {
-    _updateOffset(details.localPosition);
+  void _onPointerMove(PointerMoveEvent event) {
+    if (_disposed || !mounted || event.pointer != _pointer) return;
+    _updateOffset(event.localPosition);
   }
 
-  void _onPanEnd(DragEndDetails details) {
-    _releaseStick();
-  }
-
-  void _onPanCancel() {
+  void _onPointerEnd(PointerEvent event) {
+    if (_disposed || !mounted || event.pointer != _pointer) return;
+    _pointer = null;
     _releaseStick();
   }
 
   void _updateOffset(Offset localPos) {
+    if (_disposed || !mounted || _pointer == null) return;
     final center = Offset(widget.size / 2, widget.size / 2);
-    final delta = localPos - center;
+    final delta = Offset(
+      widget.horizontalEnabled ? localPos.dx - center.dx : 0,
+      localPos.dy - center.dy,
+    );
     final dist = delta.distance;
 
     Offset clampedOffset;
@@ -140,20 +165,24 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
   }
 
   void _releaseStick() {
+    if (_disposed || !mounted || !_isDragging) return;
     _isDragging = false;
     _hasHitBoundary = false;
-    _recenterAnimation = Tween<Offset>(
-      begin: _dragOffset,
-      end: Offset.zero,
-    ).animate(CurvedAnimation(
-      parent: _recenterController,
-      curve: Curves.easeOutCubic,
-    ));
+    _recenterAnimation = Tween<Offset>(begin: _dragOffset, end: Offset.zero)
+        .animate(
+          CurvedAnimation(
+            parent: _recenterController,
+            curve: Curves.easeOutCubic,
+          ),
+        );
     _recenterController.forward(from: 0.0);
 
     widget.onChanged(0.0, 0.0);
+    if (_disposed || !mounted) return;
+    widget.onPressed?.call(false);
+    if (_disposed || !mounted) return;
     widget.onRelease?.call();
-    if (widget.hapticsEnabled) {
+    if (!_disposed && mounted && widget.hapticsEnabled) {
       HapticFeedback.lightImpact();
     }
   }
@@ -163,11 +192,12 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
     final center = Offset(widget.size / 2, widget.size / 2);
     final knobPos = center + _dragOffset;
 
-    return GestureDetector(
-      onPanStart: _onPanStart,
-      onPanUpdate: _onPanUpdate,
-      onPanEnd: _onPanEnd,
-      onPanCancel: _onPanCancel,
+    return Listener(
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: _onPointerDown,
+      onPointerMove: _onPointerMove,
+      onPointerUp: _onPointerEnd,
+      onPointerCancel: _onPointerEnd,
       child: Container(
         width: widget.size,
         height: widget.size,
@@ -200,6 +230,7 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
                 deadzone: widget.deadzone,
                 isDragging: _isDragging,
                 accentColor: widget.accentColor,
+                horizontalEnabled: widget.horizontalEnabled,
               ),
             ),
 
@@ -215,16 +246,20 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
                   gradient: LinearGradient(
                     colors: _isDragging
                         ? [widget.accentColor, const Color(0xFFFF007F)]
-                        : [widget.accentColor, widget.accentColor.withValues(alpha: 0.5)],
+                        : [
+                            widget.accentColor,
+                            widget.accentColor.withValues(alpha: 0.5),
+                          ],
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                   ),
                   boxShadow: [
                     BoxShadow(
-                      color: (_isDragging
-                              ? const Color(0xFFFF007F)
-                              : widget.accentColor)
-                          .withValues(alpha: 0.6),
+                      color:
+                          (_isDragging
+                                  ? const Color(0xFFFF007F)
+                                  : widget.accentColor)
+                              .withValues(alpha: 0.6),
                       blurRadius: 12,
                       offset: const Offset(0, 2),
                     ),
@@ -254,12 +289,14 @@ class _ThumbstickBasePainter extends CustomPainter {
   final double deadzone;
   final bool isDragging;
   final Color accentColor;
+  final bool horizontalEnabled;
 
   _ThumbstickBasePainter({
     required this.maxRadius,
     required this.deadzone,
     required this.isDragging,
     required this.accentColor,
+    required this.horizontalEnabled,
   });
 
   @override
@@ -271,11 +308,13 @@ class _ThumbstickBasePainter extends CustomPainter {
       ..strokeWidth = 1.0;
 
     // Crosshairs
-    canvas.drawLine(
-      Offset(center.dx - maxRadius, center.dy),
-      Offset(center.dx + maxRadius, center.dy),
-      linePaint,
-    );
+    if (horizontalEnabled) {
+      canvas.drawLine(
+        Offset(center.dx - maxRadius, center.dy),
+        Offset(center.dx + maxRadius, center.dy),
+        linePaint,
+      );
+    }
     canvas.drawLine(
       Offset(center.dx, center.dy - maxRadius),
       Offset(center.dx, center.dy + maxRadius),
@@ -299,29 +338,39 @@ class _ThumbstickBasePainter extends CustomPainter {
     // Directional labels (W, S, A, D)
     _drawLabel(canvas, '▲', Offset(center.dx, center.dy - maxRadius + 14));
     _drawLabel(canvas, '▼', Offset(center.dx, center.dy + maxRadius - 14));
-    _drawLabel(canvas, '◀', Offset(center.dx - maxRadius + 14, center.dy));
-    _drawLabel(canvas, '▶', Offset(center.dx + maxRadius - 14, center.dy));
+    if (horizontalEnabled) {
+      _drawLabel(canvas, '◀', Offset(center.dx - maxRadius + 14, center.dy));
+      _drawLabel(canvas, '▶', Offset(center.dx + maxRadius - 14, center.dy));
+    }
   }
 
   void _drawLabel(Canvas canvas, String text, Offset position) {
-    final tp = TextPainter(
-      text: TextSpan(
-        text: text,
-        style: TextStyle(
-          color: accentColor.withValues(alpha: 0.45),
-          fontSize: 9,
-          fontWeight: FontWeight.bold,
-        ),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout();
-    tp.paint(canvas, position - Offset(tp.width / 2, tp.height / 2));
+    // Geometry keeps directional hints independent of font availability.
+    final direction = switch (text) {
+      '▲' => const Offset(0, -4),
+      '▼' => const Offset(0, 4),
+      '◀' => const Offset(-4, 0),
+      _ => const Offset(4, 0),
+    };
+    final tip = position + direction;
+    final base = position - direction * .5;
+    final side = Offset(-direction.dy, direction.dx) * .65;
+    canvas.drawPath(
+      Path()
+        ..moveTo(tip.dx, tip.dy)
+        ..lineTo((base + side).dx, (base + side).dy)
+        ..lineTo((base - side).dx, (base - side).dy)
+        ..close(),
+      Paint()..color = accentColor.withValues(alpha: .45),
+    );
   }
 
   @override
   bool shouldRepaint(covariant _ThumbstickBasePainter oldDelegate) {
     return oldDelegate.isDragging != isDragging ||
         oldDelegate.maxRadius != maxRadius ||
-        oldDelegate.deadzone != deadzone;
+        oldDelegate.deadzone != deadzone ||
+        oldDelegate.horizontalEnabled != horizontalEnabled ||
+        oldDelegate.accentColor != accentColor;
   }
 }

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Keep the full-size left walking/turning stick, reduce the right to 78%, and
+  combine vertical `Vista` and touch `Láser` there with an explicit selector.
+  Free the center for experience actions; changes release old gestures/grip.
+  Add `VirtualThumbstick.horizontalEnabled` for matching vertical visuals/input.
+
+- Add an explicit `horizontalLook` experience profile for games that retain
+  independent horizontal right-stick turning. New requests default off; older
+  requests retain two-axis behavior. Profile changes require neutral input.
+- Expose optional raw left-stick rim intent separately from its progressive
+  speed: enter at 92%, release below 84%, and clear on release/lifecycle/mode
+  changes. Hosts can time a turn without waiting for full movement speed.
+  Older snapshots keep a null hint; BLE transports must negotiate support.
+- Soften native analog sticks with radial response and a 1.8-second hold ramp.
+  Add optional motion look while the right thumb owns its stick, including a
+  stationary center press. Phone deflection from the press posture requests a
+  sustained look rate, including while held still; returning to center stops
+  it. Relative orientation mixes with thumb look, with angular deadzone 3° and
+  full output at 25° without clipping the stored pose. Each press recenters;
+  release, resize, lifecycle/profile changes and stale sensors clear motion.
+  Preserve digital NES controls and driving controls; BLE stays 21 bytes.
+- Add an experience-selected NES controller profile with digital D-pad, B/A,
+  Select/Start and separate Home. Keep native Bluetooth pairing and the existing
+  wire contract, including neutral acknowledgement on layout changes.
 - Pace native controller traffic: unchanged state uses a 200 ms keepalive and
   BLE analog changes are capped at 30 Hz. Buttons, neutral releases, mode ACKs
   and lifecycle safety snapshots bypass pacing; the 500 ms watchdog remains.

@@ -14,12 +14,6 @@ const _rightButtons = [
   VrJoystickControl.b,
   VrJoystickControl.a,
 ];
-const _mirrors = [
-  (VrJoystickControl.l, VrJoystickControl.r),
-  (VrJoystickControl.y, VrJoystickControl.b),
-  (VrJoystickControl.x, VrJoystickControl.a),
-  (VrJoystickControl.moveStick, VrJoystickControl.lookStick),
-];
 
 void main() {
   for (final size in [
@@ -36,6 +30,12 @@ void main() {
       for (final control in VrJoystickControl.values) {
         final rect = layout[control];
         final path = layout.shape(control);
+        if (control == VrJoystickControl.laserPad) {
+          expect(rect, Rect.zero);
+          expect(path.getBounds(), Rect.zero);
+          expect(layout.labels[control], isNull);
+          continue;
+        }
         for (final value in [rect.left, rect.top, rect.right, rect.bottom]) {
           expect(value.isFinite, isTrue, reason: '$control at $size');
         }
@@ -91,42 +91,62 @@ void main() {
       }
     });
 
-    test('edge silhouettes and circles mirror physically at $size', () {
-      final layout = VrJoystickGeometry.fit(size);
-      for (final (left, right) in _mirrors) {
-        final l = layout[left];
-        final r = layout[right];
-        // Native Path bounds round through Float32; mirrored coordinates may
-        // differ by a few ten-thousandths of a logical pixel.
-        expect(l.width, closeTo(r.width, 1e-3));
-        expect(l.height, closeTo(r.height, 1e-3));
-        expect(l.top, closeTo(r.top, 1e-3));
-        expect(l.left + r.right, closeTo(size.width, 1e-3));
-        for (var row = 0; row < 19; row++) {
-          for (var column = 0; column < 19; column++) {
+    test(
+      'left thumb stays familiar while right frees a wider center at $size',
+      () {
+        final layout = VrJoystickGeometry.fit(size);
+        final left = layout[VrJoystickControl.moveStick];
+        final right = layout[VrJoystickControl.lookStick];
+        final previous = _previousBottomAndStickShapes(
+          size,
+          leftInset: 0,
+          rightInset: 0,
+        );
+        final oldLeft = previous[VrJoystickControl.moveStick]!.getBounds();
+        final oldRight = previous[VrJoystickControl.lookStick]!.getBounds();
+        expect(left.left, closeTo(oldLeft.left, 1e-3));
+        expect(left.top, closeTo(oldLeft.top, 1e-3));
+        expect(left.width, closeTo(oldLeft.width, 1e-3));
+        expect(left.height, closeTo(oldLeft.height, 1e-3));
+        expect(right.width / left.width, closeTo(.78, 1e-4));
+        expect(right.height / left.height, closeTo(.78, 1e-4));
+        expect(right.center.dy, closeTo(left.center.dy, 1e-3));
+        expect(right.center.dx, greaterThan(oldRight.center.dx));
+        final oldCenterWidth = math.min(
+          size.width * .4,
+          (size.width * .30).clamp(128.0, 360.0),
+        );
+        expect(layout.centerPanel.width, greaterThan(oldCenterWidth));
+        expect(left.right, lessThanOrEqualTo(layout.centerPanel.left));
+        expect(right.left, greaterThanOrEqualTo(layout.centerPanel.right));
+        expect(layout.previewPanel.left, greaterThan(layout.centerPanel.left));
+        expect(layout.previewPanel.right, lessThan(layout.centerPanel.right));
+        expect(
+          layout.previewPanel.top,
+          greaterThan(layout[VrJoystickControl.recenter].bottom),
+        );
+        expect(
+          layout.previewPanel.bottom,
+          lessThanOrEqualTo(size.height - layout.footerHeight),
+        );
+        expect(layout.hitTest(layout.previewPanel.center), isNull);
+        for (var row = 0; row < 9; row++) {
+          for (var column = 0; column < 13; column++) {
             final point = Offset(
-              l.left + l.width * (column + .29) / 19,
-              l.top + l.height * (row + .41) / 19,
+              layout.previewPanel.left +
+                  layout.previewPanel.width * (column + .5) / 13,
+              layout.previewPanel.top +
+                  layout.previewPanel.height * (row + .5) / 9,
             );
+            expect(layout.hitTest(point), isNull);
             expect(
-              layout.shape(left).contains(point),
-              layout
-                  .shape(right)
-                  .contains(Offset(size.width - point.dx, point.dy)),
-              reason: '$left/$right mismatch at $point, $size',
+              layout.shape(VrJoystickControl.laserPad).contains(point),
+              isFalse,
             );
           }
         }
-      }
-      expect(
-        layout[VrJoystickControl.moveStick].right,
-        lessThanOrEqualTo(layout.centerPanel.left),
-      );
-      expect(
-        layout[VrJoystickControl.lookStick].left,
-        greaterThanOrEqualTo(layout.centerPanel.right),
-      );
-    });
+      },
+    );
 
     test(
       'circular holes belong to sticks, never surrounding bands at $size',
@@ -279,14 +299,18 @@ void main() {
             }
           }
 
-          // This refinement reallocates upper inner space only. Keep the accepted
-          // bottom corner bands and both sticks at their previous positions.
+          // The movement side is unchanged; right-side space is deliberately
+          // reassigned to the passive center and the smaller look/laser stick.
           final previous = _previousBottomAndStickShapes(
             size,
             leftInset: leftInset,
             rightInset: rightInset,
           );
-          for (final entry in previous.entries) {
+          for (final entry in previous.entries.where(
+            (entry) =>
+                entry.key == VrJoystickControl.moveStick ||
+                entry.key == VrJoystickControl.x,
+          )) {
             final actual = layout.shape(entry.key);
             final expected = entry.value;
             final bounds = expected.getBounds();
@@ -343,7 +367,8 @@ void main() {
             for (final angle in [math.pi / 3, math.pi / 4]) {
               final delta =
                   Offset(innerSign * math.cos(angle), -math.sin(angle)) *
-                  (radius + 4);
+                  (radius * (stick == VrJoystickControl.lookStick ? .78 : 1) +
+                      4);
               final inner = center + delta;
               final outer = center + Offset(-delta.dx, delta.dy);
               expect(layout.hitTest(inner), shoulder);

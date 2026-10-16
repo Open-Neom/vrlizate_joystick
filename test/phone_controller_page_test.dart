@@ -10,6 +10,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vrlizate/vrlizate.dart';
 import 'package:vrlizate_joystick/src/vr_controller_region.dart';
+import 'package:vrlizate_joystick/src/nes_controller_layout.dart';
 import 'package:vrlizate_joystick/vrlizate_joystick.dart';
 
 class _RealHttpOverrides extends HttpOverrides {}
@@ -60,6 +61,17 @@ Offset _buttonPoint(WidgetTester tester, String button) {
       : tester.getCenter(finder);
 }
 
+Future<void> _selectRightMode(
+  WidgetTester tester, {
+  required bool laser,
+}) async {
+  await tester.tap(
+    find.byKey(ValueKey(laser ? 'right_mode_laser' : 'right_mode_view')),
+    pointer: 99,
+  );
+  await tester.pump();
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   const channels = [
@@ -82,6 +94,344 @@ void main() {
           .setMockMethodCallHandler(MethodChannel(name), null);
     }
   });
+
+  Future<void> nesHostRequest(
+    WidgetTester tester,
+    _CapturedControllerLink link,
+    int revision,
+    RemoteControllerMode mode, {
+    Map<String, String> actions = const {},
+  }) async {
+    link.inbound.add(
+      jsonEncode(
+        VrControllerModeRequest(
+          mode: mode,
+          revision: revision,
+          actions: actions,
+        ).toJson(),
+      ),
+    );
+    await _pumpUntil(
+      tester,
+      () =>
+          link.packets.any((packet) => packet['hostModeRevision'] == revision),
+    );
+  }
+
+  Future<_CapturedControllerLink> openNes(WidgetTester tester) async {
+    await tester.binding.setSurfaceSize(const Size(800, 360));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final link = _CapturedControllerLink();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PhoneControllerPage(
+          initialMode: RemoteControllerMode.joystick,
+          allowWifiConnection: false,
+          linkConnector: () async => link,
+          autoConnect: true,
+        ),
+      ),
+    );
+    await _pumpUntil(tester, () => link.packets.isNotEmpty);
+    await nesHostRequest(tester, link, 1, RemoteControllerMode.nes);
+    await tester.pump(const Duration(milliseconds: 150));
+    return link;
+  }
+
+  testWidgets(
+    'NES host profile exposes exact cartridge button mappings and Home',
+    (tester) async {
+      final link = await openNes(tester);
+      expect(find.byType(VirtualThumbstick), findsNothing);
+      expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
+      expect(find.byKey(const ValueKey('joystick_recenter')), findsNothing);
+      for (final (label, wire) in [
+        ('A', 'btnA'),
+        ('B', 'btnX'),
+        ('start', 'btnY'),
+        ('select', 'btnL'),
+        ('home', 'btnB'),
+      ]) {
+        final gesture = await tester.startGesture(
+          tester.getCenter(find.byKey(ValueKey('nes_button_$label'))),
+        );
+        await tester.pump();
+        final packet = link.packets.last;
+        expect(packet['mode'], 'nes');
+        expect(packet[wire], isTrue);
+        for (final other in [
+          'btnA',
+          'btnB',
+          'btnX',
+          'btnY',
+          'btnL',
+          'btnR',
+          'btnGrip',
+        ]) {
+          expect(packet[other], other == wire);
+        }
+        expect(packet['action'], label == 'home');
+        expect(packet['trigger'], isFalse);
+        expect(packet['lookX'], 0);
+        expect(packet['lookY'], 0);
+        await gesture.up();
+        await tester.pump();
+        expect(link.packets.last[wire], isFalse);
+      }
+      final home = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey('nes_button_home'))),
+      );
+      await tester.pump();
+      expect(link.packets.last['btnB'], isTrue);
+      await nesHostRequest(tester, link, 2, RemoteControllerMode.joystick);
+      expect(find.byType(VirtualThumbstick), findsNWidgets(2));
+      expect(link.packets.last['btnB'], isFalse);
+      await home.up();
+      await tester.pumpWidget(const SizedBox.shrink());
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'NES cruceta supports two fingers, diagonals, opposing inputs and independent releases',
+    (tester) async {
+      final link = await openNes(tester);
+      final pad = tester.getRect(find.byKey(const ValueKey('nes_dpad')));
+      final up = await tester.startGesture(
+        Offset(pad.center.dx, pad.top + pad.height * .13),
+        pointer: 1,
+      );
+      final right = await tester.startGesture(
+        Offset(pad.left + pad.width * .86, pad.center.dy),
+        pointer: 2,
+      );
+      final a = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey('nes_button_A'))),
+        pointer: 3,
+      );
+      await tester.pump();
+      expect(link.packets.last['stickX'], 1);
+      expect(link.packets.last['stickY'], 1);
+      expect(link.packets.last['btnA'], isTrue);
+      await up.up();
+      await tester.pump();
+      expect(link.packets.last['stickX'], 1);
+      expect(link.packets.last['stickY'], 0);
+      final secondRight = await tester.startGesture(
+        Offset(pad.right - 12, pad.center.dy),
+        pointer: 4,
+      );
+      await right.up();
+      await tester.pump();
+      expect(link.packets.last['stickX'], 1);
+      final left = await tester.startGesture(
+        Offset(pad.left + 12, pad.center.dy),
+        pointer: 5,
+      );
+      await tester.pump();
+      expect(link.packets.last['stickX'], 0);
+      await left.cancel();
+      await tester.pump();
+      expect(link.packets.last['stickX'], 1);
+      await secondRight.cancel();
+      await a.up();
+      await tester.pump();
+      expect(link.packets.last['stickX'], 0);
+      expect(link.packets.last['btnA'], isFalse);
+      final diagonal = await tester.startGesture(
+        Offset(pad.left + pad.width * .85, pad.top + pad.height * .15),
+        pointer: 6,
+      );
+      await tester.pump();
+      expect(
+        (link.packets.last['stickX'], link.packets.last['stickY']),
+        (1.0, 1.0),
+      );
+      await diagonal.moveTo(
+        Offset(pad.left + pad.width * .15, pad.top + pad.height * .85),
+      );
+      await tester.pump();
+      expect(
+        (link.packets.last['stickX'], link.packets.last['stickY']),
+        (-1.0, -1.0),
+      );
+      await diagonal.moveTo(Offset(pad.right + 20, pad.center.dy));
+      await tester.pump();
+      expect(
+        (link.packets.last['stickX'], link.packets.last['stickY']),
+        (0.0, 0.0),
+      );
+      await diagonal.up();
+      await tester.pumpWidget(const SizedBox.shrink());
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'NES captions preserve holds, transitions and lifecycle discard old fingers',
+    (tester) async {
+      final link = await openNes(tester);
+      final pad = tester.getRect(find.byKey(const ValueKey('nes_dpad')));
+      final up = await tester.startGesture(
+        Offset(pad.center.dx, pad.top + 15),
+        pointer: 1,
+      );
+      final a = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey('nes_button_A'))),
+        pointer: 2,
+      );
+      await tester.pump();
+      await nesHostRequest(
+        tester,
+        link,
+        2,
+        RemoteControllerMode.nes,
+        actions: const {'A': 'Saltar', 'X': 'Disparar'},
+      );
+      expect(find.text('Saltar'), findsOneWidget);
+      expect(find.text('Disparar'), findsOneWidget);
+      expect(link.packets.last['btnA'], isTrue);
+      expect(link.packets.last['stickY'], 1);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      await tester.pump();
+      expect(link.packets.last['btnA'], isFalse);
+      expect(link.packets.last['stickY'], 0);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pump();
+      await up.moveBy(const Offset(1, 1));
+      await a.up();
+      await up.up();
+      await tester.pump();
+      expect(link.packets.last['btnA'], isFalse);
+      expect(link.packets.last['stickY'], 0);
+      final b = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey('nes_button_B'))),
+        pointer: 4,
+      );
+      await tester.pump();
+      expect(link.packets.last['btnX'], isTrue);
+      await nesHostRequest(tester, link, 3, RemoteControllerMode.driving);
+      expect(link.packets.last['btnX'], isFalse);
+      expect(find.byKey(const ValueKey('nes_dpad')), findsNothing);
+      await b.up();
+      await tester.pumpWidget(const SizedBox.shrink());
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('NES disconnect replaces the surface with neutral controls', (
+    tester,
+  ) async {
+    final link = await openNes(tester);
+    final a = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('nes_button_A'))),
+    );
+    await tester.pump();
+    expect(link.packets.last['btnA'], isTrue);
+    link.inbound.addError(StateError('Disconnected test transport'));
+    await _pumpUntil(
+      tester,
+      () => !tester
+          .widget<NesControllerLayout>(find.byType(NesControllerLayout))
+          .connected,
+    );
+    final surface = tester.widget<NesControllerLayout>(
+      find.byType(NesControllerLayout),
+    );
+    expect(surface.connected, isFalse);
+    expect(surface.pressed, isEmpty);
+    await a.up();
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(milliseconds: 150));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'NES resize invalidates old gestures before the first new button press',
+    (tester) async {
+      final link = await openNes(tester);
+      final pad = tester.getRect(find.byKey(const ValueKey('nes_dpad')));
+      final oldPad = await tester.startGesture(
+        Offset(pad.center.dx, pad.top + 10),
+        pointer: 1,
+      );
+      await tester.pump();
+      expect(link.packets.last['stickY'], 1);
+      await tester.binding.setSurfaceSize(const Size(640, 320));
+      await tester.pump();
+      expect(link.packets.last['stickY'], 0);
+      final first = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey('nes_button_B'))),
+        pointer: 2,
+      );
+      await tester.pump();
+      expect(link.packets.last['btnX'], isTrue);
+      final second = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey('nes_button_B'))),
+        pointer: 3,
+      );
+      await tester.pump();
+      await first.up();
+      await oldPad.moveBy(const Offset(5, 0));
+      await oldPad.up();
+      await tester.pump();
+      expect(link.packets.last['btnX'], isTrue);
+      expect(link.packets.last['stickY'], 0);
+      await second.up();
+      await tester.pump();
+      expect(link.packets.last['btnX'], isFalse);
+      await tester.pumpWidget(const SizedBox.shrink());
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  for (final size in [
+    const Size(480, 280),
+    const Size(800, 360),
+    const Size(1024, 768),
+  ]) {
+    testWidgets('NES controls fit $size with large text and a notch', (
+      tester,
+    ) async {
+      await tester.binding.setSurfaceSize(size);
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(
+        MaterialApp(
+          builder: (context, child) => MediaQuery(
+            data: MediaQuery.of(context).copyWith(
+              textScaler: const TextScaler.linear(1.8),
+              padding: const EdgeInsets.only(left: 28),
+              viewPadding: const EdgeInsets.only(left: 28),
+            ),
+            child: child!,
+          ),
+          home: const PhoneControllerPage(
+            initialMode: RemoteControllerMode.nes,
+            allowWifiConnection: false,
+          ),
+        ),
+      );
+      await tester.pump();
+      final surface = tester.getRect(find.byKey(const ValueKey('nes_surface')));
+      for (final key in [
+        'nes_dpad',
+        'nes_button_A',
+        'nes_button_B',
+        'nes_button_select',
+        'nes_button_start',
+        'nes_button_home',
+      ]) {
+        final rect = tester.getRect(find.byKey(ValueKey(key)));
+        expect(surface.contains(rect.topLeft), isTrue);
+        expect(
+          surface.contains(rect.bottomRight - const Offset(.1, .1)),
+          isTrue,
+        );
+      }
+      await tester.pumpWidget(const SizedBox.shrink());
+      expect(tester.takeException(), isNull);
+    });
+  }
 
   for (final (size, insets, textScale) in [
     (const Size(480, 280), EdgeInsets.zero, 1.2),
@@ -130,7 +480,6 @@ void main() {
         'joystick_move_stick',
         'joystick_look_stick',
         'joystick_recenter',
-        'laser_slide_pad',
       ]) {
         final finder = find.byKey(ValueKey(key));
         expect(finder, findsOneWidget, reason: key);
@@ -215,6 +564,24 @@ void main() {
       );
       expect(find.text('GATILLO (CLIC)'), findsNothing);
       expect(find.byType(VirtualThumbstick), findsNWidgets(2));
+      expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
+      expect(
+        find.byKey(const ValueKey('controller_center_panel')),
+        findsOneWidget,
+      );
+      expect(
+        regions['joystick_look_stick']!.width,
+        lessThan(regions['joystick_move_stick']!.width),
+      );
+      await _selectRightMode(tester, laser: true);
+      expect(find.byKey(const ValueKey('joystick_look_stick')), findsNothing);
+      expect(find.byType(VirtualThumbstick), findsOneWidget);
+      final laserRect = tester.getRect(
+        find.byKey(const ValueKey('laser_slide_pad')),
+      );
+      expect(laserRect, regions['joystick_look_stick']);
+      await _selectRightMode(tester, laser: false);
+      expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
       expect(tester.takeException(), isNull);
@@ -251,128 +618,271 @@ void main() {
     },
   );
 
+  for (final laserMode in [false, true]) {
+    testWidgets(
+      '${laserMode ? 'Laser' : 'View'} controls support four fingers and release each owner safely',
+      (tester) async {
+        await tester.binding.setSurfaceSize(const Size(800, 360));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        final service = VrRemoteControllerService(
+          inputTimeout: const Duration(seconds: 10),
+        );
+        addTearDown(service.dispose);
+        expect(
+          await tester.runAsync(() => service.startServer(port: 0)),
+          isTrue,
+        );
+        await tester.pumpWidget(
+          MaterialApp(
+            home: PhoneControllerPage(
+              targetHost: '127.0.0.1',
+              targetPort: service.serverPort!,
+              sessionToken: service.sessionToken,
+              autoConnect: true,
+            ),
+          ),
+        );
+        await _pumpUntil(
+          tester,
+          () =>
+              service.isConnected &&
+              find.text('RECONECTAR').evaluate().isNotEmpty,
+        );
+        if (laserMode) await _selectRightMode(tester, laser: true);
+        final movement = await tester.startGesture(
+          tester.getCenter(find.byKey(const ValueKey('joystick_move_stick'))),
+          pointer: 1,
+        );
+        await movement.moveBy(const Offset(25, 0));
+        await movement.moveBy(const Offset(15, 0));
+        final look = await tester.startGesture(
+          tester.getCenter(
+            find.byKey(
+              ValueKey(laserMode ? 'laser_slide_pad' : 'joystick_look_stick'),
+            ),
+          ),
+          pointer: 2,
+        );
+        await look.moveBy(const Offset(0, -25));
+        await look.moveBy(const Offset(0, -15));
+        final a = await tester.startGesture(
+          tester.getCenter(find.byKey(const ValueKey('joystick_button_A'))),
+          pointer: 3,
+        );
+        final l = await tester.startGesture(
+          tester.getCenter(find.text('L')),
+          pointer: 4,
+        );
+        await tester.pump(const Duration(milliseconds: 350));
+        await _pumpUntil(
+          tester,
+          () =>
+              service.latestState.stickX > .2 &&
+              (laserMode
+                  ? service.latestState.laserY > .2
+                  : service.latestState.lookY > .2) &&
+              service.latestState.btnA &&
+              service.latestState.btnL &&
+              service.latestState.btnGrip == laserMode,
+        );
+        expect(service.latestState.laserSlideActive, laserMode);
+        expect(service.latestState.lookX, 0);
+        if (laserMode) expect(service.latestState.lookY, 0);
+        expect(service.latestState.btnR, isFalse);
+
+        await a.cancel();
+        await _pumpUntil(tester, () => !service.latestState.btnA);
+        expect(service.latestState.btnL, isTrue);
+        expect(service.latestState.btnGrip, laserMode);
+        expect(service.latestState.stickX, greaterThan(.2));
+        await look.cancel();
+        await _pumpUntil(
+          tester,
+          () =>
+              service.latestState.lookY == 0 &&
+              !service.latestState.laserSlideActive &&
+              !service.latestState.btnGrip,
+        );
+        expect(service.latestState.stickX, greaterThan(.2));
+
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.inactive,
+        );
+        await _pumpUntil(
+          tester,
+          () =>
+              !service.latestState.btnL &&
+              !service.latestState.btnGrip &&
+              !service.latestState.laserSlideActive &&
+              service.latestState.stickX == 0,
+        );
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        await movement.up();
+        await l.up();
+        await tester.pump(const Duration(milliseconds: 200));
+        expect(
+          service.latestState.btnA ||
+              service.latestState.btnL ||
+              service.latestState.btnGrip,
+          isFalse,
+        );
+        expect(service.latestState.stickX, 0);
+        expect(service.latestState.lookY, 0);
+        final heldA = await tester.startGesture(
+          tester.getCenter(find.byKey(const ValueKey('joystick_button_A'))),
+          pointer: 6,
+        );
+        final heldMove = await tester.startGesture(
+          tester.getCenter(find.byKey(const ValueKey('joystick_move_stick'))),
+          pointer: 7,
+        );
+        await heldMove.moveBy(const Offset(40, 0));
+        await _pumpUntil(
+          tester,
+          () => service.latestState.btnA && service.latestState.stickX > .2,
+        );
+        await tester.tap(find.byTooltip('Ajustes y Modo'));
+        await tester.pumpAndSettle();
+        await _pumpUntil(
+          tester,
+          () => !service.latestState.btnA && service.latestState.stickX == 0,
+          reason: 'settings neutralizes held inputs without watchdog',
+        );
+        await heldMove.moveBy(const Offset(15, 0));
+        await tester.tap(find.byIcon(Icons.close_rounded));
+        await tester.pumpAndSettle();
+        await heldA.up();
+        await heldMove.up();
+        expect(service.latestState.btnA, isFalse);
+        expect(service.latestState.stickX, 0);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await _pumpUntil(tester, () => !service.isConnected);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
   testWidgets(
-    'edge controls support five fingers and release each owner safely',
+    'right-mode changes release held controls and stale gestures without reconnecting',
     (tester) async {
       await tester.binding.setSurfaceSize(const Size(800, 360));
       addTearDown(() => tester.binding.setSurfaceSize(null));
-      final service = VrRemoteControllerService(
-        inputTimeout: const Duration(seconds: 10),
-      );
-      addTearDown(service.dispose);
-      expect(await tester.runAsync(() => service.startServer(port: 0)), isTrue);
+      final link = _CapturedControllerLink();
       await tester.pumpWidget(
         MaterialApp(
           home: PhoneControllerPage(
-            targetHost: '127.0.0.1',
-            targetPort: service.serverPort!,
-            sessionToken: service.sessionToken,
+            allowWifiConnection: false,
+            linkConnector: () async => link,
             autoConnect: true,
           ),
         ),
       );
-      await _pumpUntil(
-        tester,
-        () =>
-            service.isConnected &&
-            find.text('RECONECTAR').evaluate().isNotEmpty,
+      await _pumpUntil(tester, () => link.packets.isNotEmpty);
+      await tester.pump();
+      final rightBounds = tester.getRect(
+        find.byKey(const ValueKey('joystick_look_stick')),
       );
       final movement = await tester.startGesture(
         tester.getCenter(find.byKey(const ValueKey('joystick_move_stick'))),
         pointer: 1,
       );
-      await movement.moveBy(const Offset(25, 0));
-      await movement.moveBy(const Offset(15, 0));
-      final look = await tester.startGesture(
-        tester.getCenter(find.byKey(const ValueKey('joystick_look_stick'))),
-        pointer: 2,
-      );
-      await look.moveBy(const Offset(0, -25));
-      await look.moveBy(const Offset(0, -15));
-      final a = await tester.startGesture(
-        tester.getCenter(find.byKey(const ValueKey('joystick_button_A'))),
+      await movement.moveBy(const Offset(70, 0));
+      final view = await tester.startGesture(rightBounds.center, pointer: 2);
+      await view.moveBy(const Offset(15, -25));
+      final action = await tester.startGesture(
+        _buttonPoint(tester, 'A'),
         pointer: 3,
-      );
-      final l = await tester.startGesture(
-        tester.getCenter(find.text('L')),
-        pointer: 4,
-      );
-      final pad = await tester.startGesture(
-        tester.getCenter(find.byKey(const ValueKey('laser_slide_pad'))),
-        pointer: 5,
       );
       await tester.pump(const Duration(milliseconds: 350));
       await _pumpUntil(
         tester,
         () =>
-            service.latestState.stickX > .2 &&
-            service.latestState.lookY > .2 &&
-            service.latestState.btnA &&
-            service.latestState.btnL &&
-            service.latestState.btnGrip,
+            (link.packets.last['stickX'] as num) > .2 &&
+            (link.packets.last['lookY'] as num) > .1 &&
+            link.packets.last['btnA'] == true,
       );
-      expect(service.latestState.laserSlideActive, isTrue);
-      expect(service.latestState.btnR, isFalse);
+      expect(link.packets.last['lookX'], 0);
+      expect(link.packets.last['moveAtEdge'], isTrue);
 
-      await a.cancel();
-      await _pumpUntil(tester, () => !service.latestState.btnA);
-      expect(service.latestState.btnL && service.latestState.btnGrip, isTrue);
-      expect(service.latestState.stickX, greaterThan(.2));
-      await look.cancel();
-      await _pumpUntil(tester, () => service.latestState.lookY == 0);
-      expect(service.latestState.stickX, greaterThan(.2));
+      void expectNeutral() {
+        final packet = link.packets.last;
+        for (final field in [
+          'stickX',
+          'stickY',
+          'lookX',
+          'lookY',
+          'laserX',
+          'laserY',
+        ]) {
+          expect(packet[field], 0, reason: field);
+        }
+        for (final field in [
+          'btnA',
+          'btnB',
+          'btnL',
+          'btnR',
+          'btnGrip',
+          'laserSlideActive',
+          'moveAtEdge',
+        ]) {
+          expect(packet[field], isFalse, reason: field);
+        }
+        expect(packet['mode'], 'joystick');
+        expect(link.isOpen, isTrue);
+      }
 
-      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
-      await _pumpUntil(
-        tester,
-        () =>
-            !service.latestState.btnL &&
-            !service.latestState.btnGrip &&
-            !service.latestState.laserSlideActive &&
-            service.latestState.stickX == 0,
-      );
-      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
-      await movement.up();
-      await l.up();
-      await pad.up();
-      await tester.pump(const Duration(milliseconds: 200));
+      await _selectRightMode(tester, laser: true);
+      expect(find.byKey(const ValueKey('joystick_look_stick')), findsNothing);
       expect(
-        service.latestState.btnA ||
-            service.latestState.btnL ||
-            service.latestState.btnGrip,
-        isFalse,
+        tester.getRect(find.byKey(const ValueKey('laser_slide_pad'))),
+        rightBounds,
       );
-      expect(service.latestState.stickX, 0);
-      expect(service.latestState.lookY, 0);
-      final heldA = await tester.startGesture(
-        tester.getCenter(find.byKey(const ValueKey('joystick_button_A'))),
-        pointer: 6,
+      expectNeutral();
+      await movement.moveBy(const Offset(-15, 0));
+      await view.moveBy(const Offset(0, 15));
+      await action.up();
+      await movement.up();
+      await view.up();
+      await tester.pump(const Duration(milliseconds: 100));
+      expectNeutral();
+
+      // Cover both a pending hold timer and an already-active grip. Changing
+      // mode must invalidate the old pointer before either can alter the view.
+      for (final holdMs in [100, 350]) {
+        await _selectRightMode(tester, laser: true);
+        final laser = await tester.startGesture(rightBounds.center, pointer: 4);
+        await laser.moveBy(const Offset(15, -15));
+        await tester.pump(Duration(milliseconds: holdMs));
+        await _pumpUntil(
+          tester,
+          () => link.packets.last['laserSlideActive'] == true,
+        );
+        expect(link.packets.last['btnGrip'], holdMs >= 280);
+        expect(link.packets.last['lookX'], 0);
+        expect(link.packets.last['lookY'], 0);
+        await _selectRightMode(tester, laser: false);
+        expectNeutral();
+        await laser.moveBy(const Offset(20, 10));
+        await laser.up();
+        await tester.pump(const Duration(milliseconds: 350));
+        expectNeutral();
+      }
+
+      final nextView = await tester.startGesture(
+        rightBounds.center,
+        pointer: 5,
       );
-      final heldMove = await tester.startGesture(
-        tester.getCenter(find.byKey(const ValueKey('joystick_move_stick'))),
-        pointer: 7,
-      );
-      await heldMove.moveBy(const Offset(40, 0));
-      await _pumpUntil(
-        tester,
-        () => service.latestState.btnA && service.latestState.stickX > .2,
-      );
-      await tester.tap(find.byTooltip('Ajustes y Modo'));
-      await tester.pumpAndSettle();
-      await _pumpUntil(
-        tester,
-        () => !service.latestState.btnA && service.latestState.stickX == 0,
-        reason: 'settings neutralizes held inputs without watchdog',
-      );
-      await heldMove.moveBy(const Offset(15, 0));
-      await tester.tap(find.byIcon(Icons.close_rounded));
-      await tester.pumpAndSettle();
-      await heldA.up();
-      await heldMove.up();
-      expect(service.latestState.btnA, isFalse);
-      expect(service.latestState.stickX, 0);
+      await nextView.moveBy(const Offset(20, -25));
+      await tester.pump(const Duration(milliseconds: 100));
+      await _pumpUntil(tester, () => (link.packets.last['lookY'] as num) > .1);
+      expect(link.packets.last['lookX'], 0);
+      expect(link.packets.last['laserX'], 0);
+      expect(link.packets.last['laserY'], 0);
+      expect(link.packets.last['laserSlideActive'], isFalse);
+      await nextView.up();
       await tester.pumpWidget(const SizedBox.shrink());
-      await _pumpUntil(tester, () => !service.isConnected);
       expect(tester.takeException(), isNull);
     },
   );
@@ -730,7 +1240,7 @@ void main() {
     );
     expect(find.textContaining('Sin giroscopio disponible'), findsOneWidget);
     expect(find.byType(VirtualThumbstick), findsNWidgets(2));
-    expect(find.byKey(const ValueKey('laser_slide_pad')), findsOneWidget);
+    expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
     await tester.tap(find.byTooltip('Ajustes y Modo'));
     await tester.pumpAndSettle();
     await tester.ensureVisible(find.text('CONDUCCIÓN'));
@@ -911,7 +1421,8 @@ void main() {
     await tester.pump();
     expect(find.byType(VirtualThumbstick), findsNWidgets(2));
     expect(find.text('A'), findsOneWidget);
-    expect(find.byKey(const ValueKey('laser_slide_pad')), findsOneWidget);
+    expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
+    expect(find.byKey(const ValueKey('right_mode_laser')), findsOneWidget);
     expect(find.text('GATILLO (CLIC)'), findsNothing);
     await tester.pumpWidget(const SizedBox.shrink());
     expect(tester.takeException(), isNull);
@@ -1137,6 +1648,7 @@ void main() {
             service.isConnected &&
             find.text('RECONECTAR').evaluate().isNotEmpty,
       );
+      await _selectRightMode(tester, laser: true);
       final pad = find.byKey(const ValueKey('laser_slide_pad'));
       final oldPadGesture = await tester.startGesture(
         tester.getCenter(pad),
@@ -1209,7 +1721,10 @@ void main() {
         tester,
         () =>
             service.latestState.mode == RemoteControllerMode.joystick &&
-            find.byKey(const ValueKey('laser_slide_pad')).evaluate().isNotEmpty,
+            find
+                .byKey(const ValueKey('joystick_surface'))
+                .evaluate()
+                .isNotEmpty,
       );
       expect(service.latestState.btnA || service.latestState.btnGrip, isFalse);
       expect(service.latestState.stickX, 0);
@@ -1282,12 +1797,16 @@ void main() {
       expect(find.text('X'), findsOneWidget);
       expect(find.byKey(const ValueKey('joystick_move_stick')), findsOneWidget);
 
-      // Verify center column: Recentrar Vista button + Puntero Láser (Slide 180° · Hold Grip)
+      // The center stays available for experience information. The right
+      // control has explicit view/laser modes, never two overlapping owners.
       expect(find.text('RECENTRAR VISTA'), findsOneWidget);
       expect(
-        find.text('PUNTERO LÁSER (SLIDE 180° · HOLD GRIP)'),
+        find.byKey(const ValueKey('controller_center_panel')),
         findsOneWidget,
       );
+      expect(find.byKey(const ValueKey('right_mode_view')), findsOneWidget);
+      expect(find.byKey(const ValueKey('right_mode_laser')), findsOneWidget);
+      expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
 
       // Verify right column: R, B, stick, A
       expect(find.text('R'), findsOneWidget);
@@ -1346,7 +1865,8 @@ void main() {
       await _pumpUntil(tester, () => service.isConnected);
       await tester.pump();
 
-      // Find center laser slide pad
+      await _selectRightMode(tester, laser: true);
+      // Find the right control in laser mode.
       final padFinder = find.byKey(const ValueKey('laser_slide_pad'));
       final gesture = await tester.startGesture(tester.getCenter(padFinder));
       await tester.pump(const Duration(milliseconds: 100));
@@ -1393,6 +1913,7 @@ void main() {
         await _pumpUntil(tester, () => service.isConnected);
         await tester.pump();
 
+        await _selectRightMode(tester, laser: true);
         final padFinder = find.byKey(const ValueKey('laser_slide_pad'));
         final padCenter = tester.getCenter(padFinder);
         final padTop = tester.getTopLeft(padFinder) + const Offset(20, 5);
@@ -1561,82 +2082,84 @@ void main() {
     );
   }
 
-  testWidgets('center pad owns pose over IMU during touch and after release', (
-    tester,
-  ) async {
-    final service = VrRemoteControllerService();
-    addTearDown(service.dispose);
-    await tester.runAsync(() => service.startServer(port: 0));
-    await tester.pumpWidget(
-      MaterialApp(
-        home: PhoneControllerPage(
-          initialMode: RemoteControllerMode.joystick,
-          targetHost: '127.0.0.1',
-          targetPort: service.serverPort!,
-          sessionToken: service.sessionToken,
-          autoConnect: true,
+  testWidgets(
+    'right laser pad owns pose over IMU during touch and after release',
+    (tester) async {
+      final service = VrRemoteControllerService();
+      addTearDown(service.dispose);
+      await tester.runAsync(() => service.startServer(port: 0));
+      await tester.pumpWidget(
+        MaterialApp(
+          home: PhoneControllerPage(
+            initialMode: RemoteControllerMode.joystick,
+            targetHost: '127.0.0.1',
+            targetPort: service.serverPort!,
+            sessionToken: service.sessionToken,
+            autoConnect: true,
+          ),
         ),
-      ),
-    );
-    await _pumpUntil(tester, () => service.isConnected);
-    final center = tester.getCenter(
-      find.byKey(const ValueKey('laser_slide_pad')),
-    );
-    final owner = await tester.startGesture(center, pointer: 1);
-    await _pumpUntil(tester, () => service.latestState.laserSlideActive);
-    expect(service.latestState.laserX, closeTo(0, 1e-6));
-    expect(service.latestState.laserY, closeTo(0, 1e-6));
-
-    void gyro() {
-      tester.binding.channelBuffers.push(
-        'dev.fluttercommunity.plus/sensors/gyroscope',
-        const StandardMethodCodec().encodeSuccessEnvelope(<double>[
-          0,
-          1,
-          0,
-          10000,
-        ]),
-        (_) {},
       );
-    }
+      await _pumpUntil(tester, () => service.isConnected);
+      await _selectRightMode(tester, laser: true);
+      final center = tester.getCenter(
+        find.byKey(const ValueKey('laser_slide_pad')),
+      );
+      final owner = await tester.startGesture(center, pointer: 1);
+      await _pumpUntil(tester, () => service.latestState.laserSlideActive);
+      expect(service.latestState.laserX, closeTo(0, 1e-6));
+      expect(service.latestState.laserY, closeTo(0, 1e-6));
 
-    for (var i = 0; i < 3; i++) {
+      void gyro() {
+        tester.binding.channelBuffers.push(
+          'dev.fluttercommunity.plus/sensors/gyroscope',
+          const StandardMethodCodec().encodeSuccessEnvelope(<double>[
+            0,
+            1,
+            0,
+            10000,
+          ]),
+          (_) {},
+        );
+      }
+
+      for (var i = 0; i < 3; i++) {
+        gyro();
+        await tester.pump(const Duration(milliseconds: 30));
+      }
+      // A second finger must neither steal the pose nor release the first grip.
+      final other = await tester.startGesture(
+        center + const Offset(20, 10),
+        pointer: 2,
+      );
+      await other.moveBy(const Offset(20, 10));
+      await other.up();
+      await tester.pump(const Duration(milliseconds: 30));
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+      );
+      expect(service.latestState.laserSlideActive, isTrue);
+      expect(service.latestState.laserX, closeTo(0, 1e-6));
+      expect(service.latestState.laserY, closeTo(0, 1e-6));
+      expect(service.latestState.orientation.x, closeTo(0, 1e-6));
+      expect(service.latestState.orientation.y, closeTo(0, 1e-6));
+      expect(service.latestState.angularVelocity.length, 0);
+
+      await owner.up();
+      await _pumpUntil(tester, () => !service.latestState.laserSlideActive);
       gyro();
       await tester.pump(const Duration(milliseconds: 30));
-    }
-    // A second finger must neither steal the pose nor release the first grip.
-    final other = await tester.startGesture(
-      center + const Offset(20, 10),
-      pointer: 2,
-    );
-    await other.moveBy(const Offset(20, 10));
-    await other.up();
-    await tester.pump(const Duration(milliseconds: 30));
-    await tester.runAsync(
-      () => Future<void>.delayed(const Duration(milliseconds: 20)),
-    );
-    expect(service.latestState.laserSlideActive, isTrue);
-    expect(service.latestState.laserX, closeTo(0, 1e-6));
-    expect(service.latestState.laserY, closeTo(0, 1e-6));
-    expect(service.latestState.orientation.x, closeTo(0, 1e-6));
-    expect(service.latestState.orientation.y, closeTo(0, 1e-6));
-    expect(service.latestState.angularVelocity.length, 0);
-
-    await owner.up();
-    await _pumpUntil(tester, () => !service.latestState.laserSlideActive);
-    gyro();
-    await tester.pump(const Duration(milliseconds: 30));
-    await tester.runAsync(
-      () => Future<void>.delayed(const Duration(milliseconds: 30)),
-    );
-    expect(service.latestState.angularVelocity.length, 0);
-    expect(service.latestState.orientation.x, closeTo(0, 1e-6));
-    expect(service.latestState.orientation.y, closeTo(0, 1e-6));
-    expect(service.latestState.laserX, closeTo(0, 1e-6));
-    expect(service.latestState.laserY, closeTo(0, 1e-6));
-    await tester.pumpWidget(const SizedBox.shrink());
-    await _pumpUntil(tester, () => !service.isConnected);
-    await tester.pump(const Duration(milliseconds: 150));
-    expect(tester.takeException(), isNull);
-  });
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 30)),
+      );
+      expect(service.latestState.angularVelocity.length, 0);
+      expect(service.latestState.orientation.x, closeTo(0, 1e-6));
+      expect(service.latestState.orientation.y, closeTo(0, 1e-6));
+      expect(service.latestState.laserX, closeTo(0, 1e-6));
+      expect(service.latestState.laserY, closeTo(0, 1e-6));
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _pumpUntil(tester, () => !service.isConnected);
+      await tester.pump(const Duration(milliseconds: 150));
+      expect(tester.takeException(), isNull);
+    },
+  );
 }

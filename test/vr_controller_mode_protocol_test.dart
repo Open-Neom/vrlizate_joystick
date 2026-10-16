@@ -4,20 +4,90 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vrlizate_joystick/vrlizate_joystick.dart';
 
 void main() {
-  test('host request round trips joystick/driving with explicit version', () {
-    for (final mode in [
-      RemoteControllerMode.joystick,
-      RemoteControllerMode.driving,
-    ]) {
-      final request = VrControllerModeRequest(mode: mode, revision: 12);
-      final parsed = VrControllerModeRequest.tryParse(
-        jsonEncode(request.toJson()),
-      )!;
-      expect(parsed.mode, mode);
-      expect(parsed.revision, 12);
-      expect(request.toJson()['type'], 'vrlizate.controllerMode');
-      expect(request.toJson()['version'], 1);
+  test(
+    'host request round trips joystick/driving/NES with explicit version',
+    () {
+      for (final mode in [
+        RemoteControllerMode.joystick,
+        RemoteControllerMode.driving,
+        RemoteControllerMode.nes,
+      ]) {
+        final request = VrControllerModeRequest(mode: mode, revision: 12);
+        final parsed = VrControllerModeRequest.tryParse(
+          jsonEncode(request.toJson()),
+        )!;
+        expect(parsed.mode, mode);
+        expect(parsed.revision, 12);
+        expect(parsed.horizontalLook, isFalse);
+        expect(request.toJson()['type'], 'vrlizate.controllerMode');
+        expect(request.toJson()['version'], 1);
+        expect(request.toJson()['horizontalLook'], isFalse);
+      }
+    },
+  );
+
+  test('horizontal look is explicit for new hosts and retained for legacy', () {
+    final request = const VrControllerModeRequest(
+      mode: RemoteControllerMode.joystick,
+      revision: 1,
+      horizontalLook: true,
+    ).toJson();
+    expect(VrControllerModeRequest.tryParse(request)!.horizontalLook, isTrue);
+    final legacy = Map<String, Object>.from(request)..remove('horizontalLook');
+    expect(VrControllerModeRequest.tryParse(legacy)!.horizontalLook, isTrue);
+    expect(
+      VrControllerModeRequest.tryParse({
+        ...request,
+        'horizontalLook': false,
+      })!.horizontalLook,
+      isFalse,
+    );
+    for (final invalid in [null, 0, 1, 'true', [], {}]) {
+      expect(
+        VrControllerModeRequest.tryParse({
+          ...request,
+          'horizontalLook': invalid,
+        }),
+        isNull,
+      );
     }
+    final session = VrControllerModeSession();
+    expect(session.accept({...request, 'horizontalLook': null}), isNull);
+    expect(session.revision, isNull);
+    expect(session.accept(request)!.horizontalLook, isTrue);
+  });
+
+  test('NES captions preserve the established wire keys', () {
+    const request = VrControllerModeRequest(
+      mode: RemoteControllerMode.nes,
+      revision: 2,
+      actions: {'A': 'A', 'X': 'B', 'Y': 'Start', 'L': 'Select', 'B': 'Home'},
+    );
+    final parsed = VrControllerModeRequest.tryParse(
+      jsonEncode(request.toJson()),
+    )!;
+    expect(parsed.mode, RemoteControllerMode.nes);
+    expect(parsed.actions, {
+      'A': 'A',
+      'X': 'B',
+      'Y': 'Start',
+      'L': 'Select',
+      'B': 'Home',
+    });
+    final session = VrControllerModeSession();
+    expect(session.accept(request.toJson())!.mode, RemoteControllerMode.nes);
+    expect(session.accept(request.toJson()), isNull);
+    expect(
+      session.accept(
+        const VrControllerModeRequest(
+          mode: RemoteControllerMode.joystick,
+          revision: 1,
+        ).toJson(),
+      ),
+      isNull,
+    );
+    session.reset();
+    expect(session.accept(request.toJson())!.mode, RemoteControllerMode.nes);
   });
 
   test('malformed, unsupported and unsafe revision messages are ignored', () {

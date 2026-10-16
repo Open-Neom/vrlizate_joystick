@@ -449,6 +449,44 @@ void main() {
     },
   );
 
+  test(
+    'rim intent is optional, independent of speed, and safely released',
+    () async {
+      final socket = await connect();
+      socket.add(jsonEncode({'sequence': 1, 'stickX': .5, 'moveAtEdge': true}));
+      await waitUntil(() => service.latestState.moveAtEdge == true);
+      expect(service.latestState.stickX, .5);
+      socket.add(
+        jsonEncode({'sequence': 2, 'stickX': .4, 'moveAtEdge': false}),
+      );
+      await waitUntil(() => service.latestState.stickX == .4);
+      expect(service.latestState.moveAtEdge, isFalse);
+      socket.add(jsonEncode({'sequence': 3, 'stickX': .6}));
+      await waitUntil(() => service.latestState.stickX == .6);
+      expect(service.latestState.moveAtEdge, isNull);
+      socket.add(jsonEncode({'sequence': 4, 'stickX': .5, 'moveAtEdge': true}));
+      await waitUntil(() => service.latestState.moveAtEdge == true);
+      await waitUntil(() => service.latestState.isNeutralized);
+      expect(service.latestState.moveAtEdge, isNot(isTrue));
+      expect(service.latestState.stickX, 0);
+    },
+  );
+
+  test('rim intent rejects nonboolean state snapshots', () async {
+    final socket = await connect();
+    final received = <RemoteControllerState>[];
+    final subscription = service.onState.listen(received.add);
+    addTearDown(subscription.cancel);
+    for (final invalid in [null, 1, 'true']) {
+      socket.add(
+        jsonEncode({'sequence': 1, 'moveAtEdge': invalid, 'btnA': true}),
+      );
+    }
+    socket.add(jsonEncode({'sequence': 1, 'btnX': true}));
+    await waitUntil(() => service.latestState.btnX);
+    expect(received.any((state) => state.btnA), isFalse);
+  });
+
   test('parses dual stick look yaw/pitch rates and recenter signals', () async {
     final socket = await connect();
     socket.add(

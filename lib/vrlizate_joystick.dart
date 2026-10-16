@@ -4,6 +4,8 @@ library;
 export 'src/phone_controller_page.dart';
 export 'src/remote_controller_qr_dialog.dart';
 export 'src/virtual_thumbstick.dart';
+export 'src/vr_progressive_stick.dart';
+export 'src/vr_motion_look_controller.dart';
 export 'src/vr_pairing_link.dart';
 export 'src/vr_remote_controller_service.dart';
 export 'src/vr_local_network_address.dart';
