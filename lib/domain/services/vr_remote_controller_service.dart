@@ -819,6 +819,20 @@ class VrRemoteControllerService {
             _acceptedModeRevision = hostModeRevision;
           }
 
+          final rawSearchQuery = json[VrJoystickConstants.fieldSearchQuery];
+          final String? searchQuery =
+              rawSearchQuery is String && rawSearchQuery.trim().isNotEmpty
+              ? rawSearchQuery.trim().substring(
+                  0,
+                  math.min(
+                    rawSearchQuery.trim().length,
+                    VrJoystickConstants.maxSearchQueryLength,
+                  ),
+                )
+              : null;
+          final bool searchSubmitted =
+              json[VrJoystickConstants.fieldSearchSubmitted] == true;
+
           _latestState = RemoteControllerState(
             orientation: _predictedOrientation.clone(),
             angularVelocity: angularVelocity,
@@ -857,6 +871,8 @@ class VrRemoteControllerService {
             motionAvailable:
                 json[VrJoystickConstants.fieldMotionAvailable] == true,
             rangeMeters: rangeMeters,
+            searchQuery: searchQuery,
+            searchSubmitted: searchSubmitted,
             mode: mode,
           );
 
@@ -888,7 +904,11 @@ class VrRemoteControllerService {
     if (revision == null) return !_modeControlSupported;
     if (revision != _modeRequest.revision) return false;
     if (_acceptedModeRevision == revision) return true;
-    if (mode != _modeRequest.mode) return false;
+    final modeMatches =
+        mode == _modeRequest.mode ||
+        (mode == RemoteControllerMode.laser &&
+            _modeRequest.mode == RemoteControllerMode.joystick);
+    if (!modeMatches) return false;
     if (_heldCaptionAckRevision == revision) return true;
     // A new foreground experience may acknowledge ready-to-drive. The full
     // neutral check below still rejects held pedals, sticks and buttons.

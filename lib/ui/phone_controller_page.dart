@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vector_math/vector_math.dart' as vm;
 import 'package:vrlizate/vrlizate.dart';
 import 'package:vrlizate_cast/vrlizate_cast.dart';
+import 'package:wordsphere/wordsphere.dart';
 
 import '../domain/models/vr_controller_connection_exception.dart';
 import '../domain/models/vr_controller_connection_target.dart';
@@ -20,7 +21,9 @@ import '../domain/services/vr_controller_link.dart';
 import '../domain/services/vr_controller_mode_session.dart';
 import '../domain/services/vr_controller_shake_detector.dart';
 import '../domain/services/vr_controller_state_pacer.dart';
+import '../domain/services/vr_laser_steady_dwell_controller.dart';
 import '../domain/services/vr_motion_look_controller.dart';
+import '../domain/services/vr_one_handed_laser_detector.dart';
 import '../domain/services/vr_progressive_stick.dart';
 import '../domain/services/vr_steering_controller.dart';
 import '../domain/services/vr_web_socket_controller_link.dart';
@@ -33,7 +36,9 @@ import 'nes_controller_layout.dart';
 import 'virtual_thumbstick.dart';
 import 'vr_controller_region.dart';
 import 'vr_driving_wheel_painter.dart';
+import 'vr_laser_pointing_view.dart';
 import 'vr_laser_slide_pad_painter.dart';
+import 'vr_wordsphere_search_sheet.dart';
 
 /// Native Smartphone VR Controller & Joystick Screen.
 ///
@@ -250,10 +255,23 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
   }
 
-  // Shake detection state
+  // Shake & One-Handed Laser detection state
   bool _shakeToToggleEnabled = true;
   bool _controllerVisible = true;
   final _shakeDetector = VrControllerShakeDetector();
+  final _oneHandedLaserDetector = VrOneHandedLaserDetector();
+  final _laserSteadyDwell = VrLaserSteadyDwellController();
+  final TextEditingController _wordsphereTextController =
+      TextEditingController();
+  late final WordsphereController _wordsphereController = WordsphereController(
+    textController: _wordsphereTextController,
+  );
+  bool _wordsphereSearchSheetVisible = false;
+  String? _activeSearchQuery;
+  bool _searchSubmittedPulse = false;
+  Timer? _laserClickPulseTimer;
+  Timer? _searchSubmitPulseTimer;
+  double _lastGyroOmegaMag = 0.0;
   StreamSubscription<AccelerometerEvent>? _accelSub;
 
   // Buttons state
@@ -374,6 +392,19 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
   }
 
+  bool get _hasDualHandTouchActive =>
+      _stickX.abs() > 0.05 ||
+      _stickY.abs() > 0.05 ||
+      _lookStickHeld ||
+      _isLaserSlideActive ||
+      _btnAActive ||
+      _btnBActive ||
+      _btnXActive ||
+      _btnYActive ||
+      _btnLActive ||
+      _btnRActive ||
+      _btnGripActive;
+
   void _startShakeDetection() {
     try {
       _accelSub =
@@ -382,19 +413,45 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           ).listen(
             (AccelerometerEvent event) {
               if (!mounted || !_isForeground) return;
+              final nowUs = _controllerClock.elapsedMicroseconds;
               // Driving tilt remains available when shake-to-hide is disabled.
               _steering.updateGravity(
                 event.x,
                 event.y,
                 event.z,
-                _controllerClock.elapsedMicroseconds,
+                nowUs,
               );
               _motionLook.updateGravity(
                 event.x,
                 event.y,
                 event.z,
-                _controllerClock.elapsedMicroseconds,
+                nowUs,
               );
+              if (!_settingsOpen && !_castDialogOpen) {
+                final sensorTimeUs = event.timestamp.microsecondsSinceEpoch;
+                final effectiveUs = sensorTimeUs > 0 ? sensorTimeUs : nowUs;
+                if (_activeMode == RemoteControllerMode.joystick &&
+                    _oneHandedLaserDetector.shouldSwitchToLaser(
+                      gx: event.x,
+                      gy: event.y,
+                      gz: event.z,
+                      omegaMagnitude: _lastGyroOmegaMag,
+                      dualTouchActive: _hasDualHandTouchActive,
+                      timestampUs: effectiveUs,
+                    )) {
+                  setState(() {
+                    _releaseInputs();
+                    _surfaceEpoch++;
+                    _activeMode = RemoteControllerMode.laser;
+                    _laserSteadyDwell.reset();
+                    _status =
+                        VrJoystickTranslationConstants.statusLaserOneHandReady;
+                  });
+                  _hapticMedium();
+                  _sendState(force: true);
+                  return;
+                }
+              }
               if (_lookStickHeld) {
                 _shakeDetector.reset();
                 return;
@@ -404,7 +461,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 event.x,
                 event.y,
                 event.z,
-                _controllerClock.elapsedMicroseconds,
+                nowUs,
               )) {
                 _onShakeDetected();
               }
@@ -551,6 +608,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   event.x.abs() > 100 ||
                   event.y.abs() > 100 ||
                   event.z.abs() > 100) {
+                _lastGyroOmegaMag = 0.0;
                 // Rejecting a sample must not leave the previous turn rate
                 // alive until the sensor watchdog expires. Keep thumb input.
                 if (_activeMode == RemoteControllerMode.joystick) {
@@ -561,6 +619,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 return;
               }
               _lastMotionUs = _controllerClock.elapsedMicroseconds;
+              _lastGyroOmegaMag = math.sqrt(
+                event.x * event.x + event.y * event.y + event.z * event.z,
+              );
               _setMotionCapability(VrMotionCapability.available);
               if (_activeMode == RemoteControllerMode.joystick &&
                   _lookStickHeld &&
@@ -573,6 +634,53 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   _lastMotionUs!,
                   sensorTimeUs: event.timestamp.microsecondsSinceEpoch,
                 );
+              }
+              if (_activeMode == RemoteControllerMode.laser) {
+                final now = event.timestamp;
+                if (_lastGyroTime != null) {
+                  final dt =
+                      (now.difference(_lastGyroTime!).inMicroseconds) / 1e6;
+                  if (dt > 0 && dt < 0.25) {
+                    _angularVelocity.setValues(event.x, event.y, event.z);
+                    final deltaYaw =
+                        (-event.z -
+                            event.y *
+                                VrJoystickConstants.laserGyroYawRollCoupling) *
+                        dt;
+                    final deltaPitch = event.x * dt;
+                    setState(() {
+                      _laserYaw = (_laserYaw + deltaYaw).clamp(
+                        -VrJoystickConstants.laserMaxYawRadians,
+                        VrJoystickConstants.laserMaxYawRadians,
+                      );
+                      _laserPitch = (_laserPitch + deltaPitch).clamp(
+                        -VrJoystickConstants.laserMaxPitchRadians,
+                        VrJoystickConstants.laserMaxPitchRadians,
+                      );
+                      _laserStickX =
+                          (_laserYaw / VrJoystickConstants.laserMaxYawRadians)
+                              .clamp(-1.0, 1.0);
+                      _laserStickY =
+                          (_laserPitch /
+                                  VrJoystickConstants.laserMaxPitchRadians)
+                              .clamp(-1.0, 1.0);
+                      _laserSlideNormX = _laserStickX;
+                      _laserSlideNormY = -_laserStickY;
+                      final qYaw = vm.Quaternion.axisAngle(
+                        vm.Vector3(0, 1, 0),
+                        -_laserYaw,
+                      );
+                      final qPitch = vm.Quaternion.axisAngle(
+                        vm.Vector3(1, 0, 0),
+                        _laserPitch,
+                      );
+                      _orientation = (qYaw * qPitch).normalized();
+                    });
+                    _sendState();
+                  }
+                }
+                _lastGyroTime = now;
+                return;
               }
               if (_activeMode != RemoteControllerMode.driving) {
                 // Only the touch pad owns laser aim, including after release.
@@ -601,6 +709,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               _steering.updateOrientation(_wheelOrientation);
             },
             onError: (_) {
+              _lastGyroOmegaMag = 0.0;
               _motionLook.reset();
               _angularVelocity.setZero();
               _lastGyroTime = null;
@@ -616,18 +725,33 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _streamTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
       if (!mounted || !_isForeground) return;
       final now = _controllerClock.elapsedMicroseconds;
+      final dtSeconds = (now - _lastDrivingTickUs) / 1e6;
       if (_activeMode == RemoteControllerMode.joystick) {
-        _updateJoystick(elapsed: (now - _lastDrivingTickUs) / 1e6, nowUs: now);
+        _updateJoystick(elapsed: dtSeconds, nowUs: now);
       }
       if (now - (_lastMotionUs ?? 0) > 2000000) {
+        _lastGyroOmegaMag = 0.0;
         _setMotionCapability(VrMotionCapability.unavailable);
+      }
+      if (_activeMode == RemoteControllerMode.laser) {
+        final triggered = _laserSteadyDwell.update(
+          angularSpeedRadiansPerSec: _lastGyroOmegaMag,
+          dtSeconds: math.max(dtSeconds, 0.016),
+          paused: _wordsphereSearchSheetVisible || _settingsOpen,
+        );
+        if (triggered) {
+          _pulseLaserClick();
+        } else if (now - _lastDrivingPaintUs >= 33333) {
+          _lastDrivingPaintUs = now;
+          setState(() {});
+        }
       }
       if (_activeMode == RemoteControllerMode.driving) {
         _steering.setPedals(
           throttlePressed: _throttlePedalHeld,
           brakePressed: _brakePedalHeld,
         );
-        _steering.advance((now - _lastDrivingTickUs) / 1e6);
+        _steering.advance(dtSeconds);
         final driving = _steering.state;
         final painted = _lastPaintedDrivingState;
         if (now - _lastDrivingPaintUs >= 33333 &&
@@ -701,10 +825,6 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           _steering.setPaused(true);
           _releaseInputs(send: true);
         }
-        if (_activeMode == RemoteControllerMode.laser) {
-          _activeMode = RemoteControllerMode.joystick;
-          _releaseInputs(send: true);
-        }
       }
     });
   }
@@ -713,17 +833,19 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     setState(() {
       _releaseInputs();
       _surfaceEpoch++;
-      _activeMode =
-          mode == RemoteControllerMode.laser &&
-              _motionCapability == VrMotionCapability.unavailable
-          ? RemoteControllerMode.joystick
-          : mode;
+      _activeMode = mode;
+      _oneHandedLaserDetector.setModeActive(mode == RemoteControllerMode.laser);
+      _laserSteadyDwell.reset();
+      _wordsphereSearchSheetVisible = false;
+      if (mode == RemoteControllerMode.laser) {
+        _status = VrJoystickTranslationConstants.statusLaserOneHandReady;
+      }
       _steering.setPaused(false);
       _steering.calibrate(_wheelOrientation);
       _lastDrivingTickUs = _controllerClock.elapsedMicroseconds;
     });
     _hapticClick();
-    _sendState();
+    _sendState(force: true);
   }
 
   void _centerSteering() {
@@ -797,6 +919,96 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _angularVelocity.setZero();
     });
     _sendState();
+  }
+
+  void _pulseLaserClick() {
+    _laserClickPulseTimer?.cancel();
+    _laserSteadyDwell.reset();
+    setState(() {
+      _triggerActive = true;
+      _btnAActive = true;
+    });
+    _hapticMedium();
+    _sendState(force: true);
+    _laserClickPulseTimer = Timer(
+      const Duration(milliseconds: VrJoystickConstants.laserClickPulseDurationMs),
+      () {
+        if (!mounted) return;
+        setState(() {
+          _triggerActive = false;
+          _btnAActive = false;
+        });
+        _sendState(force: true);
+      },
+    );
+  }
+
+  void _nudgeLaserAimByPan(Offset delta) {
+    if (_activeMode != RemoteControllerMode.laser) return;
+    _laserSteadyDwell.reset();
+    final nx = (_laserStickX + delta.dx / 180.0).clamp(-1.0, 1.0);
+    final ny = (_laserStickY - delta.dy / 140.0).clamp(-1.0, 1.0);
+    _updateLaserSlide(nx, -ny);
+  }
+
+  void _openWordsphereSearchSheet() {
+    _laserSteadyDwell.reset();
+    setState(() {
+      _wordsphereSearchSheetVisible = true;
+    });
+    _hapticMedium();
+    _sendState(force: true);
+  }
+
+  void _closeWordsphereSearchSheet() {
+    setState(() {
+      _wordsphereSearchSheetVisible = false;
+    });
+    _hapticLight();
+    _sendState(force: true);
+  }
+
+  void _onWordsphereQueryChanged(String query) {
+    final trimmed = query.trim();
+    setState(() {
+      _activeSearchQuery = trimmed.isEmpty
+          ? null
+          : trimmed.substring(
+              0,
+              math.min(trimmed.length, VrJoystickConstants.maxSearchQueryLength),
+            );
+    });
+    _sendState(force: true);
+  }
+
+  void _submitWordsphereSearch(String rawQuery) {
+    final trimmed = rawQuery.trim();
+    if (trimmed.isEmpty) {
+      _closeWordsphereSearchSheet();
+      return;
+    }
+    final normalized = trimmed.substring(
+      0,
+      math.min(trimmed.length, VrJoystickConstants.maxSearchQueryLength),
+    );
+    _searchSubmitPulseTimer?.cancel();
+    setState(() {
+      _activeSearchQuery = normalized;
+      _searchSubmittedPulse = true;
+      _wordsphereSearchSheetVisible = false;
+    });
+    _hapticDoublePulse();
+    _sendState(force: true);
+    _searchSubmitPulseTimer = Timer(
+      const Duration(milliseconds: VrJoystickConstants.laserClickPulseDurationMs),
+      () {
+        if (!mounted) return;
+        setState(() {
+          _searchSubmittedPulse = false;
+        });
+        _sendState(force: true);
+      },
+    );
   }
 
   String get _transportLabel {
@@ -1433,6 +1645,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _lastDrivingTickUs = _controllerClock.elapsedMicroseconds;
     _drivingActionTimer?.cancel();
     _drivingActionTimer = null;
+    _laserClickPulseTimer?.cancel();
+    _laserClickPulseTimer = null;
+    _searchSubmitPulseTimer?.cancel();
+    _searchSubmitPulseTimer = null;
     _recenterResetTimer?.cancel();
     _recenterResetTimer = null;
     _stickX = 0;
@@ -1456,6 +1672,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _btnLActive = false;
     _btnRActive = false;
     _btnGripActive = false;
+    _searchSubmittedPulse = false;
     _throttlePedalHeld = false;
     _brakePedalHeld = false;
     _gripHoldTimer?.cancel();
@@ -1561,6 +1778,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             _activeMode == RemoteControllerMode.driving && driving.paused,
         VrJoystickConstants.fieldMotionAvailable:
             _motionCapability == VrMotionCapability.available,
+        VrJoystickConstants.fieldSearchQuery: _activeSearchQuery,
+        VrJoystickConstants.fieldSearchSubmitted: _searchSubmittedPulse,
       };
       if (!_statePacer.shouldSend(
         state,
@@ -1588,6 +1807,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   void _recenterController() {
+    _laserSteadyDwell.reset();
     setState(() {
       _orientation = vm.Quaternion.identity();
       _angularVelocity.setZero();
@@ -1651,6 +1871,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _accelSub?.cancel();
     _streamTimer?.cancel();
     _recenterResetTimer?.cancel();
+    _laserClickPulseTimer?.cancel();
+    _searchSubmitPulseTimer?.cancel();
     _gripHoldTimer?.cancel();
     final socket = _socket;
     _socket = null;
@@ -1661,6 +1883,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         unawaited(_closeLink(socket));
       });
     }
+    _wordsphereController.dispose();
+    _wordsphereTextController.dispose();
     _ipController.dispose();
     // The next/current route owns orientation. During replacement this dispose
     // runs after that route mounted and must not overwrite its portrait lock.
@@ -1786,6 +2010,19 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                         onTap: () {
                           _selectMode(RemoteControllerMode.joystick);
                           setModalState(() {});
+                        },
+                      ),
+                      const SizedBox(height: 8),
+                      _buildSettingsModeCard(
+                        title: VrJoystickTranslationConstants.laserOneHandBadge,
+                        subtitle: VrJoystickTranslationConstants
+                            .statusLaserOneHandReady,
+                        icon: Icons.bolt_rounded,
+                        isSelected: _activeMode == RemoteControllerMode.laser,
+                        onTap: () {
+                          _selectMode(RemoteControllerMode.laser);
+                          setModalState(() {});
+                          Navigator.of(ctx).pop();
                         },
                       ),
                       const SizedBox(height: 8),
@@ -3847,121 +4084,48 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     );
   }
 
-  // ─── Modo Puntero Láser 3DoF Layout ──────────────────────────────────────
+  // ─── Modo Puntero Láser 3DoF Layout (1 Mano + Tap/5s Clic + Long-Press Wordsphere) ───
 
   Widget _buildLaserPointerLayout() {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        // Left Side: Gyro Aiming Virtual Canvas
-        Expanded(
-          flex: 6,
-          child: Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: const Color(0xFF101528),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(
-                color: const Color(0xFF00E5FF).withValues(alpha: 0.5),
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: const Color(0xFF00E5FF).withValues(alpha: 0.15),
-                  blurRadius: 12,
-                ),
-              ],
+    return ValueListenableBuilder<Uri?>(
+      valueListenable: _castPreview,
+      builder: (context, castUri, _) {
+        final yawDeg = _laserYaw * (180.0 / math.pi);
+        final pitchDeg = _laserPitch * (180.0 / math.pi);
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            VrLaserPointingView(
+              aimX: _laserStickX,
+              aimY: _laserStickY,
+              yawDegrees: yawDeg,
+              pitchDegrees: pitchDeg,
+              dwellProgress: _laserSteadyDwell.progress,
+              dwellRemainingSeconds: _laserSteadyDwell.remainingSeconds,
+              clickActive: _triggerActive || _btnAActive,
+              activeSearchQuery: _activeSearchQuery,
+              previewWidget: castUri == null ? null : _castImagePanel(castUri),
+              onTapClick: _pulseLaserClick,
+              onLongPressSearch: _openWordsphereSearchSheet,
+              onPanAimDelta: _nudgeLaserAimByPan,
+              onPanAimEnd: () {},
+              onRecenter: _recenterController,
+              onReturnToJoystick: () =>
+                  _selectMode(RemoteControllerMode.joystick),
             ),
-            child: Center(
-              child: FittedBox(
-                fit: BoxFit.scaleDown,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Icon(
-                      Icons.screen_rotation_rounded,
-                      size: 36,
-                      color: Color(0xFF00E5FF),
-                    ),
-                    const SizedBox(height: 6),
-                    const Text(
-                      VrJoystickTranslationConstants.laserPointer3DActive,
-                      style: TextStyle(
-                        color: Color(0xFF00E5FF),
-                        fontWeight: FontWeight.bold,
-                        fontSize: 12,
-                        letterSpacing: 1.1,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    const Text(
-                      VrJoystickTranslationConstants.laserPointer3DSubtitle,
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.white70, fontSize: 10),
-                    ),
-                    const SizedBox(height: 8),
-                    OutlinedButton.icon(
-                      onPressed: _recenterController,
-                      icon: const Icon(Icons.gps_fixed_rounded, size: 14),
-                      label: const Text(
-                        VrJoystickTranslationConstants.laserRecenterSight,
-                        style: TextStyle(fontSize: 11),
-                      ),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: const Color(0xFF00E5FF),
-                        side: const BorderSide(color: Color(0xFF00E5FF)),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 6,
-                        ),
-                        minimumSize: const Size(0, 30),
-                      ),
-                    ),
-                  ],
+            if (_wordsphereSearchSheetVisible)
+              Positioned.fill(
+                child: VrWordsphereSearchSheet(
+                  wordsphereController: _wordsphereController,
+                  textController: _wordsphereTextController,
+                  onQueryChanged: _onWordsphereQueryChanged,
+                  onSubmitted: _submitWordsphereSearch,
+                  onClose: _closeWordsphereSearchSheet,
                 ),
               ),
-            ),
-          ),
-        ),
-
-        const SizedBox(width: 10),
-
-        // Right Side: Action Buttons (Back / Trigger)
-        Expanded(
-          flex: 4,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Expanded(
-                child: _buildButton(
-                  title: VrJoystickTranslationConstants.laserBackHomeTitle,
-                  subtitle:
-                      VrJoystickTranslationConstants.laserBackHomeSubtitle,
-                  icon: Icons.navigation_rounded,
-                  isActive: _actionActive,
-                  colors: const [Color(0xFFFF007F), Color(0xFFFF9100)],
-                  onDown: () => setState(() => _actionActive = true),
-                  onUp: () => setState(() => _actionActive = false),
-                ),
-              ),
-              const SizedBox(height: 8),
-              Expanded(
-                flex: 2,
-                child: _buildButton(
-                  title: VrJoystickTranslationConstants.laserTriggerClickTitle,
-                  subtitle:
-                      VrJoystickTranslationConstants.laserTriggerClickSubtitle,
-                  icon: Icons.touch_app_rounded,
-                  isActive: _triggerActive,
-                  colors: const [Color(0xFF00E5FF), Color(0xFF7C4DFF)],
-                  onDown: () => setState(() => _triggerActive = true),
-                  onUp: () => setState(() => _triggerActive = false),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ],
+          ],
+        );
+      },
     );
   }
 

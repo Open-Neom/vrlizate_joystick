@@ -58,6 +58,8 @@ class RemoteControllerState {
   /// Never accepted from the wire; hosts should require fresh neutral input.
   final bool isNeutralized;
   final double? rangeMeters;
+  final String? searchQuery;
+  final bool searchSubmitted;
   final RemoteControllerMode mode;
   final DateTime timestamp;
 
@@ -96,6 +98,8 @@ class RemoteControllerState {
     this.motionAvailable = false,
     this.isNeutralized = false,
     this.rangeMeters,
+    this.searchQuery,
+    this.searchSubmitted = false,
     this.mode = RemoteControllerMode.joystick,
     DateTime? timestamp,
   }) : turnRate = lookX ?? turnRate,
@@ -110,5 +114,6 @@ class RemoteControllerState {
   String toString() =>
       'RemoteControllerState(mode: ${mode.name}, stick: ($stickX, $stickY), '
       'turn: $turnRate, pitch: $pitchRate, laser: ($laserX, $laserY), slide: $laserSlideActive, recenter: $recenter, range: $rangeMeters, '
-      'btnA: $btnA, btnB: $btnB, btnX: $btnX, btnY: $btnY, btnL: $btnL, btnR: $btnR, trigger: $isTriggerPressed, grip: $btnGrip)';
+      'btnA: $btnA, btnB: $btnB, btnX: $btnX, btnY: $btnY, btnL: $btnL, btnR: $btnR, trigger: $isTriggerPressed, grip: $btnGrip, '
+      'searchQuery: $searchQuery, searchSubmitted: $searchSubmitted)';
 }

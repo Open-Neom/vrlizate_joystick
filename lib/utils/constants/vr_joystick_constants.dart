@@ -134,6 +134,26 @@ abstract final class VrJoystickConstants {
   static const String fieldBrake = 'brake';
   static const String fieldDrivingPaused = 'drivingPaused';
   static const String fieldMotionAvailable = 'motionAvailable';
+  static const String fieldSearchQuery = 'searchQuery';
+  static const String fieldSearchSubmitted = 'searchSubmitted';
+  static const int maxSearchQueryLength = 120;
+
+  // One-Handed Laser Detector & 5-Second Dwell Constants
+  static const double oneHandedLateralTiltMinRatio = 0.42;
+  static const double oneHandedPointingMinOmega = 0.15;
+  static const int oneHandedSwitchHoldUs = 200000;
+  static const double oneHandedReturnFlatGxRatio = 0.88;
+  static const double oneHandedReturnFlatGyMaxRatio = 0.20;
+  static const int oneHandedReturnHoldUs = 350000;
+  static const double oneHandedMinGravityMagnitude = 7.5;
+  static const double oneHandedMaxGravityMagnitude = 12.5;
+  static const double laserAutoClickDwellSeconds = 5.0;
+  static const double laserSteadyOmegaThreshold = 0.35;
+  static const double laserMaxDeltaSeconds = 0.5;
+  static const int laserClickPulseDurationMs = 150;
+  static const double laserMaxYawRadians = 1.5707963267948966;
+  static const double laserMaxPitchRadians = 1.25;
+  static const double laserGyroYawRollCoupling = 0.35;
 
   static const String modeJoystick = 'joystick';
   static const String modeLaser = 'laser';
@@ -146,6 +166,7 @@ abstract final class VrJoystickConstants {
     fieldMotionAvailable,
     fieldControllerVisible,
     fieldMoveAtEdge,
+    fieldSearchSubmitted,
   ];
 
   static const List<String> numericStateKeys = [
@@ -196,6 +217,7 @@ abstract final class VrJoystickConstants {
     fieldLaserSlideActive,
     fieldRecenter,
     fieldMoveAtEdge,
+    fieldSearchSubmitted,
   ];
 
   static const List<String> neutralAxisKeys = [
@@ -277,6 +299,33 @@ abstract final class VrJoystickConstants {
   static const String keyRightModeLaser = 'right_mode_laser';
   static const String keyRightModeView = 'right_mode_view';
   static const String keyLaserSlidePad = 'laser_slide_pad';
+  static const String keyLaserPointingSurface = 'laser_pointing_surface';
+  static const String keyLaserPointingReticle = 'laser_pointing_reticle';
+  static const String keyLaserPointingRecenter = 'laser_pointing_recenter';
+  static const String keyLaserPointingWordsphereButton =
+      'laser_pointing_wordsphere_button';
+  static const String keyLaserPointingBackToJoystick =
+      'laser_pointing_back_to_joystick';
+  static const String keyLaserPointingDwellBadge = 'laser_pointing_dwell_badge';
+  static const String keyWordsphereSearchSheet = 'wordsphere_search_sheet';
+  static const String keyWordsphereSearchField = 'wordsphere_search_field';
+  static const String keyWordsphereSearchSubmit = 'wordsphere_search_submit';
+  static const String keyWordsphereSearchBackspace =
+      'wordsphere_search_backspace';
+  static const String keyWordsphereSearchSpace = 'wordsphere_search_space';
+  static const String keyWordsphereSearchClear = 'wordsphere_search_clear';
+  static const String keyWordsphereBoard = 'wordsphere_board';
+  static const String keyWordsphereDestinationChipPrefix = 'wordsphere_dest_';
+
+  static const List<String> wordsphereDestinations = [
+    'Mall VR',
+    'Lobby Central',
+    'Arcade NES',
+    'Conducción',
+    'Cine 360',
+    'Galería',
+    'Mundos VR',
+  ];
 
   // Regular Expression Patterns
   static const String excludedInterfacePattern =

@@ -364,4 +364,37 @@ abstract final class VrJoystickTranslationConstants {
   static const String telemetryLaserMiddle = ') | LÁSER: (';
   static const String telemetryCommaSpace = ', ';
   static const String telemetryEndParen = ')';
+
+  // One-Handed Laser Pointing, 5s Dwell & Wordsphere Search Strings
+  static const String errorInvalidDwellConfig =
+      'Dwell duration must be positive and steady threshold must be non-negative.';
+  static const String statusLaserOneHandReady =
+      'Láser 1 mano activo · mueve el teléfono para apuntar';
+  static const String laserOneHandBadge = 'LÁSER 1 MANO · APUNTANDO';
+  static const String laserTapHint =
+      'TAP (otra mano) = Clic  ·  ESPERAR 5s = Auto-Clic';
+  static const String laserLongPressHint =
+      'MANTÉN PRESIONADO (otra mano) = Escribir / Buscar con Wordsphere';
+  static const String laserDwellCountdownPrefix = 'AUTO-CLIC EN ';
+  static const String laserDwellCountdownSuffix = 's';
+  static const String laserClickTriggeredBadge = '¡CLIC ENVIADO!';
+  static const String laserReturnToJoystickButton = 'Modo Joystick';
+  static const String laserOpenWordsphereButton = 'Wordsphere';
+  static const String laserRecenterButton = 'Recentrar';
+  static const String laserDestinationActivePrefix = 'DESTINO: ';
+  static const String laserHorizontalLabelPrefix = 'H: ';
+  static const String laserVerticalLabelPrefix = '°  ·  V: ';
+  static const String laserDegreeSuffix = '°';
+  static const String wordsphereSheetTitle =
+      'BÚSQUEDA Y DESTINOS WORDSPHERE';
+  static const String wordsphereSheetSubtitle =
+      'Traza palabras en la esfera con tu mano libre o elige un destino de VRlizate';
+  static const String wordsphereSearchFieldHint =
+      '¿A dónde quieres ir o qué deseas buscar en VRlizate?';
+  static const String wordsphereSubmitButton = 'IR / BUSCAR';
+  static const String wordsphereBackspaceTooltip = 'Borrar palabra';
+  static const String wordsphereSpaceTooltip = 'Espacio';
+  static const String wordsphereClearTooltip = 'Limpiar';
+  static const String wordsphereQuickDestinationsLabel =
+      'DESTINOS RÁPIDOS DE VRLIZATE:';
 }
