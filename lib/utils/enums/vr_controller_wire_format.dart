@@ -1,0 +1,1 @@
+enum VrControllerWireFormat { json, binaryPose }

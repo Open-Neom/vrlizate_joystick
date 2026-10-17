@@ -2,7 +2,7 @@
 
 Mando dual-analógico en segundo smartphone, perfiles de control especializados (Joystick, Conducción, NES) y servicio de emparejamiento para Flutter y VRlizate.
 
-> Versión actual: **0.2.0**. Consulta [CHANGELOG.md](CHANGELOG.md) para el historial de cambios.
+> Versión actual: **1.0.0**. Consulta [CHANGELOG.md](CHANGELOG.md) para el historial de cambios.
 
 ## Características principales
 
@@ -10,10 +10,11 @@ Mando dual-analógico en segundo smartphone, perfiles de control especializados 
 - **Doble stick virtual progresivo (`VirtualThumbstick`):**
   - **Stick izquierdo:** locomoción 3D con zona muerta radial (10%), rampa progresiva de velocidad (1.8 s) y detección de intención de giro en el borde (`moveAtEdge` al 92%, liberación al 84%).
   - **Control derecho (`Vista` / `Láser`):** inclinación vertical (o dos ejes si la experiencia solicita `horizontalLook: true`), giro de vista por inclinación del teléfono (`VrMotionLookController`) al mantener presionado el stick, o pad táctil de puntero láser con agarre por pulsación sostenida (`Láser`).
-- **Perfiles dirigidos por el anfitrión (`RemoteControllerMode`):**
-  - `joystick`: locomoción, vista/láser y botones `A/B/X/Y/L/R`.
-  - `driving`: volante 3DoF por giroscopio (`VrSteeringController`) con deslizador táctil de respaldo, acelerador (`R`), freno (`L`) y pausa explícita.
-  - `nes`: cruceta digital (D-pad), botones `B/A`, `Select`, `Start` y `Home`.
+- **Perfiles dirigidos por el anfitrión (`RemoteControllerMode` y `VrGamepadLayoutPreset`):**
+  - `joystick` (`dualStickVr`): locomoción, vista/láser y botones `A/B/X/Y/L/R`.
+  - `driving` (`steeringWheel`): volante 3DoF por giroscopio (`VrSteeringController`) con deslizador táctil de respaldo, acelerador (`R`), freno (`L`) y pausa explícita.
+  - `nes` (`retroArcade8Way`): cruceta digital (D-pad), botones `B/A`, `Select`, `Start` y `Home`.
+  - Remapeo de botones (`VrButtonMapping`) y patrones hápticos predefinidos (`VrHapticPatternPreset`).
 - **Telemetría y visibilidad 3D:** sacudir el mando (o usar Ajustes) alterna la visibilidad del mando 3D en el visor (`controllerVisible`) sin recentrar la cámara ni interrumpir la partida.
 - **Vista previa del visor (`vrlizate_cast`):** muestra automáticamente la transmisión monocular LAN en el centro del mando cuando el visor anuncia `cast_preview`.
 

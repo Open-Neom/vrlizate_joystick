@@ -1,7 +1,16 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 - 2026-10-17
 
+- Adopt Open Neom modular directory structure (`lib/utils/constants/`,
+  `lib/utils/enums/`, `lib/domain/models/`, `lib/domain/services/`, `lib/ui/`)
+  with one class/enum per file and backward-compatible `lib/src/` barrels.
+- Centralize all protocol keys, HTML5 fallback templates, and UI translations in
+  `VrJoystickConstants` and `VrJoystickTranslationConstants`.
+- Add `VrGamepadLayoutPreset` (`dualStickVr`, `retroArcade8Way`,
+  `steeringWheel`, `mediaRemote`), `VrHapticPatternPreset` (`lightTap`,
+  `buttonPress`, `portalEnter`, `collisionBump`, `holdExitWarning`), and
+  `VrButtonMapping` with configurable `holdCenterForHomeDuration`.
 - Keep the full-size left walking/turning stick, reduce the right to 78%, and
   combine vertical `Vista` and touch `Láser` there with an explicit selector.
   Free the center for experience actions; changes release old gestures/grip.
