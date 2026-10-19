@@ -172,6 +172,7 @@ class VrRemoteControllerService {
   }
 
   RemoteControllerMode get recommendedMode => _modeRequest.mode;
+  bool get recommendedHorizontalLook => _modeRequest.horizontalLook;
   Map<String, String> get recommendedActions => _modeRequest.actions;
 
   /// Activates or deactivates the built-in single-screen handheld gamepad.
@@ -832,6 +833,14 @@ class VrRemoteControllerService {
               : null;
           final bool searchSubmitted =
               json[VrJoystickConstants.fieldSearchSubmitted] == true;
+          final double passthroughMix =
+              ((json[VrJoystickConstants.fieldPassthroughMix] as num?)
+                      ?.toDouble() ??
+                  0.0)
+                  .clamp(0.0, 1.0);
+          final bool passthroughActive =
+              (json[VrJoystickConstants.fieldPassthroughActive] as bool?) ??
+              (passthroughMix > 0.01);
 
           _latestState = RemoteControllerState(
             orientation: _predictedOrientation.clone(),
@@ -873,6 +882,8 @@ class VrRemoteControllerService {
             rangeMeters: rangeMeters,
             searchQuery: searchQuery,
             searchSubmitted: searchSubmitted,
+            passthroughMix: passthroughMix,
+            passthroughActive: passthroughActive,
             mode: mode,
           );
 

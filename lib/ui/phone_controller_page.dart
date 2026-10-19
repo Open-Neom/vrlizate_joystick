@@ -24,6 +24,7 @@ import '../domain/services/vr_controller_state_pacer.dart';
 import '../domain/services/vr_laser_steady_dwell_controller.dart';
 import '../domain/services/vr_motion_look_controller.dart';
 import '../domain/services/vr_one_handed_laser_detector.dart';
+import '../domain/services/vr_passthrough_split_gesture_controller.dart';
 import '../domain/services/vr_progressive_stick.dart';
 import '../domain/services/vr_steering_controller.dart';
 import '../domain/services/vr_web_socket_controller_link.dart';
@@ -38,6 +39,7 @@ import 'vr_controller_region.dart';
 import 'vr_driving_wheel_painter.dart';
 import 'vr_laser_pointing_view.dart';
 import 'vr_laser_slide_pad_painter.dart';
+import 'vr_passthrough_curtain_overlay_painter.dart';
 import 'vr_wordsphere_search_sheet.dart';
 
 /// Native Smartphone VR Controller & Joystick Screen.
@@ -261,6 +263,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   final _shakeDetector = VrControllerShakeDetector();
   final _oneHandedLaserDetector = VrOneHandedLaserDetector();
   final _laserSteadyDwell = VrLaserSteadyDwellController();
+  final _passthroughGesture = VrPassthroughSplitGestureController();
+  int _lastPassthroughHapticBucket = 0;
   final TextEditingController _wordsphereTextController =
       TextEditingController();
   late final WordsphereController _wordsphereController = WordsphereController(
@@ -1673,6 +1677,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _btnRActive = false;
     _btnGripActive = false;
     _searchSubmittedPulse = false;
+    _passthroughGesture.cancelGesture();
     _throttlePedalHeld = false;
     _brakePedalHeld = false;
     _gripHoldTimer?.cancel();
@@ -1780,6 +1785,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             _motionCapability == VrMotionCapability.available,
         VrJoystickConstants.fieldSearchQuery: _activeSearchQuery,
         VrJoystickConstants.fieldSearchSubmitted: _searchSubmittedPulse,
+        VrJoystickConstants.fieldPassthroughMix:
+            _passthroughGesture.passthroughMix,
+        VrJoystickConstants.fieldPassthroughActive:
+            _passthroughGesture.passthroughActive,
       };
       if (!_statePacer.shouldSend(
         state,
@@ -3196,150 +3205,229 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           );
         }
 
-        return Stack(
-          key: const ValueKey(VrJoystickConstants.keyJoystickSurface),
-          children: [
-            Positioned.fromRect(
-              rect: geometry.centerPanel,
-              child: IgnorePointer(
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF101528),
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(
-                      color:
-                          (_btnGripActive
-                                  ? const Color(0xFFFF9100)
-                                  : const Color(0xFF10B981))
-                              .withValues(alpha: .35),
+        return Listener(
+          behavior: HitTestBehavior.translucent,
+          onPointerDown: (event) {
+            if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+            final normX = event.localPosition.dx / constraints.maxWidth;
+            final normY = event.localPosition.dy / constraints.maxHeight;
+            final changed = _passthroughGesture.onPointerDown(
+              pointerId: event.pointer,
+              normX: normX,
+              normY: normY,
+              timestampUs: _controllerClock.elapsedMicroseconds,
+            );
+            if (changed) {
+              _lastPassthroughHapticBucket =
+                  (_passthroughGesture.passthroughMix * 4).round();
+              _hapticLight();
+              setState(() {});
+            }
+          },
+          onPointerMove: (event) {
+            if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+            final normX = event.localPosition.dx / constraints.maxWidth;
+            final normY = event.localPosition.dy / constraints.maxHeight;
+            final changed = _passthroughGesture.onPointerMove(
+              pointerId: event.pointer,
+              normX: normX,
+              normY: normY,
+              timestampUs: _controllerClock.elapsedMicroseconds,
+            );
+            if (changed) {
+              final bucket = (_passthroughGesture.passthroughMix * 4).round();
+              if (bucket != _lastPassthroughHapticBucket) {
+                _lastPassthroughHapticBucket = bucket;
+                _hapticClick();
+              }
+              setState(() {});
+              _sendState();
+            }
+          },
+          onPointerUp: (event) {
+            final changed = _passthroughGesture.onPointerUpOrCancel(
+              pointerId: event.pointer,
+              timestampUs: _controllerClock.elapsedMicroseconds,
+            );
+            if (changed && mounted) {
+              _hapticMedium();
+              setState(() {});
+              _sendState(force: true);
+            }
+          },
+          onPointerCancel: (event) {
+            final changed = _passthroughGesture.onPointerUpOrCancel(
+              pointerId: event.pointer,
+              timestampUs: _controllerClock.elapsedMicroseconds,
+            );
+            if (changed && mounted) {
+              setState(() {});
+              _sendState(force: true);
+            }
+          },
+          child: Stack(
+            key: const ValueKey(VrJoystickConstants.keyJoystickSurface),
+            children: [
+              Positioned.fromRect(
+                rect: geometry.centerPanel,
+                child: IgnorePointer(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF101528),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color:
+                            (_btnGripActive
+                                    ? const Color(0xFFFF9100)
+                                    : const Color(0xFF10B981))
+                                .withValues(alpha: .35),
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
-            button(
-              VrJoystickControl.l,
-              title: VrJoystickConstants.actionKeyL,
-              subtitle: _actionLabel(VrJoystickConstants.actionKeyL),
-              active: _btnLActive,
-              colors: const [Color(0xFF00A7B5), Color(0xFF395AB5)],
-              onDown: () => setState(
-                () => _btnLActive = !driving || !_steering.state.paused,
+              button(
+                VrJoystickControl.l,
+                title: VrJoystickConstants.actionKeyL,
+                subtitle: _actionLabel(VrJoystickConstants.actionKeyL),
+                active: _btnLActive,
+                colors: const [Color(0xFF00A7B5), Color(0xFF395AB5)],
+                onDown: () => setState(
+                  () => _btnLActive = !driving || !_steering.state.paused,
+                ),
+                onUp: () => setState(() => _btnLActive = false),
               ),
-              onUp: () => setState(() => _btnLActive = false),
-            ),
-            button(
-              VrJoystickControl.r,
-              title: VrJoystickConstants.actionKeyR,
-              subtitle: _actionLabel(VrJoystickConstants.actionKeyR),
-              active: _btnRActive,
-              colors: const [Color(0xFFFF9100), Color(0xFFD64D18)],
-              onDown: () => setState(
-                () => _btnRActive = !driving || !_steering.state.paused,
+              button(
+                VrJoystickControl.r,
+                title: VrJoystickConstants.actionKeyR,
+                subtitle: _actionLabel(VrJoystickConstants.actionKeyR),
+                active: _btnRActive,
+                colors: const [Color(0xFFFF9100), Color(0xFFD64D18)],
+                onDown: () => setState(
+                  () => _btnRActive = !driving || !_steering.state.paused,
+                ),
+                onUp: () => setState(() => _btnRActive = false),
               ),
-              onUp: () => setState(() => _btnRActive = false),
-            ),
-            button(
-              VrJoystickControl.y,
-              title: VrJoystickConstants.actionKeyY,
-              subtitle: _actionLabel(VrJoystickConstants.actionKeyY),
-              active: _btnYActive,
-              colors: const [Color(0xFFFFD54F), Color(0xFFF59E0B)],
-              textColor: const Color(0xFF211500),
-              onDown: () => setState(() => _btnYActive = true),
-              onUp: () => setState(() => _btnYActive = false),
-            ),
-            button(
-              VrJoystickControl.x,
-              title: VrJoystickConstants.actionKeyX,
-              subtitle: _actionLabel(VrJoystickConstants.actionKeyX),
-              active: _btnXActive,
-              colors: const [Color(0xFF2979FF), Color(0xFF1555BA)],
-              onDown: () {
-                if (driving) {
-                  setState(() {
+              button(
+                VrJoystickControl.y,
+                title: VrJoystickConstants.actionKeyY,
+                subtitle: _actionLabel(VrJoystickConstants.actionKeyY),
+                active: _btnYActive,
+                colors: const [Color(0xFFFFD54F), Color(0xFFF59E0B)],
+                textColor: const Color(0xFF211500),
+                onDown: () => setState(() => _btnYActive = true),
+                onUp: () => setState(() => _btnYActive = false),
+              ),
+              button(
+                VrJoystickControl.x,
+                title: VrJoystickConstants.actionKeyX,
+                subtitle: _actionLabel(VrJoystickConstants.actionKeyX),
+                active: _btnXActive,
+                colors: const [Color(0xFF2979FF), Color(0xFF1555BA)],
+                onDown: () {
+                  if (driving) {
+                    setState(() {
+                      _steering.setPaused(true);
+                      _releaseInputs();
+                      _surfaceEpoch++;
+                    });
+                    _pulseDrivingAction(reset: true);
+                  } else {
+                    setState(() => _btnXActive = true);
+                  }
+                },
+                onUp: () => setState(() => _btnXActive = false),
+              ),
+              button(
+                VrJoystickControl.b,
+                title: VrJoystickConstants.actionKeyB,
+                subtitle: _actionLabel(VrJoystickConstants.actionKeyB),
+                active: _btnBActive,
+                colors: const [Color(0xFFFF5252), Color(0xFFB71C45)],
+                onDown: () => setState(() {
+                  if (driving) {
                     _steering.setPaused(true);
                     _releaseInputs();
-                    _surfaceEpoch++;
-                  });
-                  _pulseDrivingAction(reset: true);
-                } else {
-                  setState(() => _btnXActive = true);
-                }
-              },
-              onUp: () => setState(() => _btnXActive = false),
-            ),
-            button(
-              VrJoystickControl.b,
-              title: VrJoystickConstants.actionKeyB,
-              subtitle: _actionLabel(VrJoystickConstants.actionKeyB),
-              active: _btnBActive,
-              colors: const [Color(0xFFFF5252), Color(0xFFB71C45)],
-              onDown: () => setState(() {
-                if (driving) {
-                  _steering.setPaused(true);
-                  _releaseInputs();
-                }
-                _btnBActive = true;
-              }),
-              onUp: () => setState(() => _btnBActive = false),
-            ),
-            button(
-              VrJoystickControl.a,
-              title: VrJoystickConstants.actionKeyA,
-              subtitle: _actionLabel(VrJoystickConstants.actionKeyA),
-              active: _btnAActive,
-              colors: const [Color(0xFF10B981), Color(0xFF087848)],
-              onDown: driving
-                  ? _selectDrivingMenu
-                  : () => setState(() => _btnAActive = true),
-              onUp: () => setState(() => _btnAActive = false),
-            ),
-            stick(VrJoystickControl.moveStick, true),
-            if (_rightLaser)
-              Positioned.fromRect(
-                rect: geometry[VrJoystickControl.lookStick],
-                child: ClipOval(child: _buildLaserSlidePad()),
-              )
-            else
-              stick(VrJoystickControl.lookStick, false),
-            Positioned(
-              left: geometry.centerPanel.left + 6,
-              width: geometry.centerPanel.width - 12,
-              top: 0,
-              height: geometry[VrJoystickControl.recenter].top - 4,
-              child: _buildJoystickChrome(),
-            ),
-            Positioned.fromRect(
-              rect: geometry[VrJoystickControl.recenter],
-              child: _buildButton(
-                key: const ValueKey(VrJoystickConstants.keyJoystickRecenter),
-                title: driving
-                    ? VrJoystickTranslationConstants.drivingCenterWheelTitle
-                    : VrJoystickTranslationConstants.joystickRecenterTitle,
-                subtitle: driving
-                    ? VrJoystickTranslationConstants
-                          .drivingCenterWheelLongSubtitle
-                    : VrJoystickTranslationConstants.joystickRecenterSubtitle,
-                icon: Icons.filter_center_focus_rounded,
-                isActive: _recenterTriggered,
-                colors: const [Color(0xFFE17815), Color(0xFFB43A77)],
-                onDown: driving ? _centerSteering : _recenterController,
-                onUp: () {},
+                  }
+                  _btnBActive = true;
+                }),
+                onUp: () => setState(() => _btnBActive = false),
               ),
-            ),
-            Positioned.fromRect(
-              rect: geometry.previewPanel,
-              child: _buildJoystickCenter(),
-            ),
-            Positioned(
-              left: geometry.centerPanel.left + 6,
-              right: constraints.maxWidth - geometry.centerPanel.right + 6,
-              bottom: 0,
-              height: geometry.footerHeight,
-              child: driving ? _buildDrivingStatus() : _buildJoystickStatus(),
-            ),
-          ],
+              button(
+                VrJoystickControl.a,
+                title: VrJoystickConstants.actionKeyA,
+                subtitle: _actionLabel(VrJoystickConstants.actionKeyA),
+                active: _btnAActive,
+                colors: const [Color(0xFF10B981), Color(0xFF087848)],
+                onDown: driving
+                    ? _selectDrivingMenu
+                    : () => setState(() => _btnAActive = true),
+                onUp: () => setState(() => _btnAActive = false),
+              ),
+              stick(VrJoystickControl.moveStick, true),
+              if (_rightLaser)
+                Positioned.fromRect(
+                  rect: geometry[VrJoystickControl.lookStick],
+                  child: ClipOval(child: _buildLaserSlidePad()),
+                )
+              else
+                stick(VrJoystickControl.lookStick, false),
+              Positioned(
+                left: geometry.centerPanel.left + 6,
+                width: geometry.centerPanel.width - 12,
+                top: 0,
+                height: geometry[VrJoystickControl.recenter].top - 4,
+                child: _buildJoystickChrome(),
+              ),
+              Positioned.fromRect(
+                rect: geometry[VrJoystickControl.recenter],
+                child: _buildButton(
+                  key: const ValueKey(VrJoystickConstants.keyJoystickRecenter),
+                  title: driving
+                      ? VrJoystickTranslationConstants.drivingCenterWheelTitle
+                      : VrJoystickTranslationConstants.joystickRecenterTitle,
+                  subtitle: driving
+                      ? VrJoystickTranslationConstants
+                            .drivingCenterWheelLongSubtitle
+                      : VrJoystickTranslationConstants.joystickRecenterSubtitle,
+                  icon: Icons.filter_center_focus_rounded,
+                  isActive: _recenterTriggered,
+                  colors: const [Color(0xFFE17815), Color(0xFFB43A77)],
+                  onDown: driving ? _centerSteering : _recenterController,
+                  onUp: () {},
+                ),
+              ),
+              Positioned.fromRect(
+                rect: geometry.previewPanel,
+                child: _buildJoystickCenter(),
+              ),
+              Positioned(
+                left: geometry.centerPanel.left + 6,
+                right: constraints.maxWidth - geometry.centerPanel.right + 6,
+                bottom: 0,
+                height: geometry.footerHeight,
+                child: driving ? _buildDrivingStatus() : _buildJoystickStatus(),
+              ),
+              if (_passthroughGesture.isGestureActive ||
+                  _passthroughGesture.passthroughActive)
+                Positioned.fill(
+                  child: IgnorePointer(
+                    key: const ValueKey(
+                      VrJoystickConstants.keyPassthroughCurtainOverlay,
+                    ),
+                    child: CustomPaint(
+                      painter: VrPassthroughCurtainOverlayPainter(
+                        mode: _passthroughGesture.mode,
+                        passthroughMix: _passthroughGesture.passthroughMix,
+                        spread: _passthroughGesture.currentSpread,
+                        leftThumbNormX: _passthroughGesture.leftThumbNormX,
+                        rightThumbNormX: _passthroughGesture.rightThumbNormX,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
         );
       },
     );

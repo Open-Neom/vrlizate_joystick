@@ -397,4 +397,14 @@ abstract final class VrJoystickTranslationConstants {
   static const String wordsphereClearTooltip = 'Limpiar';
   static const String wordsphereQuickDestinationsLabel =
       'DESTINOS RÁPIDOS DE VRLIZATE:';
+
+  // Dual-Thumb Center-to-Lateral Passthrough Split Gesture Strings
+  static const String passthroughMixBadgePrefix = 'PASSTHROUGH MIX: ';
+  static const String passthroughCycleBadgePrefix =
+      'PASSTHROUGH 0→100→0%: ';
+  static const String passthroughFastSwipeBadgePrefix =
+      'PASSTHROUGH RÁPIDO: ';
+  static const String passthroughPercentSuffix = '%';
+  static const String passthroughCenterArmedHint =
+      'DESLIZA PULGARES A LOS LADOS · RÁPIDO: ON/OFF · LENTO: MIX 0→100→0%';
 }

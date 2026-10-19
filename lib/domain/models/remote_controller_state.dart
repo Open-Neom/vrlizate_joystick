@@ -60,6 +60,8 @@ class RemoteControllerState {
   final double? rangeMeters;
   final String? searchQuery;
   final bool searchSubmitted;
+  final double passthroughMix;
+  final bool passthroughActive;
   final RemoteControllerMode mode;
   final DateTime timestamp;
 
@@ -100,10 +102,13 @@ class RemoteControllerState {
     this.rangeMeters,
     this.searchQuery,
     this.searchSubmitted = false,
+    this.passthroughMix = 0.0,
+    bool? passthroughActive,
     this.mode = RemoteControllerMode.joystick,
     DateTime? timestamp,
   }) : turnRate = lookX ?? turnRate,
        pitchRate = lookY ?? pitchRate,
+       passthroughActive = passthroughActive ?? (passthroughMix > 0.01),
        angularVelocity = angularVelocity ?? vm.Vector3.zero(),
        timestamp = timestamp ?? DateTime.now();
 
@@ -115,5 +120,5 @@ class RemoteControllerState {
       'RemoteControllerState(mode: ${mode.name}, stick: ($stickX, $stickY), '
       'turn: $turnRate, pitch: $pitchRate, laser: ($laserX, $laserY), slide: $laserSlideActive, recenter: $recenter, range: $rangeMeters, '
       'btnA: $btnA, btnB: $btnB, btnX: $btnX, btnY: $btnY, btnL: $btnL, btnR: $btnR, trigger: $isTriggerPressed, grip: $btnGrip, '
-      'searchQuery: $searchQuery, searchSubmitted: $searchSubmitted)';
+      'searchQuery: $searchQuery, searchSubmitted: $searchSubmitted, passthroughMix: $passthroughMix, passthroughActive: $passthroughActive)';
 }

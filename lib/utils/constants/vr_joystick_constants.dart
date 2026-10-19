@@ -136,7 +136,25 @@ abstract final class VrJoystickConstants {
   static const String fieldMotionAvailable = 'motionAvailable';
   static const String fieldSearchQuery = 'searchQuery';
   static const String fieldSearchSubmitted = 'searchSubmitted';
+  static const String fieldPassthroughMix = 'passthroughMix';
+  static const String fieldPassthroughActive = 'passthroughActive';
   static const int maxSearchQueryLength = 120;
+
+  // Dual-Thumb Center-to-Lateral Passthrough Split Gesture Constants
+  static const double passthroughCenterMinNormX = 0.28;
+  static const double passthroughCenterMaxNormX = 0.72;
+  static const double passthroughMaxInitialThumbSpan = 0.38;
+  static const int passthroughThumbSyncWindowUs = 320000;
+  static const double passthroughMinActivationSpread = 0.04;
+  static const double passthroughFullSpanNormDistance = 0.84;
+  static const double passthroughFastSwipeMinSpeedPerSec = 1.40;
+  static const int passthroughFastSwipeMaxDurationUs = 380000;
+  static const double passthroughFastSwipeMinSpread = 0.35;
+  static const double passthroughUltraSlowMaxSpeedPerSec = 0.55;
+  static const int passthroughUltraSlowMinDurationUs = 850000;
+  static const double passthroughDirectionToleranceNorm = 0.04;
+  static const String keyPassthroughCurtainOverlay =
+      'passthrough_curtain_overlay';
 
   // One-Handed Laser Detector & 5-Second Dwell Constants
   static const double oneHandedLateralTiltMinRatio = 0.42;
@@ -167,6 +185,7 @@ abstract final class VrJoystickConstants {
     fieldControllerVisible,
     fieldMoveAtEdge,
     fieldSearchSubmitted,
+    fieldPassthroughActive,
   ];
 
   static const List<String> numericStateKeys = [
@@ -195,6 +214,7 @@ abstract final class VrJoystickConstants {
     fieldDrivingTilt,
     fieldThrottle,
     fieldBrake,
+    fieldPassthroughMix,
   ];
 
   static const List<String> angularVelocityKeys = [
@@ -252,6 +272,7 @@ abstract final class VrJoystickConstants {
     fieldDrivingTilt,
     fieldThrottle,
     fieldBrake,
+    fieldPassthroughMix,
   };
 
   // Directional glyphs for VirtualThumbstick
