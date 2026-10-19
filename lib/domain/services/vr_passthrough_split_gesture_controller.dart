@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import '../../utils/constants/vr_joystick_constants.dart';
 import '../../utils/enums/vr_passthrough_split_gesture_mode.dart';
+import '../../utils/enums/vr_passthrough_visual_style.dart';
 import '../models/vr_thumb_pointer_track.dart';
 
 /// Recognizes the dual-thumb center-to-lateral ("curtain split") shortcut on
@@ -9,15 +10,22 @@ import '../models/vr_thumb_pointer_track.dart';
 ///
 /// 1. **Tap Center with Both Thumbs:** Both thumbs touch near the horizontal
 ///    center of the controller (`normX` in `[0.28, 0.72]`) within `320 ms`.
-/// 2. **Fast Outward Slide (`fastToggleSwipe`):** Rapidly sliding the left thumb
+/// 2. **Double-Tap Center (`sonarEcholocationPulse`):** Tapping the center twice
+///    rapidly with both thumbs emits a `1.2s` 3D sonar echolocation wave that
+///    sweeps `0% -> 100% -> 0%` across the room's AI wireframe contours.
+/// 3. **Fast Outward Slide (`fastToggleSwipe`):** Rapidly sliding the left thumb
 ///    left and the right thumb right toggles Passthrough (`0% <-> 100%`).
-/// 3. **Slow Outward Slide (`slowMixBlend`):** Sliding slowly lets the user
+/// 4. **Slow Outward Slide (`slowMixBlend`):** Sliding slowly lets the user
 ///    blend Passthrough and the virtual world at any percentage (`0% .. 100%`),
-///    latching the chosen mix when the thumbs are lifted.
-/// 4. **Ultra-Slow Full Traversal (`ultraSlowCycleZeroToHundredToZero`):**
+///    latching the chosen mix and curtain aperture (`curtainLeftNormX .. curtainRightNormX`).
+/// 5. **Ultra-Slow Full Traversal (`ultraSlowCycleZeroToHundredToZero`):**
 ///    Sliding even slower across the lateral span sweeps the mix smoothly
 ///    through `0% -> 100% -> 0%` (center = `0%`, mid-lateral = `100%`, outer
 ///    edges = `0%`).
+/// 6. **Vertical Thumb Modulation (`visualStyle`):**
+///    - Sliding along the upper band (`normY < 0.35`) selects `fullCameraFeed`.
+///    - Sliding along the middle band (`0.35 <= normY <= 0.65`) selects `hybridCameraAndWireframe`.
+///    - Sliding along the lower band (`normY > 0.65`) selects `aiWireframeOnly`.
 class VrPassthroughSplitGestureController {
   VrPassthroughSplitGestureController({
     this.centerMinNormX = VrJoystickConstants.passthroughCenterMinNormX,
@@ -50,12 +58,21 @@ class VrPassthroughSplitGestureController {
   double _lastSpread = 0.0;
   double _smoothedSpreadSpeedPerSec = 0.0;
   double _peakSpread = 0.0;
+  int? _lastCenterShortTapReleaseUs;
+  int? _sonarPulseStartUs;
 
   VrPassthroughSplitGestureMode _mode = VrPassthroughSplitGestureMode.idle;
+  VrPassthroughVisualStyle _visualStyle =
+      VrPassthroughVisualStyle.hybridCameraAndWireframe;
   double _passthroughMix = 0.0;
+  double _curtainLeftNormX = 0.0;
+  double _curtainRightNormX = 1.0;
 
   /// Current gesture recognition mode.
   VrPassthroughSplitGestureMode get mode => _mode;
+
+  /// Active visual style selected by vertical thumb band or double-tap sonar.
+  VrPassthroughVisualStyle get visualStyle => _visualStyle;
 
   /// Whether a dual-thumb center split gesture is currently in progress.
   bool get isGestureActive => _mode != VrPassthroughSplitGestureMode.idle;
@@ -64,8 +81,18 @@ class VrPassthroughSplitGestureController {
   /// passthrough / AI wireframe).
   double get passthroughMix => _passthroughMix;
 
-  /// Convenience getter (`true` when [passthroughMix] > `0.01`).
-  bool get passthroughActive => _passthroughMix > 0.01;
+  /// Convenience getter (`true` when [passthroughMix] > `0.01` or sonar pulse active).
+  bool get passthroughActive =>
+      _passthroughMix > 0.01 || _sonarPulseStartUs != null;
+
+  /// Normalized left edge (`0.0 .. 0.5`) of the spatial passthrough curtain.
+  double get curtainLeftNormX => _curtainLeftNormX;
+
+  /// Normalized right edge (`0.5 .. 1.0`) of the spatial passthrough curtain.
+  double get curtainRightNormX => _curtainRightNormX;
+
+  /// Whether a 3D echolocation sonar pulse is currently expanding.
+  bool get isSonarPulseActive => _sonarPulseStartUs != null;
 
   /// Current normalized lateral spread (`0.0 .. 1.0`) between the two thumbs.
   double get currentSpread => _lastSpread;
@@ -81,6 +108,37 @@ class VrPassthroughSplitGestureController {
   /// Directly sets or resets the latched passthrough mix (`0.0 .. 1.0`).
   void setPassthroughMix(double value) {
     _passthroughMix = value.clamp(0.0, 1.0);
+    if (_passthroughMix <= 0.01) {
+      _curtainLeftNormX = 0.5;
+      _curtainRightNormX = 0.5;
+    } else {
+      _curtainLeftNormX = (0.5 - _passthroughMix * 0.5).clamp(0.0, 0.5);
+      _curtainRightNormX = (0.5 + _passthroughMix * 0.5).clamp(0.5, 1.0);
+    }
+  }
+
+  /// Evaluates the expanding 3D sonar pulse (`0.0 .. 1.0` progress) at [timestampUs],
+  /// automatically updating [passthroughMix] along a `0% -> 100% -> 0%` envelope.
+  double evaluateSonarPulseProgress(int timestampUs) {
+    final startUs = _sonarPulseStartUs;
+    if (startUs == null) return 0.0;
+    final elapsedUs = timestampUs - startUs;
+    if (elapsedUs <= 0) return 0.0;
+    if (elapsedUs >= VrJoystickConstants.passthroughSonarPulseDurationUs) {
+      _sonarPulseStartUs = null;
+      _passthroughMix = 0.0;
+      return 0.0;
+    }
+    final progress =
+        (elapsedUs / VrJoystickConstants.passthroughSonarPulseDurationUs).clamp(
+          0.0,
+          1.0,
+        );
+    // Smooth sin(pi * progress) envelope: 0% -> 100% -> 0%
+    _passthroughMix = math.sin(math.pi * progress).clamp(0.0, 1.0);
+    _curtainLeftNormX = (0.5 - progress * 0.5).clamp(0.0, 0.5);
+    _curtainRightNormX = (0.5 + progress * 0.5).clamp(0.5, 1.0);
+    return progress;
   }
 
   /// Resets active pointer tracking without clearing the latched [passthroughMix].
@@ -115,7 +173,6 @@ class VrPassthroughSplitGestureController {
       return false;
     }
 
-    // Look for two pointers that started inside the central zone within thumbSyncWindowUs.
     final centerCandidates = _pointers.values.where((p) {
       return p.startNormX >= centerMinNormX &&
           p.startNormX <= centerMaxNormX &&
@@ -168,8 +225,6 @@ class VrPassthroughSplitGestureController {
     final right = _pointers[_rightPointerId];
     if (left == null || right == null) return false;
 
-    // Ensure left thumb stays to the left of right thumb and neither crosses
-    // significantly inward past its initial center tap point.
     final leftMovedLeft =
         left.currentNormX <=
         left.startNormX + VrJoystickConstants.passthroughDirectionToleranceNorm;
@@ -179,6 +234,17 @@ class VrPassthroughSplitGestureController {
             VrJoystickConstants.passthroughDirectionToleranceNorm;
     if (!leftMovedLeft || !rightMovedRight) {
       return false;
+    }
+
+    // Update vertical style from average thumb Y coordinate
+    final meanNormY = (left.currentNormY + right.currentNormY) * 0.5;
+    if (meanNormY < VrJoystickConstants.passthroughUpperCameraBandMaxNormY) {
+      _visualStyle = VrPassthroughVisualStyle.fullCameraFeed;
+    } else if (meanNormY >
+        VrJoystickConstants.passthroughLowerWireframeBandMinNormY) {
+      _visualStyle = VrPassthroughVisualStyle.aiWireframeOnly;
+    } else {
+      _visualStyle = VrPassthroughVisualStyle.hybridCameraAndWireframe;
     }
 
     final currentSpan = math.max(0.0, right.currentNormX - left.currentNormX);
@@ -203,6 +269,9 @@ class VrPassthroughSplitGestureController {
       _peakSpread = spread;
     }
 
+    _curtainLeftNormX = left.currentNormX.clamp(0.0, 0.5);
+    _curtainRightNormX = right.currentNormX.clamp(0.5, 1.0);
+
     if (spread < VrJoystickConstants.passthroughMinActivationSpread &&
         _mode == VrPassthroughSplitGestureMode.armedCenterTap) {
       return false;
@@ -212,14 +281,13 @@ class VrPassthroughSplitGestureController {
     final elapsedSec = elapsedUs / 1000000.0;
     final averageOutwardSpeed = _peakSpread / elapsedSec;
 
-    // Classify the gesture speed regime:
     if (elapsedUs <= fastSwipeMaxDurationUs &&
         (averageOutwardSpeed >= fastSwipeMinSpeedPerSec ||
             _smoothedSpreadSpeedPerSec >= fastSwipeMinSpeedPerSec) &&
         spread >= VrJoystickConstants.passthroughFastSwipeMinSpread) {
       _mode = VrPassthroughSplitGestureMode.fastToggleSwipe;
       final targetToggle = _baselineMixAtGestureStart >= 0.5 ? 0.0 : 1.0;
-      _passthroughMix = targetToggle;
+      setPassthroughMix(targetToggle);
       return true;
     }
 
@@ -228,8 +296,6 @@ class VrPassthroughSplitGestureController {
             _smoothedSpreadSpeedPerSec <= ultraSlowMaxSpeedPerSec * 1.25)) {
       _mode =
           VrPassthroughSplitGestureMode.ultraSlowCycleZeroToHundredToZero;
-      // Continuous 0% -> 100% -> 0% triangle wave over spread [0.0 .. 1.0]:
-      // spread = 0.0 -> 0%, spread = 0.5 -> 100%, spread = 1.0 -> 0%.
       final cycleMix = (1.0 - (2.0 * spread - 1.0).abs()).clamp(0.0, 1.0);
       _passthroughMix = cycleMix;
       return true;
@@ -240,8 +306,8 @@ class VrPassthroughSplitGestureController {
     return true;
   }
 
-  /// Processes pointer release/cancel. Latches the final [passthroughMix] and
-  /// returns `true` if a passthrough gesture was active.
+  /// Processes pointer release/cancel. Latches the final [passthroughMix] or
+  /// triggers a 3D Sonar Pulse on dual-thumb center double-tap.
   bool onPointerUpOrCancel({
     required int pointerId,
     required int timestampUs,
@@ -253,11 +319,30 @@ class VrPassthroughSplitGestureController {
 
     final wasActive = _mode != VrPassthroughSplitGestureMode.idle;
     final elapsedUs = math.max(1, timestampUs - _gestureStartUs);
-    if (_mode == VrPassthroughSplitGestureMode.fastToggleSwipe ||
+
+    // Check for Dual-Thumb Center Double-Tap (two quick taps in center with minimal spread)
+    if (_mode == VrPassthroughSplitGestureMode.armedCenterTap &&
+        _peakSpread < VrJoystickConstants.passthroughMinActivationSpread &&
+        elapsedUs <= VrJoystickConstants.passthroughDoubleTapMaxTapDurationUs) {
+      final prevReleaseUs = _lastCenterShortTapReleaseUs;
+      if (prevReleaseUs != null &&
+          (timestampUs - prevReleaseUs) <=
+              VrJoystickConstants.passthroughDoubleTapMaxIntervalUs) {
+        _lastCenterShortTapReleaseUs = null;
+        _sonarPulseStartUs = timestampUs;
+        _visualStyle = VrPassthroughVisualStyle.sonarEcholocationPulse;
+        _passthroughMix = 0.50;
+        _curtainLeftNormX = 0.0;
+        _curtainRightNormX = 1.0;
+      } else {
+        _lastCenterShortTapReleaseUs = timestampUs;
+      }
+    } else if (_mode == VrPassthroughSplitGestureMode.fastToggleSwipe ||
         (_mode != VrPassthroughSplitGestureMode.idle &&
             elapsedUs <= fastSwipeMaxDurationUs &&
             _peakSpread >= VrJoystickConstants.passthroughFastSwipeMinSpread)) {
-      _passthroughMix = _baselineMixAtGestureStart >= 0.5 ? 0.0 : 1.0;
+      final targetToggle = _baselineMixAtGestureStart >= 0.5 ? 0.0 : 1.0;
+      setPassthroughMix(targetToggle);
     }
 
     _leftPointerId = null;

@@ -55,3 +55,4 @@ export 'utils/enums/vr_joystick_control.dart';
 export 'utils/enums/vr_motion_capability.dart';
 export 'utils/enums/vr_pairing_camera_error.dart';
 export 'utils/enums/vr_passthrough_split_gesture_mode.dart';
+export 'utils/enums/vr_passthrough_visual_style.dart';

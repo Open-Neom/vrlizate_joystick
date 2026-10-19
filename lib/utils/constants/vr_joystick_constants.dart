@@ -153,6 +153,15 @@ abstract final class VrJoystickConstants {
   static const double passthroughUltraSlowMaxSpeedPerSec = 0.55;
   static const int passthroughUltraSlowMinDurationUs = 850000;
   static const double passthroughDirectionToleranceNorm = 0.04;
+  static const double passthroughUpperCameraBandMaxNormY = 0.35;
+  static const double passthroughLowerWireframeBandMinNormY = 0.65;
+  static const int passthroughDoubleTapMaxTapDurationUs = 260000;
+  static const int passthroughDoubleTapMaxIntervalUs = 450000;
+  static const int passthroughSonarPulseDurationUs = 1200000;
+  static const String fieldPassthroughStyle = 'passthroughStyle';
+  static const String fieldPassthroughSonarPulse = 'passthroughSonarPulse';
+  static const String fieldPassthroughCurtainLeft = 'passthroughCurtainLeft';
+  static const String fieldPassthroughCurtainRight = 'passthroughCurtainRight';
   static const String keyPassthroughCurtainOverlay =
       'passthrough_curtain_overlay';
 

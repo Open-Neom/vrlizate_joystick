@@ -190,5 +190,107 @@ void main() {
       expect(controller.passthroughMix, closeTo(0.0, 0.02));
       expect(controller.passthroughActive, isFalse);
     });
+
+    test('vertical thumb band selects fullCameraFeed, hybrid, or aiWireframeOnly', () {
+      final controller = VrPassthroughSplitGestureController();
+
+      // Upper band (normY = 0.20 < 0.35) -> fullCameraFeed
+      controller.onPointerDown(
+        pointerId: 1,
+        normX: 0.45,
+        normY: 0.20,
+        timestampUs: 0,
+      );
+      controller.onPointerDown(
+        pointerId: 2,
+        normX: 0.55,
+        normY: 0.20,
+        timestampUs: 10000,
+      );
+      controller.onPointerMove(
+        pointerId: 1,
+        normX: 0.25,
+        normY: 0.20,
+        timestampUs: 500000,
+      );
+      controller.onPointerMove(
+        pointerId: 2,
+        normX: 0.75,
+        normY: 0.20,
+        timestampUs: 510000,
+      );
+      expect(controller.visualStyle, VrPassthroughVisualStyle.fullCameraFeed);
+      expect(controller.curtainLeftNormX, closeTo(0.25, 1e-4));
+      expect(controller.curtainRightNormX, closeTo(0.75, 1e-4));
+
+      // Lower band (normY = 0.80 > 0.65) -> aiWireframeOnly
+      controller.onPointerMove(
+        pointerId: 1,
+        normX: 0.20,
+        normY: 0.80,
+        timestampUs: 700000,
+      );
+      controller.onPointerMove(
+        pointerId: 2,
+        normX: 0.80,
+        normY: 0.80,
+        timestampUs: 710000,
+      );
+      expect(controller.visualStyle, VrPassthroughVisualStyle.aiWireframeOnly);
+    });
+
+    test('dual-thumb center double-tap triggers 3D echolocation sonar pulse', () {
+      final controller = VrPassthroughSplitGestureController();
+
+      // First short dual-thumb tap in center
+      controller.onPointerDown(
+        pointerId: 1,
+        normX: 0.47,
+        normY: 0.50,
+        timestampUs: 0,
+      );
+      controller.onPointerDown(
+        pointerId: 2,
+        normX: 0.53,
+        normY: 0.50,
+        timestampUs: 10000,
+      );
+      controller.onPointerUpOrCancel(pointerId: 1, timestampUs: 90000);
+      controller.onPointerUpOrCancel(pointerId: 2, timestampUs: 95000);
+      expect(controller.isSonarPulseActive, isFalse);
+
+      // Second short dual-thumb tap in center within 450 ms
+      controller.onPointerDown(
+        pointerId: 3,
+        normX: 0.47,
+        normY: 0.50,
+        timestampUs: 220000,
+      );
+      controller.onPointerDown(
+        pointerId: 4,
+        normX: 0.53,
+        normY: 0.50,
+        timestampUs: 230000,
+      );
+      controller.onPointerUpOrCancel(pointerId: 3, timestampUs: 310000);
+      controller.onPointerUpOrCancel(pointerId: 4, timestampUs: 315000);
+
+      expect(controller.isSonarPulseActive, isTrue);
+      expect(
+        controller.visualStyle,
+        VrPassthroughVisualStyle.sonarEcholocationPulse,
+      );
+
+      // Halfway through 1.2s sonar pulse (t = 310ms + 600ms = 910,000 us) -> 100% envelope peak
+      final midProgress = controller.evaluateSonarPulseProgress(910000);
+      expect(midProgress, closeTo(0.50, 0.02));
+      expect(controller.passthroughMix, closeTo(1.0, 0.02));
+
+      // After 1.2s -> automatically returns to 0%
+      final endProgress = controller.evaluateSonarPulseProgress(1600000);
+      expect(endProgress, 0.0);
+      expect(controller.passthroughMix, 0.0);
+      expect(controller.isSonarPulseActive, isFalse);
+    });
   });
 }
