@@ -407,4 +407,19 @@ abstract final class VrJoystickTranslationConstants {
   static const String passthroughPercentSuffix = '%';
   static const String passthroughCenterArmedHint =
       'DESLIZA PULGARES A LOS LADOS · RÁPIDO: ON/OFF · LENTO: MIX 0→100→0%';
+  static const String breakthroughBarIdleLabel =
+      '◀ ● ● BREAKTHROUGH (DESLIZA) ▶';
+  static const String breakthroughBarActivePrefix = '◀ BREAKTHROUGH ';
+  static const String breakthroughBarActiveSuffix = '% ▶';
+  static const String spatialHudButtonLabel = '3 CÁM';
+  static const String settingsBreakthroughTitle =
+      'Cortina Breakthrough / Passthrough (0% → 100%)';
+  static const String settingsBreakthroughSubtitle =
+      'Toca el centro con 2 pulgares y desliza hacia los lados, o usa la barra central.';
+  static const String settingsSpatialHudTitle =
+      'Mostrar HUD de 3 Cámaras y Cálculos en Visor';
+  static const String settingsSpatialHudSubtitle =
+      'Muestra en el visor la sincronización de las 3 cámaras y telemetría espacial en vivo.';
+  static const String childRoleSyncingBannerTitle =
+      'SINCRONIZANDO CON EL VISOR VR · ABRIENDO HOME 3D…';
 }

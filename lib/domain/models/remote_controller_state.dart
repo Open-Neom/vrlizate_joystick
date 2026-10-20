@@ -62,6 +62,20 @@ class RemoteControllerState {
   final bool searchSubmitted;
   final double passthroughMix;
   final bool passthroughActive;
+  final bool spatialHudVisible;
+  final double? leftFootU;
+  final double? leftFootV;
+  final double? rightFootU;
+  final double? rightFootV;
+  final double? feetConfidence;
+  final double? handU;
+  final double? handV;
+  final double? handConfidence;
+  final double? visorU;
+  final double? visorV;
+  final double? visorWidth;
+  final String? joystickCameraRole;
+  final String? joystickMiniFrame;
   final RemoteControllerMode mode;
   final DateTime timestamp;
 
@@ -104,6 +118,20 @@ class RemoteControllerState {
     this.searchSubmitted = false,
     this.passthroughMix = 0.0,
     bool? passthroughActive,
+    this.spatialHudVisible = false,
+    this.leftFootU,
+    this.leftFootV,
+    this.rightFootU,
+    this.rightFootV,
+    this.feetConfidence,
+    this.handU,
+    this.handV,
+    this.handConfidence,
+    this.visorU,
+    this.visorV,
+    this.visorWidth,
+    this.joystickCameraRole,
+    this.joystickMiniFrame,
     this.mode = RemoteControllerMode.joystick,
     DateTime? timestamp,
   }) : turnRate = lookX ?? turnRate,
@@ -120,5 +148,5 @@ class RemoteControllerState {
       'RemoteControllerState(mode: ${mode.name}, stick: ($stickX, $stickY), '
       'turn: $turnRate, pitch: $pitchRate, laser: ($laserX, $laserY), slide: $laserSlideActive, recenter: $recenter, range: $rangeMeters, '
       'btnA: $btnA, btnB: $btnB, btnX: $btnX, btnY: $btnY, btnL: $btnL, btnR: $btnR, trigger: $isTriggerPressed, grip: $btnGrip, '
-      'searchQuery: $searchQuery, searchSubmitted: $searchSubmitted, passthroughMix: $passthroughMix, passthroughActive: $passthroughActive)';
+      'searchQuery: $searchQuery, searchSubmitted: $searchSubmitted, passthroughMix: $passthroughMix, passthroughActive: $passthroughActive, spatialHudVisible: $spatialHudVisible)';
 }

@@ -21,6 +21,7 @@ import '../domain/services/vr_controller_link.dart';
 import '../domain/services/vr_controller_mode_session.dart';
 import '../domain/services/vr_controller_shake_detector.dart';
 import '../domain/services/vr_controller_state_pacer.dart';
+import '../domain/services/vr_joystick_camera_vision_service.dart';
 import '../domain/services/vr_laser_steady_dwell_controller.dart';
 import '../domain/services/vr_motion_look_controller.dart';
 import '../domain/services/vr_one_handed_laser_detector.dart';
@@ -35,6 +36,7 @@ import '../utils/enums/vr_joystick_control.dart';
 import '../utils/enums/vr_motion_capability.dart';
 import 'nes_controller_layout.dart';
 import 'virtual_thumbstick.dart';
+import 'vr_breakthrough_curtain_bar.dart';
 import 'vr_controller_region.dart';
 import 'vr_driving_wheel_painter.dart';
 import 'vr_laser_pointing_view.dart';
@@ -264,7 +266,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   final _oneHandedLaserDetector = VrOneHandedLaserDetector();
   final _laserSteadyDwell = VrLaserSteadyDwellController();
   final _passthroughGesture = VrPassthroughSplitGestureController();
+  final _visionService = VrJoystickCameraVisionService();
+  int _lastVisionTelemetryUs = 0;
   int _lastPassthroughHapticBucket = 0;
+  bool _spatialHudVisible = false;
+  double _lastSentPassthroughMix = 0.0;
+  bool _lastSentSpatialHudVisible = false;
   final TextEditingController _wordsphereTextController =
       TextEditingController();
   late final WordsphereController _wordsphereController = WordsphereController(
@@ -332,6 +339,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
     _startGyroTracking();
     _startShakeDetection();
+    _visionService.addListener(_onVisionServiceUpdated);
+    unawaited(_visionService.start());
 
     // Lock to horizontal (landscape) mode for ergonomic dual-hand controller gameplay
     SystemChrome.setPreferredOrientations([
@@ -431,6 +440,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 event.z,
                 nowUs,
               );
+              _visionService.updateImuGravity(event.x, event.y, event.z);
               if (!_settingsOpen && !_castDialogOpen) {
                 final sensorTimeUs = event.timestamp.microsecondsSinceEpoch;
                 final effectiveUs = sensorTimeUs > 0 ? sensorTimeUs : nowUs;
@@ -770,6 +780,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         }
       }
       _lastDrivingTickUs = now;
+      _visionService.tick();
+      _sendVisionTelemetryMessageIfDue(now);
       _sendState();
     });
   }
@@ -1720,11 +1732,105 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
   }
 
+  void _setBreakthroughMix(double mix) {
+    final clamped = mix.clamp(0.0, 1.0);
+    setState(() {
+      _passthroughGesture.setPassthroughMix(clamped);
+    });
+    final bucket = (clamped * 4).round();
+    if (bucket != _lastPassthroughHapticBucket) {
+      _lastPassthroughHapticBucket = bucket;
+      _hapticClick();
+    }
+    _sendPassthroughControlMessage(force: true);
+    _sendState();
+  }
+
+  void _toggleBreakthroughMix() {
+    final current = _passthroughGesture.passthroughMix;
+    final next = current < 0.25
+        ? 0.65
+        : (current < 0.85 ? 1.0 : 0.0);
+    setState(() {
+      _passthroughGesture.setPassthroughMix(next);
+    });
+    _hapticMedium();
+    _sendPassthroughControlMessage(force: true);
+    _sendState(force: true);
+  }
+
+  void _toggleSpatialHud([bool? value]) {
+    setState(() {
+      _spatialHudVisible = value ?? !_spatialHudVisible;
+    });
+    _hapticClick();
+    _sendPassthroughControlMessage(force: true);
+    _sendState(force: true);
+  }
+
+  void _sendPassthroughControlMessage({bool force = false}) {
+    final ws = _socket;
+    if (ws == null || !ws.isOpen || !_isConnected) return;
+    final mix = _passthroughGesture.passthroughMix;
+    if (!force &&
+        (mix - _lastSentPassthroughMix).abs() < 0.015 &&
+        _spatialHudVisible == _lastSentSpatialHudVisible) {
+      return;
+    }
+    _lastSentPassthroughMix = mix;
+    _lastSentSpatialHudVisible = _spatialHudVisible;
+    final controlPayload = jsonEncode({
+      VrJoystickConstants.fieldType:
+          VrJoystickConstants.passthroughControlType,
+      VrJoystickConstants.fieldPassthroughMix: mix,
+      VrJoystickConstants.fieldPassthroughActive:
+          _passthroughGesture.passthroughActive,
+      VrJoystickConstants.fieldSpatialHudVisible: _spatialHudVisible,
+    });
+    try {
+      ws.add(controlPayload);
+    } catch (_) {
+      _onDisconnected(ws);
+    }
+  }
+
+  void _onVisionServiceUpdated() {
+    if (!mounted || !_isForeground || !_isConnected) return;
+    _sendVisionTelemetryMessageIfDue(_controllerClock.elapsedMicroseconds);
+  }
+
+  void _sendVisionTelemetryMessageIfDue(int nowUs) {
+    final ws = _socket;
+    if (ws == null || !ws.isOpen || !_isConnected || !_isForeground) return;
+    final minIntervalUs = _showsBluetooth ? 650000 : 340000;
+    if (nowUs - _lastVisionTelemetryUs < minIntervalUs) return;
+    final payloadMap = _visionService.buildVisionTelemetryPayload(
+      includeMiniFrame: !_showsBluetooth,
+    );
+    if (payloadMap == null) return;
+    _lastVisionTelemetryUs = nowUs;
+    try {
+      ws.add(jsonEncode(payloadMap));
+    } catch (_) {
+      _onDisconnected(ws);
+    }
+  }
+
   void _sendState({bool force = false}) {
     final ws = _socket;
     if (ws != null && ws.isOpen && _isConnected && (_isForeground || force)) {
+      _sendPassthroughControlMessage();
       final driving = _steering.state;
       final isDriving = _activeMode == RemoteControllerMode.driving;
+      final isLaserOverBle =
+          _showsBluetooth && _activeMode == RemoteControllerMode.laser;
+      final wireModeName = isLaserOverBle
+          ? RemoteControllerMode.joystick.name
+          : _activeMode.name;
+      final liveRangeMeters =
+          (_visionService.isCameraStreaming || _visionService.ultrasonicActive)
+          ? _visionService.currentRangeMeters
+          : 0.55;
       final state = <String, Object?>{
         VrJoystickConstants.fieldHostModeRevision: _hostModeSession.revision,
         VrJoystickConstants.fieldQx: _orientation.x,
@@ -1748,12 +1854,13 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         VrJoystickConstants.fieldLookPitch: isDriving ? 0.0 : _lookY,
         VrJoystickConstants.fieldLaserX: _laserStickX,
         VrJoystickConstants.fieldLaserY: _laserStickY,
-        VrJoystickConstants.fieldLaserSlideActive: _isLaserSlideActive,
+        VrJoystickConstants.fieldLaserSlideActive:
+            _isLaserSlideActive || isLaserOverBle,
         VrJoystickConstants.fieldAimX: _laserStickX,
         VrJoystickConstants.fieldAimY: _laserStickY,
         VrJoystickConstants.fieldRecenter: _recenterTriggered,
         VrJoystickConstants.fieldControllerVisible: _controllerVisible,
-        VrJoystickConstants.fieldRangeMeters: 0.55,
+        VrJoystickConstants.fieldRangeMeters: liveRangeMeters,
         VrJoystickConstants.fieldTrigger:
             _triggerActive || (!isDriving && _btnRActive),
         VrJoystickConstants.fieldAction: _actionActive || _btnBActive,
@@ -1764,7 +1871,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         VrJoystickConstants.fieldBtnL: _btnLActive,
         VrJoystickConstants.fieldBtnR: _btnRActive,
         VrJoystickConstants.fieldBtnGrip: _btnGripActive,
-        VrJoystickConstants.fieldMode: _activeMode.name,
+        VrJoystickConstants.fieldMode: wireModeName,
         VrJoystickConstants.fieldSteering:
             _activeMode == RemoteControllerMode.driving
             ? driving.steering
@@ -1789,6 +1896,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             _passthroughGesture.passthroughMix,
         VrJoystickConstants.fieldPassthroughActive:
             _passthroughGesture.passthroughActive,
+        VrJoystickConstants.fieldSpatialHudVisible: _spatialHudVisible,
       };
       if (!_statePacer.shouldSend(
         state,
@@ -1883,6 +1991,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _laserClickPulseTimer?.cancel();
     _searchSubmitPulseTimer?.cancel();
     _gripHoldTimer?.cancel();
+    _visionService.removeListener(_onVisionServiceUpdated);
+    _visionService.dispose();
     final socket = _socket;
     _socket = null;
     _linkSubscription?.cancel();
@@ -2340,6 +2450,93 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                           }
                         },
                       ),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        value: _spatialHudVisible,
+                        activeThumbColor: const Color(0xFF10B981),
+                        title: const Text(
+                          VrJoystickTranslationConstants
+                              .settingsSpatialHudTitle,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        subtitle: const Text(
+                          VrJoystickTranslationConstants
+                              .settingsSpatialHudSubtitle,
+                          style: TextStyle(color: Colors.white60, fontSize: 10),
+                        ),
+                        onChanged: (val) {
+                          _toggleSpatialHud(val);
+                          setModalState(() {});
+                        },
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF080816),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: _passthroughGesture.passthroughActive
+                                ? const Color(0xFF00E5FF)
+                                : Colors.white12,
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                const Expanded(
+                                  child: Text(
+                                    VrJoystickTranslationConstants
+                                        .settingsBreakthroughTitle,
+                                    style: TextStyle(
+                                      color: Color(0xFF00E5FF),
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                                Text(
+                                  '${(_passthroughGesture.passthroughMix * 100).round()}${VrJoystickTranslationConstants.passthroughPercentSuffix}',
+                                  style: const TextStyle(
+                                    color: Color(0xFF10B981),
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 2),
+                            const Text(
+                              VrJoystickTranslationConstants
+                                  .settingsBreakthroughSubtitle,
+                              style: TextStyle(
+                                color: Colors.white60,
+                                fontSize: 9.5,
+                              ),
+                            ),
+                            Slider(
+                              value: _passthroughGesture.passthroughMix,
+                              min: 0.0,
+                              max: 1.0,
+                              activeColor: const Color(0xFF00E5FF),
+                              inactiveColor: Colors.white24,
+                              onChanged: (val) {
+                                _setBreakthroughMix(val);
+                                setModalState(() {});
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
                       const SizedBox(height: 6),
                       OutlinedButton.icon(
                         onPressed: () {
@@ -2588,19 +2785,34 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   Widget _buildChildRoleBanner() {
+    final syncing = _isConnecting && !_isConnected;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      padding: EdgeInsets.symmetric(
+        horizontal: 8,
+        vertical: syncing ? 5 : 3,
+      ),
       decoration: BoxDecoration(
-        color: const Color(0xFF00E5FF).withValues(alpha: .08),
+        color: const Color(0xFF00E5FF).withValues(alpha: syncing ? 0.20 : 0.08),
         borderRadius: BorderRadius.circular(8),
+        border: syncing
+            ? Border.all(
+                color: const Color(0xFF00E5FF).withValues(alpha: 0.65),
+              )
+            : null,
       ),
       child: Row(
         children: [
-          const Icon(Icons.link_rounded, color: Color(0xFF00E5FF), size: 14),
+          Icon(
+            syncing ? Icons.sync_rounded : Icons.link_rounded,
+            color: const Color(0xFF00E5FF),
+            size: 14,
+          ),
           const SizedBox(width: 6),
-          const Text(
-            VrJoystickTranslationConstants.childRoleBannerTitle,
-            style: TextStyle(
+          Text(
+            syncing
+                ? VrJoystickTranslationConstants.childRoleSyncingBannerTitle
+                : VrJoystickTranslationConstants.childRoleBannerTitle,
+            style: const TextStyle(
               color: Color(0xFF00E5FF),
               fontSize: 9,
               fontWeight: FontWeight.bold,
@@ -3544,6 +3756,16 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 ),
               ),
             ),
+          if (constraints.maxHeight >= 112) ...[
+            VrBreakthroughCurtainBar(
+              passthroughMix: _passthroughGesture.passthroughMix,
+              spatialHudVisible: _spatialHudVisible,
+              onMixChanged: _setBreakthroughMix,
+              onToggleMix: _toggleBreakthroughMix,
+              onToggleSpatialHud: () => _toggleSpatialHud(),
+            ),
+            const SizedBox(height: 4),
+          ],
           SizedBox(
             height: math.min(44, constraints.maxHeight),
             child: Row(

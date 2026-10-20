@@ -216,6 +216,33 @@ class VrPassthroughSplitGestureController {
     track.currentNormY = normY.clamp(0.0, 1.0);
     track.lastUpdateTimestampUs = timestampUs;
 
+    if (_mode == VrPassthroughSplitGestureMode.idle && _pointers.length >= 2) {
+      final centerCandidates = _pointers.values.where((p) {
+        return p.startNormX >= centerMinNormX && p.startNormX <= centerMaxNormX;
+      }).toList();
+      if (centerCandidates.length >= 2) {
+        centerCandidates.sort((a, b) => a.currentNormX.compareTo(b.currentNormX));
+        final leftCand = centerCandidates.first;
+        final rightCand = centerCandidates.last;
+        final startSpan = (rightCand.startNormX - leftCand.startNormX).abs();
+        final curSpan = (rightCand.currentNormX - leftCand.currentNormX).abs();
+        if (startSpan <= maxInitialThumbSpan &&
+            curSpan > startSpan + 0.02 &&
+            leftCand.currentNormX <= leftCand.startNormX + 0.02 &&
+            rightCand.currentNormX >= rightCand.startNormX - 0.02) {
+          _leftPointerId = leftCand.pointerId;
+          _rightPointerId = rightCand.pointerId;
+          _gestureStartUs = timestampUs;
+          _initialSpan = startSpan;
+          _baselineMixAtGestureStart = _passthroughMix;
+          _lastSpread = 0.0;
+          _peakSpread = 0.0;
+          _smoothedSpreadSpeedPerSec = 0.0;
+          _mode = VrPassthroughSplitGestureMode.armedCenterTap;
+        }
+      }
+    }
+
     if (_mode == VrPassthroughSplitGestureMode.idle) return false;
     if (pointerId != _leftPointerId && pointerId != _rightPointerId) {
       return false;

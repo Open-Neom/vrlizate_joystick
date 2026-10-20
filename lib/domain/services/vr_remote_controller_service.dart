@@ -677,6 +677,29 @@ class VrRemoteControllerService {
             return;
           }
           final json = decoded;
+          if (json[VrJoystickConstants.fieldType] ==
+              VrJoystickConstants.passthroughControlType) {
+            final rawMix = json[VrJoystickConstants.fieldPassthroughMix];
+            if (rawMix is num && rawMix.isFinite) {
+              _latchedPassthroughMix = rawMix.toDouble().clamp(0.0, 1.0);
+            }
+            final rawActive = json[VrJoystickConstants.fieldPassthroughActive];
+            _latchedPassthroughActive = rawActive is bool
+                ? rawActive
+                : (_latchedPassthroughMix > 0.01);
+            final rawHud = json[VrJoystickConstants.fieldSpatialHudVisible];
+            if (rawHud is bool) {
+              _latchedSpatialHudVisible = rawHud;
+            }
+            _emitWithLatchedPassthrough();
+            return;
+          }
+          if (json[VrJoystickConstants.fieldType] ==
+              VrJoystickConstants.visionTelemetryMessageType) {
+            _ingestVisionTelemetry(json);
+            _emitWithLatchedPassthrough();
+            return;
+          }
           final sequence = _optionalCounter(
             json,
             VrJoystickConstants.fieldSequence,
@@ -833,14 +856,23 @@ class VrRemoteControllerService {
               : null;
           final bool searchSubmitted =
               json[VrJoystickConstants.fieldSearchSubmitted] == true;
-          final double passthroughMix =
-              ((json[VrJoystickConstants.fieldPassthroughMix] as num?)
-                      ?.toDouble() ??
-                  0.0)
-                  .clamp(0.0, 1.0);
-          final bool passthroughActive =
-              (json[VrJoystickConstants.fieldPassthroughActive] as bool?) ??
-              (passthroughMix > 0.01);
+          if (json.containsKey(VrJoystickConstants.fieldPassthroughMix)) {
+            _latchedPassthroughMix =
+                ((json[VrJoystickConstants.fieldPassthroughMix] as num?)
+                        ?.toDouble() ??
+                    0.0)
+                    .clamp(0.0, 1.0);
+          }
+          if (json.containsKey(VrJoystickConstants.fieldPassthroughActive)) {
+            _latchedPassthroughActive =
+                json[VrJoystickConstants.fieldPassthroughActive] == true;
+          } else {
+            _latchedPassthroughActive = _latchedPassthroughMix > 0.01;
+          }
+          if (json.containsKey(VrJoystickConstants.fieldSpatialHudVisible)) {
+            _latchedSpatialHudVisible =
+                json[VrJoystickConstants.fieldSpatialHudVisible] == true;
+          }
 
           _latestState = RemoteControllerState(
             orientation: _predictedOrientation.clone(),
@@ -879,11 +911,25 @@ class VrRemoteControllerService {
             drivingPaused: drivingPaused,
             motionAvailable:
                 json[VrJoystickConstants.fieldMotionAvailable] == true,
-            rangeMeters: rangeMeters,
+            rangeMeters: rangeMeters ?? _latchedRangeMeters,
             searchQuery: searchQuery,
             searchSubmitted: searchSubmitted,
-            passthroughMix: passthroughMix,
-            passthroughActive: passthroughActive,
+            passthroughMix: _latchedPassthroughMix,
+            passthroughActive: _latchedPassthroughActive,
+            spatialHudVisible: _latchedSpatialHudVisible,
+            leftFootU: _latchedLeftFootU,
+            leftFootV: _latchedLeftFootV,
+            rightFootU: _latchedRightFootU,
+            rightFootV: _latchedRightFootV,
+            feetConfidence: _latchedFeetConfidence,
+            handU: _latchedHandU,
+            handV: _latchedHandV,
+            handConfidence: _latchedHandConfidence,
+            visorU: _latchedVisorU,
+            visorV: _latchedVisorV,
+            visorWidth: _latchedVisorWidth,
+            joystickCameraRole: _latchedJoystickCameraRole,
+            joystickMiniFrame: _latchedJoystickMiniFrame,
             mode: mode,
           );
 
@@ -904,6 +950,138 @@ class VrRemoteControllerService {
     _sendControllerMode();
     final preview = _castPreviewUri;
     if (preview != null) _sendCastPreview(_castPreviewMessage(preview));
+  }
+
+  double _latchedPassthroughMix = 0.0;
+  bool _latchedPassthroughActive = false;
+  bool _latchedSpatialHudVisible = false;
+  double? _latchedRangeMeters;
+  double? _latchedLeftFootU;
+  double? _latchedLeftFootV;
+  double? _latchedRightFootU;
+  double? _latchedRightFootV;
+  double? _latchedFeetConfidence;
+  double? _latchedHandU;
+  double? _latchedHandV;
+  double? _latchedHandConfidence;
+  double? _latchedVisorU;
+  double? _latchedVisorV;
+  double? _latchedVisorWidth;
+  String? _latchedJoystickCameraRole;
+  String? _latchedJoystickMiniFrame;
+
+  void _ingestVisionTelemetry(Map<String, dynamic> json) {
+    double? finiteNum(String key) {
+      final v = json[key];
+      return (v is num && v.isFinite) ? v.toDouble() : null;
+    }
+
+    _latchedRangeMeters =
+        finiteNum(VrJoystickConstants.fieldRangeMeters) ?? _latchedRangeMeters;
+    _latchedLeftFootU =
+        finiteNum(VrJoystickConstants.fieldLeftFootU) ?? _latchedLeftFootU;
+    _latchedLeftFootV =
+        finiteNum(VrJoystickConstants.fieldLeftFootV) ?? _latchedLeftFootV;
+    _latchedRightFootU =
+        finiteNum(VrJoystickConstants.fieldRightFootU) ?? _latchedRightFootU;
+    _latchedRightFootV =
+        finiteNum(VrJoystickConstants.fieldRightFootV) ?? _latchedRightFootV;
+    _latchedFeetConfidence =
+        finiteNum(VrJoystickConstants.fieldFeetConfidence) ??
+        _latchedFeetConfidence;
+    _latchedHandU = finiteNum(VrJoystickConstants.fieldHandU) ?? _latchedHandU;
+    _latchedHandV = finiteNum(VrJoystickConstants.fieldHandV) ?? _latchedHandV;
+    _latchedHandConfidence =
+        finiteNum(VrJoystickConstants.fieldHandConfidence) ??
+        _latchedHandConfidence;
+    _latchedVisorU =
+        finiteNum(VrJoystickConstants.fieldVisorU) ?? _latchedVisorU;
+    _latchedVisorV =
+        finiteNum(VrJoystickConstants.fieldVisorV) ?? _latchedVisorV;
+    _latchedVisorWidth =
+        finiteNum(VrJoystickConstants.fieldVisorWidth) ?? _latchedVisorWidth;
+    final role = json[VrJoystickConstants.fieldJoystickCameraRole];
+    if (role is String && role.isNotEmpty) {
+      _latchedJoystickCameraRole = role;
+    }
+    final frame = json[VrJoystickConstants.fieldJoystickMiniFrame];
+    if (frame is String && frame.isNotEmpty && frame.length <= 1600) {
+      _latchedJoystickMiniFrame = frame;
+    }
+  }
+
+  /// Directly updates the latched Breakthrough/Passthrough mix (`0.0 .. 1.0`)
+  /// on the Visor host and notifies listeners.
+  void setPassthroughMix(double mix) {
+    if (_disposed) return;
+    _latchedPassthroughMix = mix.clamp(0.0, 1.0);
+    _latchedPassthroughActive = _latchedPassthroughMix > 0.01;
+    _emitWithLatchedPassthrough();
+  }
+
+  /// Directly toggles the 3-Camera & Live Calculations HUD inside the Visor.
+  void setSpatialHudVisible(bool visible) {
+    if (_disposed) return;
+    _latchedSpatialHudVisible = visible;
+    _emitWithLatchedPassthrough();
+  }
+
+  void _emitWithLatchedPassthrough() {
+    final prev = _latestState;
+    _latestState = RemoteControllerState(
+      orientation: prev.orientation.clone(),
+      angularVelocity: prev.angularVelocity.clone(),
+      isTriggerPressed: prev.isTriggerPressed,
+      isActionPressed: prev.isActionPressed,
+      btnA: prev.btnA,
+      btnB: prev.btnB,
+      btnX: prev.btnX,
+      btnY: prev.btnY,
+      btnL: prev.btnL,
+      btnR: prev.btnR,
+      btnGrip: prev.btnGrip,
+      stickClick: prev.stickClick,
+      stickX: prev.stickX,
+      stickY: prev.stickY,
+      moveAtEdge: prev.moveAtEdge,
+      touchX: prev.touchX,
+      touchY: prev.touchY,
+      turnRate: prev.turnRate,
+      pitchRate: prev.pitchRate,
+      laserX: prev.laserX,
+      laserY: prev.laserY,
+      laserSlideActive: prev.laserSlideActive,
+      recenter: prev.recenter,
+      controllerVisible: prev.controllerVisible,
+      steering: prev.steering,
+      drivingTilt: prev.drivingTilt,
+      throttle: prev.throttle,
+      brake: prev.brake,
+      drivingPaused: prev.drivingPaused,
+      motionAvailable: prev.motionAvailable,
+      isNeutralized: prev.isNeutralized,
+      rangeMeters: _latchedRangeMeters ?? prev.rangeMeters,
+      searchQuery: prev.searchQuery,
+      searchSubmitted: prev.searchSubmitted,
+      passthroughMix: _latchedPassthroughMix,
+      passthroughActive: _latchedPassthroughActive,
+      spatialHudVisible: _latchedSpatialHudVisible,
+      leftFootU: _latchedLeftFootU,
+      leftFootV: _latchedLeftFootV,
+      rightFootU: _latchedRightFootU,
+      rightFootV: _latchedRightFootV,
+      feetConfidence: _latchedFeetConfidence,
+      handU: _latchedHandU,
+      handV: _latchedHandV,
+      handConfidence: _latchedHandConfidence,
+      visorU: _latchedVisorU,
+      visorV: _latchedVisorV,
+      visorWidth: _latchedVisorWidth,
+      joystickCameraRole: _latchedJoystickCameraRole,
+      joystickMiniFrame: _latchedJoystickMiniFrame,
+      mode: prev.mode,
+    );
+    if (!_disposed) _stateController.add(_latestState);
   }
 
   bool _acceptsModeState(
@@ -971,6 +1149,23 @@ class VrRemoteControllerService {
       drivingPaused: _latestState.mode == RemoteControllerMode.driving,
       isNeutralized: true,
       controllerVisible: controllerVisible ?? _latestState.controllerVisible,
+      rangeMeters: _latchedRangeMeters ?? _latestState.rangeMeters,
+      passthroughMix: _latchedPassthroughMix,
+      passthroughActive: _latchedPassthroughActive,
+      spatialHudVisible: _latchedSpatialHudVisible,
+      leftFootU: _latchedLeftFootU,
+      leftFootV: _latchedLeftFootV,
+      rightFootU: _latchedRightFootU,
+      rightFootV: _latchedRightFootV,
+      feetConfidence: _latchedFeetConfidence,
+      handU: _latchedHandU,
+      handV: _latchedHandV,
+      handConfidence: _latchedHandConfidence,
+      visorU: _latchedVisorU,
+      visorV: _latchedVisorV,
+      visorWidth: _latchedVisorWidth,
+      joystickCameraRole: _latchedJoystickCameraRole,
+      joystickMiniFrame: _latchedJoystickMiniFrame,
     );
     if (!_disposed) _stateController.add(_latestState);
   }

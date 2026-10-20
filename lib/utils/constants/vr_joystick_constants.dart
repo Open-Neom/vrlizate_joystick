@@ -141,15 +141,15 @@ abstract final class VrJoystickConstants {
   static const int maxSearchQueryLength = 120;
 
   // Dual-Thumb Center-to-Lateral Passthrough Split Gesture Constants
-  static const double passthroughCenterMinNormX = 0.28;
-  static const double passthroughCenterMaxNormX = 0.72;
-  static const double passthroughMaxInitialThumbSpan = 0.38;
-  static const int passthroughThumbSyncWindowUs = 320000;
-  static const double passthroughMinActivationSpread = 0.04;
+  static const double passthroughCenterMinNormX = 0.16;
+  static const double passthroughCenterMaxNormX = 0.84;
+  static const double passthroughMaxInitialThumbSpan = 0.68;
+  static const int passthroughThumbSyncWindowUs = 900000;
+  static const double passthroughMinActivationSpread = 0.035;
   static const double passthroughFullSpanNormDistance = 0.84;
   static const double passthroughFastSwipeMinSpeedPerSec = 1.40;
   static const int passthroughFastSwipeMaxDurationUs = 380000;
-  static const double passthroughFastSwipeMinSpread = 0.35;
+  static const double passthroughFastSwipeMinSpread = 0.32;
   static const double passthroughUltraSlowMaxSpeedPerSec = 0.55;
   static const int passthroughUltraSlowMinDurationUs = 850000;
   static const double passthroughDirectionToleranceNorm = 0.04;
@@ -158,12 +158,56 @@ abstract final class VrJoystickConstants {
   static const int passthroughDoubleTapMaxTapDurationUs = 260000;
   static const int passthroughDoubleTapMaxIntervalUs = 450000;
   static const int passthroughSonarPulseDurationUs = 1200000;
+  static const String passthroughControlType = 'vrlizate.passthrough';
+  static const String visionTelemetryMessageType = 'vrlizate.visionTelemetry';
   static const String fieldPassthroughStyle = 'passthroughStyle';
   static const String fieldPassthroughSonarPulse = 'passthroughSonarPulse';
   static const String fieldPassthroughCurtainLeft = 'passthroughCurtainLeft';
   static const String fieldPassthroughCurtainRight = 'passthroughCurtainRight';
+  static const String fieldSpatialHudVisible = 'spatialHudVisible';
+  static const String fieldLeftFootU = 'leftFootU';
+  static const String fieldLeftFootV = 'leftFootV';
+  static const String fieldRightFootU = 'rightFootU';
+  static const String fieldRightFootV = 'rightFootV';
+  static const String fieldFeetConfidence = 'feetConfidence';
+  static const String fieldHandU = 'handU';
+  static const String fieldHandV = 'handV';
+  static const String fieldHandConfidence = 'handConfidence';
+  static const String fieldVisorU = 'visorU';
+  static const String fieldVisorV = 'visorV';
+  static const String fieldVisorWidth = 'visorWidth';
+  static const String fieldJoystickCameraRole = 'joystickCameraRole';
+  static const String fieldJoystickMiniFrame = 'joystickMiniFrame';
   static const String keyPassthroughCurtainOverlay =
       'passthrough_curtain_overlay';
+  static const String keyBreakthroughCenterBar = 'breakthrough_center_bar';
+  static const String keySpatialHudToggle = 'spatial_hud_toggle';
+
+  // Joystick Camera Vision (Cám 2 Piso + Cám 3 Manos/Visor) & Ultrasonic Sonar Constants
+  static const String ultrasonicSonarChannelName = 'vrlizate/ultrasonic_sonar';
+  static const String ultrasonicPingMethod = 'ping';
+  static const String ultrasonicFieldEchoDistanceMeters = 'echoDistanceMeters';
+  static const String ultrasonicFieldSnrDb = 'snrDb';
+  static const String cameraRoleRear = 'rear';
+  static const String cameraRoleFront = 'front';
+  static const String envKeyFlutterTest = 'FLUTTER_TEST';
+  static const int visionMiniFrameGridWidth = 24;
+  static const int visionMiniFrameGridHeight = 18;
+  static const double defaultLeftFootU = 0.36;
+  static const double defaultLeftFootV = 0.72;
+  static const double defaultRightFootU = 0.64;
+  static const double defaultRightFootV = 0.72;
+  static const double defaultHandU = 0.50;
+  static const double defaultHandV = 0.58;
+  static const double defaultVisorU = 0.50;
+  static const double defaultVisorV = 0.24;
+  static const double defaultVisorWidth = 0.20;
+  static const double defaultRangeMeters = 0.54;
+  static const int ultrasonicPingIntervalMs = 520;
+  static const int cameraLensMultiplexIntervalMs = 3400;
+  static const double minValidUltrasonicSnrDb = 3.8;
+  static const double minUltrasonicEchoMeters = 0.22;
+  static const double maxUltrasonicEchoMeters = 1.15;
 
   // One-Handed Laser Detector & 5-Second Dwell Constants
   static const double oneHandedLateralTiltMinRatio = 0.42;
@@ -195,6 +239,7 @@ abstract final class VrJoystickConstants {
     fieldMoveAtEdge,
     fieldSearchSubmitted,
     fieldPassthroughActive,
+    fieldSpatialHudVisible,
   ];
 
   static const List<String> numericStateKeys = [
