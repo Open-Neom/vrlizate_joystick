@@ -214,11 +214,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   double _stickY = 0.0;
   bool _moveAtEdge = false;
   bool _rightLaser = false;
-  // Native games can explicitly retain both view axes. Walking hosts request
-  // vertical-only view, while old mode messages keep their original contract.
-  bool _horizontalLookEnabled = false;
+  // Horizontal + vertical right-stick look enabled by default so the right
+  // thumbstick on the Joystick smartphone can turn left/right as well as pitch.
+  bool _horizontalLookEnabled = true;
   double _lookX =
-      0.0; // Reserved for legacy/full-look clients; this UI uses pitch.
+      0.0; // Horizontal turn rate from the right thumbstick.
   double _lookY = 0.0; // 180° Vertical tilt (pitch)
   final _moveResponse = VrProgressiveStick();
   final _lookResponse = VrProgressiveStick(initialGain: .45, maxGain: .8);
@@ -340,7 +340,6 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _startGyroTracking();
     _startShakeDetection();
     _visionService.addListener(_onVisionServiceUpdated);
-    unawaited(_visionService.start());
 
     // Lock to horizontal (landscape) mode for ergonomic dual-hand controller gameplay
     SystemChrome.setPreferredOrientations([
@@ -799,9 +798,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     );
     _stickX = move.x;
     _stickY = move.y;
-    // Heading belongs to the left stick. In laser mode neither thumb nor
-    // phone inclination can move the camera while the user is aiming.
-    var x = _horizontalLookEnabled ? look.x + motion.x : 0.0;
+    // Right thumbstick horizontal deflection turns left/right; relative phone
+    // tilt while holding the look stick contributes vertical pitch only.
+    var x = _horizontalLookEnabled ? look.x : 0.0;
     var y = look.y + motion.y;
     final magnitude = math.sqrt(x * x + y * y);
     if (magnitude > 1) {
@@ -1760,9 +1759,13 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   void _toggleSpatialHud([bool? value]) {
+    final next = value ?? !_spatialHudVisible;
     setState(() {
-      _spatialHudVisible = value ?? !_spatialHudVisible;
+      _spatialHudVisible = next;
     });
+    if (next) {
+      unawaited(_visionService.start());
+    }
     _hapticClick();
     _sendPassthroughControlMessage(force: true);
     _sendState(force: true);

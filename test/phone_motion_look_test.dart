@@ -151,14 +151,14 @@ void main() {
   );
 
   testWidgets(
-    'right view ignores horizontal thumb input; left keeps rim intent',
+    'right view enables horizontal thumb turning by default; left keeps rim intent',
     (tester) async {
       final link = await open(tester);
       final hold = await tester.startGesture(tester.getCenter(right));
       await hold.moveBy(Offset(tester.getSize(right).width, 0));
       await tick(tester, 80);
-      expect(link.last['lookX'], 0);
-      expect(link.last['lookY'], 0);
+      expect(link.last['lookX'], greaterThan(.1));
+      expect(link.last['lookY'], closeTo(0, 1e-5));
       expect(link.last['laserX'], 0);
       await hold.up();
       final walk = await tester.startGesture(tester.getCenter(left));

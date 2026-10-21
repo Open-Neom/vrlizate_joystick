@@ -803,7 +803,7 @@ void main() {
             (link.packets.last['lookY'] as num) > .1 &&
             link.packets.last['btnA'] == true,
       );
-      expect(link.packets.last['lookX'], 0);
+      expect(link.packets.last['lookX'], greaterThan(0));
       expect(link.packets.last['moveAtEdge'], isTrue);
 
       void expectNeutral() {
@@ -877,7 +877,7 @@ void main() {
       await nextView.moveBy(const Offset(20, -25));
       await tester.pump(const Duration(milliseconds: 100));
       await _pumpUntil(tester, () => (link.packets.last['lookY'] as num) > .1);
-      expect(link.packets.last['lookX'], 0);
+      expect(link.packets.last['lookX'], greaterThan(0));
       expect(link.packets.last['laserX'], 0);
       expect(link.packets.last['laserY'], 0);
       expect(link.packets.last['laserSlideActive'], isFalse);
