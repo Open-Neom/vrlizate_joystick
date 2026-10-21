@@ -17,10 +17,13 @@ import '../domain/models/vr_controller_connection_exception.dart';
 import '../domain/models/vr_controller_connection_target.dart';
 import '../domain/models/vr_joystick_geometry.dart';
 import '../domain/models/vr_steering_state.dart';
+import '../domain/services/vr_auto_walk_lock_controller.dart';
 import '../domain/services/vr_controller_link.dart';
 import '../domain/services/vr_controller_mode_session.dart';
 import '../domain/services/vr_controller_shake_detector.dart';
 import '../domain/services/vr_controller_state_pacer.dart';
+import '../domain/services/vr_flick_stick_controller.dart';
+import '../domain/services/vr_inertial_trackball_controller.dart';
 import '../domain/services/vr_joystick_camera_vision_service.dart';
 import '../domain/services/vr_laser_steady_dwell_controller.dart';
 import '../domain/services/vr_motion_look_controller.dart';
@@ -34,6 +37,7 @@ import '../utils/constants/vr_joystick_translation_constants.dart';
 import '../utils/enums/remote_controller_mode.dart';
 import '../utils/enums/vr_joystick_control.dart';
 import '../utils/enums/vr_motion_capability.dart';
+import '../utils/enums/vr_right_stick_look_mode.dart';
 import 'nes_controller_layout.dart';
 import 'virtual_thumbstick.dart';
 import 'vr_breakthrough_curtain_bar.dart';
@@ -295,7 +299,26 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   bool _btnLActive = false;
   bool _btnRActive = false;
   bool _btnGripActive = false;
+  bool _stickClickActive = false;
   Timer? _gripHoldTimer;
+  Timer? _stickClickPulseTimer;
+
+  // Open-source inspired ergonomics & look controllers
+  bool _dynamicTouchOriginEnabled = true;
+  bool _cardinalDetentsEnabled = true;
+  bool _autoWalkLockEnabled = true;
+  VrRightStickLookMode _rightStickLookMode =
+      VrRightStickLookMode.smoothDualAxis;
+  final VrAutoWalkLockController _leftAutoWalkController =
+      VrAutoWalkLockController();
+  final VrAutoWalkLockController _rightStickClickDetector =
+      VrAutoWalkLockController();
+  final VrFlickStickController _flickStickController =
+      VrFlickStickController();
+  final VrInertialTrackballController _inertialTrackballController =
+      VrInertialTrackballController();
+  double _rawLookX = 0.0;
+  double _rawLookY = 0.0;
 
   // Laser aim belongs to touch; wheel motion must never rotate the pointer.
   vm.Quaternion _orientation = vm.Quaternion.identity();
@@ -506,10 +529,40 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       final savedMotionLook = prefs.getBool(
         VrJoystickConstants.prefKeyMotionLookEnabled,
       );
+      final savedDynamicOrigin = prefs.getBool(
+        VrJoystickConstants.prefKeyDynamicTouchOrigin,
+      );
+      final savedCardinalDetents = prefs.getBool(
+        VrJoystickConstants.prefKeyCardinalDetentsEnabled,
+      );
+      final savedAutoWalkLock = prefs.getBool(
+        VrJoystickConstants.prefKeyAutoWalkLockEnabled,
+      );
+      final savedLookModeName = prefs.getString(
+        VrJoystickConstants.prefKeyRightStickLookMode,
+      );
       if (mounted) {
         setState(() {
           if (savedHaptics != null) _hapticsEnabled = savedHaptics;
           if (savedMotionLook != null) _motionLookEnabled = savedMotionLook;
+          if (savedDynamicOrigin != null) {
+            _dynamicTouchOriginEnabled = savedDynamicOrigin;
+          }
+          if (savedCardinalDetents != null) {
+            _cardinalDetentsEnabled = savedCardinalDetents;
+          }
+          if (savedAutoWalkLock != null) {
+            _autoWalkLockEnabled = savedAutoWalkLock;
+            if (!_autoWalkLockEnabled) _leftAutoWalkController.reset();
+          }
+          if (savedLookModeName != null) {
+            for (final mode in VrRightStickLookMode.values) {
+              if (mode.name == savedLookModeName) {
+                _rightStickLookMode = mode;
+                break;
+              }
+            }
+          }
           // Preference loading must never activate a gesture already held.
           if (!_motionLookEnabled) {
             _motionLook.setActive(false, _controllerClock.elapsedMicroseconds);
@@ -534,6 +587,42 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         enabled,
       );
     } catch (_) {}
+  }
+
+  Future<void> _persistBoolPref(String key, bool value) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(key, value);
+    } catch (_) {}
+  }
+
+  Future<void> _persistRightStickLookMode(VrRightStickLookMode mode) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        VrJoystickConstants.prefKeyRightStickLookMode,
+        mode.name,
+      );
+    } catch (_) {}
+  }
+
+  void _pulseStickClick() {
+    _stickClickPulseTimer?.cancel();
+    setState(() {
+      _stickClickActive = true;
+    });
+    _hapticMedium();
+    _sendState(force: true);
+    _stickClickPulseTimer = Timer(
+      const Duration(milliseconds: VrJoystickConstants.stickClickPulseDurationMs),
+      () {
+        if (!mounted) return;
+        setState(() {
+          _stickClickActive = false;
+        });
+        _sendState(force: true);
+      },
+    );
   }
 
   Future<void> _loadSavedIp() async {
@@ -796,12 +885,56 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     final motion = _motionLook.sample(
       nowUs ?? _controllerClock.elapsedMicroseconds,
     );
-    _stickX = move.x;
-    _stickY = move.y;
-    // Right thumbstick horizontal deflection turns left/right; relative phone
-    // tilt while holding the look stick contributes vertical pitch only.
-    var x = _horizontalLookEnabled ? look.x : 0.0;
-    var y = look.y + motion.y;
+    if (_leftAutoWalkController.isAutoWalkLocked) {
+      _stickX = 0.0;
+      _stickY = math.max(move.y, 1.0);
+      _moveAtEdge = true;
+    } else {
+      _stickX = move.x;
+      _stickY = move.y;
+    }
+    // Right thumbstick horizontal deflection turns left/right according to
+    // the active look mode; relative phone tilt while holding the look stick
+    // contributes vertical pitch only.
+    double x;
+    double y;
+    switch (_rightStickLookMode) {
+      case VrRightStickLookMode.smoothDualAxis:
+        x = _horizontalLookEnabled ? look.x : 0.0;
+        y = look.y + motion.y;
+      case VrRightStickLookMode.comfortSnapTurn:
+        x = _horizontalLookEnabled
+            ? _flickStickController.update(
+                mode: _rightStickLookMode,
+                x: _rawLookX,
+                y: _rawLookY,
+                dtSeconds: elapsed,
+              )
+            : 0.0;
+        y = look.y + motion.y;
+      case VrRightStickLookMode.flickStick:
+        x = _horizontalLookEnabled
+            ? _flickStickController.update(
+                mode: _rightStickLookMode,
+                x: _rawLookX,
+                y: _rawLookY,
+                dtSeconds: elapsed,
+              )
+            : 0.0;
+        y = motion.y;
+      case VrRightStickLookMode.inertialTrackball:
+        if (_lookStickHeld) {
+          x = _horizontalLookEnabled ? look.x : 0.0;
+          y = look.y + motion.y;
+        } else if (_inertialTrackballController.isCoasting) {
+          final coast = _inertialTrackballController.advance(elapsed);
+          x = _horizontalLookEnabled ? coast.x : 0.0;
+          y = coast.y;
+        } else {
+          x = 0.0;
+          y = 0.0;
+        }
+    }
     final magnitude = math.sqrt(x * x + y * y);
     if (magnitude > 1) {
       x /= magnitude;
@@ -1666,6 +1799,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _searchSubmitPulseTimer = null;
     _recenterResetTimer?.cancel();
     _recenterResetTimer = null;
+    _stickClickPulseTimer?.cancel();
+    _stickClickPulseTimer = null;
+    _leftAutoWalkController.reset();
+    _rightStickClickDetector.reset();
+    _flickStickController.reset();
+    _inertialTrackballController.reset();
+    _rawLookX = 0;
+    _rawLookY = 0;
     _stickX = 0;
     _stickY = 0;
     _moveAtEdge = false;
@@ -1687,6 +1828,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _btnLActive = false;
     _btnRActive = false;
     _btnGripActive = false;
+    _stickClickActive = false;
     _searchSubmittedPulse = false;
     _passthroughGesture.cancelGesture();
     _throttlePedalHeld = false;
@@ -1874,6 +2016,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         VrJoystickConstants.fieldBtnL: _btnLActive,
         VrJoystickConstants.fieldBtnR: _btnRActive,
         VrJoystickConstants.fieldBtnGrip: _btnGripActive,
+        VrJoystickConstants.fieldStickClick: _stickClickActive,
         VrJoystickConstants.fieldMode: wireModeName,
         VrJoystickConstants.fieldSteering:
             _activeMode == RemoteControllerMode.driving
@@ -1994,6 +2137,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _laserClickPulseTimer?.cancel();
     _searchSubmitPulseTimer?.cancel();
     _gripHoldTimer?.cancel();
+    _stickClickPulseTimer?.cancel();
     _visionService.removeListener(_onVisionServiceUpdated);
     _visionService.dispose();
     final socket = _socket;
@@ -2476,6 +2620,178 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                           setModalState(() {});
                         },
                       ),
+                      SwitchListTile(
+                        key: const ValueKey(
+                          VrJoystickConstants.keyControllerDynamicOriginToggle,
+                        ),
+                        contentPadding: EdgeInsets.zero,
+                        value: _dynamicTouchOriginEnabled,
+                        activeThumbColor: const Color(0xFF00E5FF),
+                        title: const Text(
+                          VrJoystickTranslationConstants
+                              .settingsDynamicOriginTitle,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        subtitle: const Text(
+                          VrJoystickTranslationConstants
+                              .settingsDynamicOriginSubtitle,
+                          style: TextStyle(color: Colors.white60, fontSize: 10),
+                        ),
+                        onChanged: (val) {
+                          setState(() => _dynamicTouchOriginEnabled = val);
+                          setModalState(() {});
+                          unawaited(
+                            _persistBoolPref(
+                              VrJoystickConstants.prefKeyDynamicTouchOrigin,
+                              val,
+                            ),
+                          );
+                        },
+                      ),
+                      SwitchListTile(
+                        key: const ValueKey(
+                          VrJoystickConstants
+                              .keyControllerCardinalDetentsToggle,
+                        ),
+                        contentPadding: EdgeInsets.zero,
+                        value: _cardinalDetentsEnabled,
+                        activeThumbColor: const Color(0xFF00E5FF),
+                        title: const Text(
+                          VrJoystickTranslationConstants
+                              .settingsCardinalDetentsTitle,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        subtitle: const Text(
+                          VrJoystickTranslationConstants
+                              .settingsCardinalDetentsSubtitle,
+                          style: TextStyle(color: Colors.white60, fontSize: 10),
+                        ),
+                        onChanged: (val) {
+                          setState(() => _cardinalDetentsEnabled = val);
+                          setModalState(() {});
+                          unawaited(
+                            _persistBoolPref(
+                              VrJoystickConstants.prefKeyCardinalDetentsEnabled,
+                              val,
+                            ),
+                          );
+                        },
+                      ),
+                      SwitchListTile(
+                        key: const ValueKey(
+                          VrJoystickConstants.keyControllerAutoWalkToggle,
+                        ),
+                        contentPadding: EdgeInsets.zero,
+                        value: _autoWalkLockEnabled,
+                        activeThumbColor: const Color(0xFF10B981),
+                        title: const Text(
+                          VrJoystickTranslationConstants
+                              .settingsAutoWalkLockTitle,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        subtitle: const Text(
+                          VrJoystickTranslationConstants
+                              .settingsAutoWalkLockSubtitle,
+                          style: TextStyle(color: Colors.white60, fontSize: 10),
+                        ),
+                        onChanged: (val) {
+                          setState(() {
+                            _autoWalkLockEnabled = val;
+                            if (!val) {
+                              _leftAutoWalkController.reset();
+                              _moveAtEdge = false;
+                              _moveResponse.reset();
+                              _updateJoystick();
+                            }
+                          });
+                          setModalState(() {});
+                          unawaited(
+                            _persistBoolPref(
+                              VrJoystickConstants.prefKeyAutoWalkLockEnabled,
+                              val,
+                            ),
+                          );
+                          _sendState(force: true);
+                        },
+                      ),
+                      const SizedBox(height: 6),
+                      const Text(
+                        VrJoystickTranslationConstants
+                            .settingsRightLookModeTitle,
+                        style: TextStyle(
+                          color: Color(0xFFFF9100),
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 0.8,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      SegmentedButton<VrRightStickLookMode>(
+                        key: const ValueKey(
+                          VrJoystickConstants.keyControllerRightLookModeSelector,
+                        ),
+                        segments: const [
+                          ButtonSegment(
+                            value: VrRightStickLookMode.smoothDualAxis,
+                            label: Text(
+                              VrJoystickTranslationConstants
+                                  .rightLookModeSmoothLabel,
+                              style: TextStyle(fontSize: 10),
+                            ),
+                          ),
+                          ButtonSegment(
+                            value: VrRightStickLookMode.comfortSnapTurn,
+                            label: Text(
+                              VrJoystickTranslationConstants
+                                  .rightLookModeSnapLabel,
+                              style: TextStyle(fontSize: 10),
+                            ),
+                          ),
+                          ButtonSegment(
+                            value: VrRightStickLookMode.flickStick,
+                            label: Text(
+                              VrJoystickTranslationConstants
+                                  .rightLookModeFlickLabel,
+                              style: TextStyle(fontSize: 10),
+                            ),
+                          ),
+                          ButtonSegment(
+                            value: VrRightStickLookMode.inertialTrackball,
+                            label: Text(
+                              VrJoystickTranslationConstants
+                                  .rightLookModeTrackballLabel,
+                              style: TextStyle(fontSize: 10),
+                            ),
+                          ),
+                        ],
+                        selected: {_rightStickLookMode},
+                        onSelectionChanged: (selection) {
+                          final next = selection.first;
+                          setState(() {
+                            _rightStickLookMode = next;
+                            _flickStickController.reset();
+                            _inertialTrackballController.reset();
+                            _updateJoystick();
+                          });
+                          setModalState(() {});
+                          unawaited(_persistRightStickLookMode(next));
+                          _hapticClick();
+                          _sendState(force: true);
+                        },
+                      ),
+                      const SizedBox(height: 8),
                       Container(
                         padding: const EdgeInsets.symmetric(
                           horizontal: 10,
@@ -3370,49 +3686,124 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                     ? const Color(0xFF00E5FF)
                     : const Color(0xFFFF9100),
                 hapticsEnabled: _hapticsEnabled,
+                dynamicTouchOrigin: _dynamicTouchOriginEnabled,
+                enableCardinalDetents: _cardinalDetentsEnabled,
+                isAutoWalkLocked:
+                    movement && _leftAutoWalkController.isAutoWalkLocked,
                 onPressed: (pressed) {
                   if (!_acceptsSurfaceInput(surfaceEpoch)) return;
-                  if (!movement) {
+                  final nowUs = _controllerClock.elapsedMicroseconds;
+                  if (movement) {
+                    if (pressed) {
+                      final doubleTapped = _leftAutoWalkController
+                          .onPointerDown(nowUs);
+                      if (doubleTapped) {
+                        _pulseStickClick();
+                      }
+                      if (!_leftAutoWalkController.isAutoWalkLocked) {
+                        _moveAtEdge = false;
+                        _moveResponse.reset();
+                      }
+                      _updateJoystick(nowUs: nowUs);
+                      _sendState(force: true);
+                    }
+                  } else {
                     _lookStickHeld = pressed;
+                    if (pressed) {
+                      _inertialTrackballController.onTouchDown(nowUs);
+                      final doubleTapped = _rightStickClickDetector
+                          .onPointerDown(nowUs);
+                      if (doubleTapped) {
+                        _pulseStickClick();
+                      }
+                    }
                     _motionLook.setActive(
                       pressed && _motionLookEnabled,
-                      _controllerClock.elapsedMicroseconds,
+                      nowUs,
                     );
                     if (!pressed) _lookResponse.reset();
-                    _updateJoystick();
+                    _updateJoystick(nowUs: nowUs);
                     _sendState(force: true);
                   }
                 },
                 onChanged: (x, y) {
                   if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                  final nowUs = _controllerClock.elapsedMicroseconds;
                   if (movement) {
+                    final justLocked = _leftAutoWalkController.onStickChanged(
+                      x,
+                      y,
+                      timestampUs: nowUs,
+                      autoWalkEnabled: _autoWalkLockEnabled,
+                    );
+                    if (justLocked) {
+                      _hapticMedium();
+                    }
                     // Preserve rim intent before the progressive speed ramp.
                     // Hysteresis prevents tiny finger drift from rearming it.
                     final radiusSquared = x * x + y * y;
                     _moveAtEdge =
-                        radiusSquared.isFinite &&
-                        radiusSquared >= (_moveAtEdge ? .84 * .84 : .92 * .92);
+                        _leftAutoWalkController.isAutoWalkLocked ||
+                        (radiusSquared.isFinite &&
+                            radiusSquared >=
+                                (_moveAtEdge ? .84 * .84 : .92 * .92));
                     _moveResponse.setInput(x, y);
                   } else {
-                    _lookResponse.setInput(_horizontalLookEnabled ? x : 0, y);
+                    _rawLookX = _horizontalLookEnabled ? x : 0.0;
+                    _rawLookY = y;
+                    _rightStickClickDetector.onStickChanged(
+                      x,
+                      y,
+                      timestampUs: nowUs,
+                      autoWalkEnabled: false,
+                    );
+                    if (_rightStickLookMode ==
+                        VrRightStickLookMode.inertialTrackball) {
+                      _inertialTrackballController.onTouchMove(
+                        _rawLookX,
+                        _rawLookY,
+                        timestampUs: nowUs,
+                      );
+                    }
+                    _lookResponse.setInput(_rawLookX, _rawLookY);
                   }
-                  _updateJoystick();
+                  _updateJoystick(nowUs: nowUs);
                   _sendState();
                 },
                 onRelease: () {
                   if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                  final nowUs = _controllerClock.elapsedMicroseconds;
                   if (movement) {
-                    _moveAtEdge = false;
-                    _moveResponse.reset();
+                    final locked = _leftAutoWalkController.onPointerUp(
+                      nowUs,
+                      autoWalkEnabled: _autoWalkLockEnabled,
+                    );
+                    if (locked) {
+                      _moveAtEdge = true;
+                      _moveResponse.setInput(0.0, 1.0);
+                      setState(() {});
+                    } else {
+                      _moveAtEdge = false;
+                      _moveResponse.reset();
+                    }
                   } else {
+                    _rightStickClickDetector.onPointerUp(
+                      nowUs,
+                      autoWalkEnabled: false,
+                    );
+                    _rawLookX = 0.0;
+                    _rawLookY = 0.0;
                     _lookResponse.reset();
                     _lookStickHeld = false;
-                    _motionLook.setActive(
-                      false,
-                      _controllerClock.elapsedMicroseconds,
-                    );
+                    _motionLook.setActive(false, nowUs);
+                    if (_rightStickLookMode ==
+                        VrRightStickLookMode.inertialTrackball) {
+                      _inertialTrackballController.onTouchUp();
+                    } else {
+                      _flickStickController.reset();
+                    }
                   }
-                  _updateJoystick();
+                  _updateJoystick(nowUs: nowUs);
                   _sendState(force: true);
                 },
               ),

@@ -41,6 +41,51 @@ abstract final class VrJoystickConstants {
   static const String prefKeyHostIp = 'vrlizate_host_ip';
   static const String prefKeyHapticsEnabled = 'vrlizate_haptics_enabled';
   static const String prefKeyMotionLookEnabled = 'vrlizate_motion_look_enabled';
+  static const String prefKeyDynamicTouchOrigin =
+      'vrlizate_dynamic_touch_origin';
+  static const String prefKeyCardinalDetentsEnabled =
+      'vrlizate_cardinal_detents_enabled';
+  static const String prefKeyAutoWalkLockEnabled =
+      'vrlizate_auto_walk_lock_enabled';
+  static const String prefKeyRightStickLookMode =
+      'vrlizate_right_stick_look_mode';
+
+  // Open-Source Inspired Thumbstick & Look Enhancement Constants
+  // 1. Dynamic / Floating Touch Origin (nipplejs / AirConsole inspired)
+  static const double defaultDynamicOriginMaxRatio = 0.38;
+
+  // 2. Radial & Cardinal Haptic Detents (Steam Controller / VirtualGamePad inspired)
+  static const double hapticMidRingThreshold = 0.50;
+  static const double hapticMidRingRelease = 0.43;
+  static const double hapticOuterRimThreshold = 0.92;
+  static const double hapticOuterRimRelease = 0.84;
+  static const double hapticCardinalMinRadius = 0.36;
+  static const double hapticCardinalEnterDegrees = 7.0;
+  static const double hapticCardinalExitDegrees = 11.5;
+
+  // 3. Flick Stick & Comfort Snap-Turn (JoyShockMapper inspired)
+  static const double snapTurnTriggerThreshold = 0.72;
+  static const double snapTurnRearmThreshold = 0.35;
+  static const double snapTurnPulseDurationSeconds = 0.12;
+  static const double snapTurnCooldownSeconds = 0.30;
+  static const double flickStickRimEngageThreshold = 0.80;
+  static const double flickStickRimReleaseThreshold = 0.65;
+  static const double flickStickSnapDurationSeconds = 0.14;
+  static const double flickStickSweepGain = 0.65;
+
+  // 4. Double-Tap (L3/R3) & Auto-Walk / Sprint Lock (moonlight-android inspired)
+  static const int doubleTapMaxTapDurationUs = 260000;
+  static const int doubleTapMaxIntervalUs = 360000;
+  static const double autoWalkForwardMinY = 0.78;
+  static const double autoWalkForwardMaxAbsX = 0.38;
+  static const int autoWalkHoldLockDurationUs = 200000;
+  static const int stickClickPulseDurationMs = 150;
+
+  // 5. Inertial Virtual Trackball (Steam Controller inspired)
+  static const double trackballFrictionPerSecond = 3.2;
+  static const double trackballMinLaunchSpeed = 0.15;
+  static const double trackballStopSpeedThreshold = 0.025;
+  static const double trackballVelocitySmoothing = 0.45;
 
   // Protocol & Wire Keys
   static const String controllerModeType = 'vrlizate.controllerMode';
@@ -391,6 +436,15 @@ abstract final class VrJoystickConstants {
   static const String keyWordsphereSearchClear = 'wordsphere_search_clear';
   static const String keyWordsphereBoard = 'wordsphere_board';
   static const String keyWordsphereDestinationChipPrefix = 'wordsphere_dest_';
+  static const String keyControllerDynamicOriginToggle =
+      'controller_dynamic_origin_toggle';
+  static const String keyControllerCardinalDetentsToggle =
+      'controller_cardinal_detents_toggle';
+  static const String keyControllerAutoWalkToggle =
+      'controller_auto_walk_toggle';
+  static const String keyControllerRightLookModeSelector =
+      'controller_right_look_mode_selector';
+  static const String keyAutoWalkLockedBadge = 'auto_walk_locked_badge';
 
   static const List<String> wordsphereDestinations = [
     'Mall VR',

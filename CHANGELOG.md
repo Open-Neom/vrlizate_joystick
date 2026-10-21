@@ -2,6 +2,12 @@
 
 ## 1.0.0 - 2026-10-20
 
+- Add 5 open-source-inspired VR thumbstick & look enhancements:
+  1. **Dynamic / Floating Touch Origin (`VirtualThumbstick.dynamicTouchOrigin`)**: inspired by `nipplejs` and `AirConsole`, anchors `(0, 0)` where the thumb lands on the stick when wearing a VR visor so off-center blind contact does not cause unintended movement or camera jumps.
+  2. **Radial & Cardinal Haptic Detents (`VrThumbstickHapticDetentController`)**: inspired by `Steam Controller` and `VirtualGamePad`, fires subtle haptic ticks at the 50% walk ring, 92% sprint rim, and 4 cardinal axes ($0^\circ, 90^\circ, 180^\circ, 270^\circ$) with hysteresis.
+  3. **Flick Stick & Comfort Snap-Turn (`VrFlickStickController`, `VrRightStickLookMode`)**: inspired by `JibbSmart/JoyShockMapper`, adds configurable right-stick look modes (`smoothDualAxis`, `comfortSnapTurn`, `flickStick`, `inertialTrackball`).
+  4. **Double-Tap (`L3`/`R3` `stickClick`) & Auto-Walk / Sprint Lock (`VrAutoWalkLockController`)**: inspired by `moonlight-android`, emits `stickClick` pulses on double-tap and latches hands-free forward sprint when pushed to the upper rim on the second tap, cancelling on the next touch.
+  5. **Inertial Virtual Trackball (`VrInertialTrackballController`)**: inspired by `Steam Controller`, allows flicking the right look stick so angular momentum glides with exponential friction decay and stops immediately on touch.
 - Adopt Open Neom modular directory structure (`lib/utils/constants/`,
   `lib/utils/enums/`, `lib/domain/models/`, `lib/domain/services/`, `lib/ui/`)
   with one class/enum per file and backward-compatible `lib/src/` barrels.

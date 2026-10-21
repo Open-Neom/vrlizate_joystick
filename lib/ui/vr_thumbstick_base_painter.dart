@@ -8,6 +8,8 @@ class VrThumbstickBasePainter extends CustomPainter {
   final bool isDragging;
   final Color accentColor;
   final bool horizontalEnabled;
+  final Offset originOffset;
+  final bool isAutoWalkLocked;
 
   VrThumbstickBasePainter({
     required this.maxRadius,
@@ -15,11 +17,14 @@ class VrThumbstickBasePainter extends CustomPainter {
     required this.isDragging,
     required this.accentColor,
     required this.horizontalEnabled,
+    this.originOffset = Offset.zero,
+    this.isAutoWalkLocked = false,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
+    final activeOrigin = center + originOffset;
 
     final linePaint = Paint()
       ..color = accentColor.withValues(alpha: 0.25)
@@ -46,12 +51,32 @@ class VrThumbstickBasePainter extends CustomPainter {
       ..strokeWidth = 1.0;
     canvas.drawCircle(center, maxRadius * 0.5, midPaint);
 
+    // Outer 92% sprint/rim detent ring
+    final rimPaint = Paint()
+      ..color = accentColor.withValues(alpha: isAutoWalkLocked ? 0.55 : 0.10)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = isAutoWalkLocked ? 1.8 : 1.0;
+    canvas.drawCircle(
+      center,
+      maxRadius * VrJoystickConstants.hapticOuterRimThreshold,
+      rimPaint,
+    );
+
+    // Dynamic floating origin indicator when off-center
+    if (isDragging && originOffset.distance > 1.5) {
+      final originPaint = Paint()
+        ..color = accentColor.withValues(alpha: 0.45)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.2;
+      canvas.drawCircle(activeOrigin, 6.0, originPaint);
+    }
+
     // Deadzone circle
     final deadzonePaint = Paint()
       ..color = const Color(0xFFFF007F).withValues(alpha: 0.2)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.0;
-    canvas.drawCircle(center, maxRadius * deadzone, deadzonePaint);
+    canvas.drawCircle(activeOrigin, maxRadius * deadzone, deadzonePaint);
 
     // Directional labels (W, S, A, D)
     _drawLabel(
@@ -105,6 +130,8 @@ class VrThumbstickBasePainter extends CustomPainter {
         oldDelegate.maxRadius != maxRadius ||
         oldDelegate.deadzone != deadzone ||
         oldDelegate.horizontalEnabled != horizontalEnabled ||
-        oldDelegate.accentColor != accentColor;
+        oldDelegate.accentColor != accentColor ||
+        oldDelegate.originOffset != originOffset ||
+        oldDelegate.isAutoWalkLocked != isAutoWalkLocked;
   }
 }

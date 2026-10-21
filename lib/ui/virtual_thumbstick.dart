@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../domain/services/vr_thumbstick_haptic_detent_controller.dart';
+import '../utils/constants/vr_joystick_constants.dart';
+import '../utils/enums/vr_haptic_pattern_preset.dart';
 import 'vr_thumbstick_base_painter.dart';
 
 /// Interactive on-screen Virtual Analog Thumbstick for VR/Gamepad navigation.
@@ -8,9 +11,14 @@ import 'vr_thumbstick_base_painter.dart';
 /// Features:
 /// - 360-degree continuous analog vector $(x, y) \in [-1.0, 1.0]$.
 /// - Configurable deadzone threshold to avoid sensor and finger drift.
-/// - Automatic spring recenter upon finger release.
-/// - Cyberpunk neon visual feedback with concentric range rings and crosshairs.
-/// - Haptic feedback on boundary excursions and release.
+/// - Optional **Dynamic / Floating Touch Origin** ([dynamicTouchOrigin],
+///   inspired by `nipplejs` & `AirConsole`) so blind thumb contact while
+///   wearing a VR headset anchors the `(0, 0)` center where the thumb lands.
+/// - **Radial & Cardinal Haptic Detents** ([enableCardinalDetents], inspired by
+///   `Steam Controller` & `VirtualGamePad`) at 50% walk ring, 92% sprint rim,
+///   and the 4 cardinal axes ($0^\circ, 90^\circ, 180^\circ, 270^\circ$).
+/// - Automatic spring recenter upon finger release (or visual forward latch
+///   when [isAutoWalkLocked] is active).
 class VirtualThumbstick extends StatefulWidget {
   /// Diameter of the outer base area in pixels.
   final double size;
@@ -42,6 +50,23 @@ class VirtualThumbstick extends StatefulWidget {
   /// Whether tactile haptic feedback / vibration is enabled for touch, boundary, and release.
   final bool hapticsEnabled;
 
+  /// When true, the initial pointer-down position (clamped within
+  /// [maxDynamicOriginRatio] of the travel radius) becomes the `(0, 0)` origin
+  /// for that drag gesture so off-center blind thumb contact does not cause
+  /// unintended initial movement or turning.
+  final bool dynamicTouchOrigin;
+
+  /// Maximum fraction of `_maxRadius` that [dynamicTouchOrigin] can shift the
+  /// origin from the geometric center, guaranteeing full 100% rim deflection.
+  final double maxDynamicOriginRatio;
+
+  /// Whether 50% mid-ring and 4-way cardinal axis haptic detents are enabled.
+  final bool enableCardinalDetents;
+
+  /// Whether Auto-Walk / Sprint Lock is currently holding the knob at the top
+  /// forward position.
+  final bool isAutoWalkLocked;
+
   const VirtualThumbstick({
     super.key,
     this.size = 150.0,
@@ -50,6 +75,11 @@ class VirtualThumbstick extends StatefulWidget {
     this.horizontalEnabled = true,
     this.accentColor = const Color(0xFF00E5FF),
     this.hapticsEnabled = true,
+    this.dynamicTouchOrigin = false,
+    this.maxDynamicOriginRatio =
+        VrJoystickConstants.defaultDynamicOriginMaxRatio,
+    this.enableCardinalDetents = true,
+    this.isAutoWalkLocked = false,
     required this.onChanged,
     this.onRelease,
     this.onPressed,
@@ -62,10 +92,13 @@ class VirtualThumbstick extends StatefulWidget {
 class _VirtualThumbstickState extends State<VirtualThumbstick>
     with SingleTickerProviderStateMixin {
   Offset _dragOffset = Offset.zero;
+  Offset _originOffset = Offset.zero;
   bool _isDragging = false;
   bool _hasHitBoundary = false;
   bool _disposed = false;
   int? _pointer;
+  final VrThumbstickHapticDetentController _detentController =
+      VrThumbstickHapticDetentController();
 
   late AnimationController _recenterController;
   late Animation<Offset> _recenterAnimation;
@@ -104,6 +137,22 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
     _recenterController.stop();
     _isDragging = true;
     _hasHitBoundary = false;
+    _detentController.reset();
+    if (widget.dynamicTouchOrigin) {
+      final center = Offset(widget.size / 2, widget.size / 2);
+      final rawOrigin = Offset(
+        widget.horizontalEnabled ? event.localPosition.dx - center.dx : 0.0,
+        event.localPosition.dy - center.dy,
+      );
+      final maxOriginDist =
+          _maxRadius * widget.maxDynamicOriginRatio.clamp(0.0, 0.75);
+      final dist = rawOrigin.distance;
+      _originOffset = dist <= maxOriginDist || dist == 0
+          ? rawOrigin
+          : (rawOrigin / dist) * maxOriginDist;
+    } else {
+      _originOffset = Offset.zero;
+    }
     widget.onPressed?.call(true);
     if (_disposed || !mounted) return;
     _updateOffset(event.localPosition);
@@ -125,7 +174,7 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
 
   void _updateOffset(Offset localPos) {
     if (_disposed || !mounted || _pointer == null) return;
-    final center = Offset(widget.size / 2, widget.size / 2);
+    final center = Offset(widget.size / 2, widget.size / 2) + _originOffset;
     final delta = Offset(
       widget.horizontalEnabled ? localPos.dx - center.dx : 0,
       localPos.dy - center.dy,
@@ -158,10 +207,21 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
     // Y: +1.0 (up/forward) to -1.0 (down/backward)
     final normalizedDist = clampedOffset.distance / _maxRadius;
     if (normalizedDist < widget.deadzone) {
+      _detentController.reset();
       widget.onChanged(0.0, 0.0);
     } else {
       final normX = (clampedOffset.dx / _maxRadius).clamp(-1.0, 1.0);
       final normY = (-clampedOffset.dy / _maxRadius).clamp(-1.0, 1.0);
+      final detent = _detentController.evaluate(
+        normX,
+        normY,
+        enableCardinalDetents: widget.enableCardinalDetents,
+      );
+      if (detent == VrHapticPatternPreset.lightTap &&
+          widget.hapticsEnabled &&
+          widget.enableCardinalDetents) {
+        HapticFeedback.selectionClick();
+      }
       widget.onChanged(normX, normY);
     }
   }
@@ -170,6 +230,8 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
     if (_disposed || !mounted || !_isDragging) return;
     _isDragging = false;
     _hasHitBoundary = false;
+    _originOffset = Offset.zero;
+    _detentController.reset();
     _recenterAnimation = Tween<Offset>(begin: _dragOffset, end: Offset.zero)
         .animate(
           CurvedAnimation(
@@ -192,7 +254,10 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
   @override
   Widget build(BuildContext context) {
     final center = Offset(widget.size / 2, widget.size / 2);
-    final knobPos = center + _dragOffset;
+    final effectiveOffset = !_isDragging && widget.isAutoWalkLocked
+        ? Offset(0, -_maxRadius * 0.92)
+        : _dragOffset;
+    final knobPos = center + effectiveOffset;
 
     return Listener(
       behavior: HitTestBehavior.opaque,
@@ -233,6 +298,8 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
                 isDragging: _isDragging,
                 accentColor: widget.accentColor,
                 horizontalEnabled: widget.horizontalEnabled,
+                originOffset: _originOffset,
+                isAutoWalkLocked: widget.isAutoWalkLocked,
               ),
             ),
 

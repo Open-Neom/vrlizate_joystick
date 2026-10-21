@@ -422,4 +422,25 @@ abstract final class VrJoystickTranslationConstants {
       'Muestra en el visor la sincronización de las 3 cámaras y telemetría espacial en vivo.';
   static const String childRoleSyncingBannerTitle =
       'SINCRONIZANDO CON EL VISOR VR · ABRIENDO HOME 3D…';
+
+  // Open-Source Inspired Ergonomics & Look Modes
+  static const String settingsDynamicOriginTitle =
+      'Origen táctil flotante (uso a ciegas con visor)';
+  static const String settingsDynamicOriginSubtitle =
+      'Centra el stick donde apoya tu pulgar al tocar para evitar giros o pasos accidentales.';
+  static const String settingsCardinalDetentsTitle =
+      'Muescas hápticas en ejes y anillos (50% / 92%)';
+  static const String settingsCardinalDetentsSubtitle =
+      'Pulsos táctiles sutiles al cruzar los 4 ejes cardinales y el borde de sprint.';
+  static const String settingsAutoWalkLockTitle =
+      'Auto-caminar / Sprint con doble toque (L3)';
+  static const String settingsAutoWalkLockSubtitle =
+      'Doble toque y deslizar arriba en el stick izquierdo fija la marcha; toca de nuevo para soltar.';
+  static const String settingsRightLookModeTitle =
+      'ESTILO DE GIRO (STICK DERECHO)';
+  static const String rightLookModeSmoothLabel = 'Suave 2 Ejes';
+  static const String rightLookModeSnapLabel = 'Snap 30°';
+  static const String rightLookModeFlickLabel = 'Flick 360°';
+  static const String rightLookModeTrackballLabel = 'Trackball';
+  static const String autoWalkLockedBadgeLabel = '🔒 AUTO-SPRINT ACTIVO';
 }
