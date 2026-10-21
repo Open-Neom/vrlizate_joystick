@@ -1,10 +1,14 @@
 # Changelog
 
-## 1.0.0 - 2026-10-17
+## 1.0.0 - 2026-10-20
 
 - Adopt Open Neom modular directory structure (`lib/utils/constants/`,
   `lib/utils/enums/`, `lib/domain/models/`, `lib/domain/services/`, `lib/ui/`)
   with one class/enum per file and backward-compatible `lib/src/` barrels.
+- Add `VrJoystickCameraVisionService` for dual-camera computer vision on the Joystick smartphone (rear camera floor-plane & shoe/foot tracking, front camera hands, torso & visor tracking) and ultrasonic 20 kHz acoustic ping emission.
+- Add `VrPassthroughSplitGestureDetector` for dual-thumb center-to-lateral curtain split gesture (fast toggle, slow continuous 0..100% blend, ultra-slow 0->100->0% sweep, vertical style modulation across camera/hybrid/wireframe, and center double-tap sonar pulse).
+- Add `VrOneHandedLaserDetector`, `VrLaserSteadyDwellController` (5-second steady auto-click), `VrLaserPointingView`, and `VrWordsphereSearchSheet` (long-press free hand opens Wordsphere spatial search).
+- Add `HardwareGamepadAdapter` and `HardwareGamepadKeyBindings` for physical Bluetooth/USB gamepads.
 - Centralize all protocol keys, HTML5 fallback templates, and UI translations in
   `VrJoystickConstants` and `VrJoystickTranslationConstants`.
 - Add `VrGamepadLayoutPreset` (`dualStickVr`, `retroArcade8Way`,
