@@ -26,6 +26,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
   bool _starting = false;
   bool _disposed = false;
   final bool _enabled = true;
+  bool enableHardwareCameraStream = false;
   bool _autoMultiplexLenses = true;
   String _activeRole = VrJoystickConstants.cameraRoleRear;
 
@@ -96,6 +97,10 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
   /// Starts real-time camera CV and ultrasonic ToF ranging on mobile devices.
   Future<void> start() async {
     if (_disposed || _starting || _isFlutterTestEnvironment) return;
+    if (!enableHardwareCameraStream) {
+      notifyListeners();
+      return;
+    }
     if (kIsWeb || !(Platform.isAndroid || Platform.isIOS)) return;
     _starting = true;
     try {
