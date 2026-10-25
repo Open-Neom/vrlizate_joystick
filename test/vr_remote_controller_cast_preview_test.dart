@@ -90,6 +90,73 @@ void main() {
   }
 
   test(
+    'effective passthrough feedback is authenticated deduplicated and read only',
+    () {
+      service.setEffectivePassthroughState(mix: .65, cameraEnabled: true);
+      final unauthorized = _PreviewLink();
+      addTearDown(unauthorized.close);
+      expect(
+        service.attachControllerLink(unauthorized, sessionToken: 'wrong'),
+        isFalse,
+      );
+      expect(unauthorized.sent, isEmpty);
+      final paired = connect();
+      List<Map<String, dynamic>> states(_PreviewLink link) => link.messagesSent
+          .where((p) => p['type'] == 'vrlizate.passthrough.state')
+          .toList();
+      expect(states(paired), hasLength(1));
+      expect(states(paired).single['passthroughMix'], .65);
+      expect(states(paired).single.containsKey('passthroughCommand'), isFalse);
+      for (var i = 0; i < 60; i++) {
+        service.setEffectivePassthroughState(mix: .65, cameraEnabled: true);
+      }
+      expect(states(paired), hasLength(1));
+      service.setEffectivePassthroughState(mix: .65, cameraEnabled: false);
+      expect(states(paired), hasLength(2));
+      expect(states(paired).last['passthroughMix'], 0.0);
+      expect(service.latestState.passthroughCommandRevision, 0);
+      final reconnected = connect();
+      expect(states(reconnected), hasLength(1));
+      expect(states(reconnected).single['passthroughMix'], 0.0);
+      expect(
+        states(reconnected).single['revision'],
+        states(paired).last['revision'],
+      );
+    },
+  );
+
+  test(
+    'passthrough drag feedback is coalesced and OFF cancels pending updates',
+    () async {
+      service.setEffectivePassthroughState(mix: .2, cameraEnabled: true);
+      final paired = connect();
+      List<Map<String, dynamic>> states() => paired.messagesSent
+          .where((p) => p['type'] == 'vrlizate.passthrough.state')
+          .toList();
+      for (var i = 0; i < 60; i++) {
+        service.setEffectivePassthroughState(
+          mix: .3 + i / 100,
+          cameraEnabled: true,
+        );
+      }
+      expect(states(), hasLength(1));
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(states(), hasLength(2));
+      expect(states().last['passthroughMix'], closeTo(.89, .000001));
+      service.setEffectivePassthroughState(mix: .9, cameraEnabled: true);
+      service.setEffectivePassthroughState(mix: 0, cameraEnabled: false);
+      expect(states(), hasLength(3));
+      expect(states().last['cameraEnabled'], isFalse);
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(states(), hasLength(3));
+      service.setEffectivePassthroughState(mix: .6, cameraEnabled: true);
+      service.stop();
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(states(), hasLength(3));
+    },
+  );
+
+  test(
     'preview is private until authenticated attach, without LAN startup',
     () {
       service.setCastPreviewUri(firstUri);

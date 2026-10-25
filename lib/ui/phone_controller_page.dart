@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -17,6 +18,7 @@ import '../domain/models/vr_controller_connection_exception.dart';
 import '../domain/models/vr_controller_connection_target.dart';
 import '../domain/models/vr_joystick_geometry.dart';
 import '../domain/models/vr_steering_state.dart';
+import '../domain/models/vr_tracking_marker_configuration.dart';
 import '../domain/services/vr_auto_walk_lock_controller.dart';
 import '../domain/services/vr_controller_link.dart';
 import '../domain/services/vr_controller_mode_session.dart';
@@ -46,6 +48,7 @@ import 'vr_driving_wheel_painter.dart';
 import 'vr_laser_pointing_view.dart';
 import 'vr_laser_slide_pad_painter.dart';
 import 'vr_passthrough_curtain_overlay_painter.dart';
+import 'vr_public_tracking_marker_page.dart';
 import 'vr_wordsphere_search_sheet.dart';
 
 /// Native Smartphone VR Controller & Joystick Screen.
@@ -117,6 +120,69 @@ class PhoneControllerPage extends StatefulWidget {
   State<PhoneControllerPage> createState() => _PhoneControllerPageState();
 }
 
+/// A separate, unmirrored diagnostic plot avoids claiming pixel registration
+/// against device-specific mirrored GPU camera previews.
+class _BodyLandmarkDiagnosticPainter extends CustomPainter {
+  const _BodyLandmarkDiagnosticPainter(this.landmarks);
+  final List<VrBodyLandmark> landmarks;
+
+  static const _bones = <(int, int)>[
+    (11, 12),
+    (11, 13),
+    (13, 15),
+    (12, 14),
+    (14, 16),
+    (11, 23),
+    (12, 24),
+    (23, 24),
+    (23, 25),
+    (25, 27),
+    (24, 26),
+    (26, 28),
+    (27, 29),
+    (29, 31),
+    (28, 30),
+    (30, 32),
+  ];
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawRect(
+      Offset.zero & size,
+      Paint()..color = const Color(0xFF080816),
+    );
+    final points = <int, VrBodyLandmark>{
+      for (final landmark in landmarks)
+        if (landmark.inFrameLikelihood >= .5 &&
+            landmark.u >= 0 &&
+            landmark.u <= 1 &&
+            landmark.v >= 0 &&
+            landmark.v <= 1)
+          landmark.type: landmark,
+    };
+    Offset location(VrBodyLandmark point) =>
+        Offset(point.u * size.width, point.v * size.height);
+    final paint = Paint()
+      ..color = const Color(0xFF10B981)
+      ..strokeWidth = 1.5;
+    for (final (start, end) in _bones) {
+      final a = points[start];
+      final b = points[end];
+      if (a != null && b != null) {
+        canvas.drawLine(location(a), location(b), paint);
+      }
+    }
+    paint.color = const Color(0xFF7DD3FC);
+    for (final point in points.values) {
+      canvas.drawCircle(location(point), 2.5, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_BodyLandmarkDiagnosticPainter oldDelegate) =>
+      !identical(landmarks, oldDelegate.landmarks);
+}
+
 class _PhoneControllerPageState extends State<PhoneControllerPage>
     with WidgetsBindingObserver {
   final TextEditingController _ipController = TextEditingController(
@@ -153,6 +219,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     Duration(seconds: 10),
   ];
   int _socketGeneration = 0;
+  int _effectivePassthroughRevision = -1;
+  bool _hasEffectivePassthroughState = false;
+  double _reportedPassthroughMix = 0;
+  double? _pendingPassthroughMix;
+  final _passthroughSettingsRevision = ValueNotifier<int>(0);
+  final Set<int> _exclusiveControlPointers = {};
   int _surfaceEpoch = 0;
   // mounted remains true while descendants dispose their gesture recognizers.
   // Those recognizers can synchronously call onTapCancel under the tree lock.
@@ -221,8 +293,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   // Horizontal + vertical right-stick look enabled by default so the right
   // thumbstick on the Joystick smartphone can turn left/right as well as pitch.
   bool _horizontalLookEnabled = true;
-  double _lookX =
-      0.0; // Horizontal turn rate from the right thumbstick.
+  double _lookX = 0.0; // Horizontal turn rate from the right thumbstick.
   double _lookY = 0.0; // 180° Vertical tilt (pitch)
   final _moveResponse = VrProgressiveStick();
   final _lookResponse = VrProgressiveStick(initialGain: .45, maxGain: .8);
@@ -241,6 +312,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   // Haptic feedback / vibration state
   bool _hapticsEnabled = true;
+  Timer? _connectionHapticTimer;
 
   void _hapticClick() {
     if (_hapticsEnabled) HapticFeedback.selectionClick();
@@ -255,10 +327,15 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   void _hapticDoublePulse() {
+    _connectionHapticTimer?.cancel();
+    _connectionHapticTimer = null;
     if (_hapticsEnabled) {
       HapticFeedback.heavyImpact();
-      Future.delayed(const Duration(milliseconds: 140), () {
-        HapticFeedback.heavyImpact();
+      _connectionHapticTimer = Timer(const Duration(milliseconds: 140), () {
+        _connectionHapticTimer = null;
+        if (mounted && _isForeground && _isConnected && _hapticsEnabled) {
+          HapticFeedback.heavyImpact();
+        }
       });
     }
   }
@@ -271,6 +348,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   final _laserSteadyDwell = VrLaserSteadyDwellController();
   final _passthroughGesture = VrPassthroughSplitGestureController();
   final _visionService = VrJoystickCameraVisionService();
+  VrTrackingMarkerConfiguration? _trackingMarkerConfiguration;
+  bool _cameraSettingsBusy = false;
+  bool _showAuxiliaryCameraPreview = false;
   int _lastVisionTelemetryUs = 0;
   int _lastPassthroughHapticBucket = 0;
   bool _spatialHudVisible = false;
@@ -313,8 +393,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       VrAutoWalkLockController();
   final VrAutoWalkLockController _rightStickClickDetector =
       VrAutoWalkLockController();
-  final VrFlickStickController _flickStickController =
-      VrFlickStickController();
+  final VrFlickStickController _flickStickController = VrFlickStickController();
   final VrInertialTrackballController _inertialTrackballController =
       VrInertialTrackballController();
   double _rawLookX = 0.0;
@@ -363,6 +442,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _startGyroTracking();
     _startShakeDetection();
     _visionService.addListener(_onVisionServiceUpdated);
+    unawaited(_visionService.start());
 
     // Lock to horizontal (landscape) mode for ergonomic dual-hand controller gameplay
     SystemChrome.setPreferredOrientations([
@@ -450,18 +530,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               if (!mounted || !_isForeground) return;
               final nowUs = _controllerClock.elapsedMicroseconds;
               // Driving tilt remains available when shake-to-hide is disabled.
-              _steering.updateGravity(
-                event.x,
-                event.y,
-                event.z,
-                nowUs,
-              );
-              _motionLook.updateGravity(
-                event.x,
-                event.y,
-                event.z,
-                nowUs,
-              );
+              _steering.updateGravity(event.x, event.y, event.z, nowUs);
+              _motionLook.updateGravity(event.x, event.y, event.z, nowUs);
               _visionService.updateImuGravity(event.x, event.y, event.z);
               if (!_settingsOpen && !_castDialogOpen) {
                 final sensorTimeUs = event.timestamp.microsecondsSinceEpoch;
@@ -493,12 +563,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 return;
               }
               if (_settingsOpen || !_shakeToToggleEnabled) return;
-              if (_shakeDetector.addSample(
-                event.x,
-                event.y,
-                event.z,
-                nowUs,
-              )) {
+              if (_shakeDetector.addSample(event.x, event.y, event.z, nowUs)) {
                 _onShakeDetected();
               }
             },
@@ -614,7 +679,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _hapticMedium();
     _sendState(force: true);
     _stickClickPulseTimer = Timer(
-      const Duration(milliseconds: VrJoystickConstants.stickClickPulseDurationMs),
+      const Duration(
+        milliseconds: VrJoystickConstants.stickClickPulseDurationMs,
+      ),
       () {
         if (!mounted) return;
         setState(() {
@@ -1079,7 +1146,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _hapticMedium();
     _sendState(force: true);
     _laserClickPulseTimer = Timer(
-      const Duration(milliseconds: VrJoystickConstants.laserClickPulseDurationMs),
+      const Duration(
+        milliseconds: VrJoystickConstants.laserClickPulseDurationMs,
+      ),
       () {
         if (!mounted) return;
         setState(() {
@@ -1123,7 +1192,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           ? null
           : trimmed.substring(
               0,
-              math.min(trimmed.length, VrJoystickConstants.maxSearchQueryLength),
+              math.min(
+                trimmed.length,
+                VrJoystickConstants.maxSearchQueryLength,
+              ),
             );
     });
     _sendState(force: true);
@@ -1148,7 +1220,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _hapticDoublePulse();
     _sendState(force: true);
     _searchSubmitPulseTimer = Timer(
-      const Duration(milliseconds: VrJoystickConstants.laserClickPulseDurationMs),
+      const Duration(
+        milliseconds: VrJoystickConstants.laserClickPulseDurationMs,
+      ),
       () {
         if (!mounted) return;
         setState(() {
@@ -1341,6 +1415,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _socketTarget = target;
       _socketGeneration = generation;
       _hostModeSession.reset();
+      _effectivePassthroughRevision = -1;
+      _hasEffectivePassthroughState = false;
+      _pendingPassthroughMix = null;
       _lastHostMode = null;
       _hostActions = const {};
       _reconnectAttempt = 0;
@@ -1364,6 +1441,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             ? '${VrJoystickTranslationConstants.statusLinkedParentVisorPrefix}${target.host}${VrJoystickConstants.colonSeparator}${target.port}${VrJoystickConstants.closeParen}'
             : VrJoystickTranslationConstants.statusConnectedToVisor;
       });
+      _notifyPassthroughSettings();
       if (target != null) unawaited(_rememberHost(target.host));
       _hapticDoublePulse();
       _linkSubscription = socket.messages.listen(
@@ -1373,6 +1451,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         cancelOnError: true,
       );
       _sendState();
+      _sendPublicTrackingMarker();
       // The callback is observational; a host storage failure must not tear
       // down the authenticated controller transport.
       if (_isConnected && identical(_socket, socket)) {
@@ -1458,6 +1537,54 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     return true;
   }
 
+  bool _acceptEffectivePassthroughState(Object? data) {
+    if (data is! String || data.length > 1023) return false;
+    Object? decoded;
+    try {
+      decoded = jsonDecode(data);
+    } catch (_) {
+      return false;
+    }
+    if (decoded is! Map<String, dynamic> ||
+        decoded[VrJoystickConstants.fieldType] !=
+            VrJoystickConstants.passthroughStateMessageType) {
+      return false;
+    }
+    final revision = decoded[VrJoystickConstants.fieldRevision];
+    final mix = decoded[VrJoystickConstants.fieldPassthroughMix];
+    final enabled = decoded['cameraEnabled'];
+    if (revision is! int ||
+        revision < 0 ||
+        revision > 0x7fffffff ||
+        revision <= _effectivePassthroughRevision ||
+        mix is! num ||
+        !mix.isFinite ||
+        mix < 0 ||
+        mix > 1 ||
+        enabled is! bool) {
+      return true;
+    }
+    _effectivePassthroughRevision = revision;
+    final effective = enabled ? mix.toDouble() : 0.0;
+    setState(() {
+      _hasEffectivePassthroughState = true;
+      _reportedPassthroughMix = effective;
+      if (_pendingPassthroughMix case final pending?) {
+        if ((pending - effective).abs() < .005) _pendingPassthroughMix = null;
+      }
+      if (_pendingPassthroughMix == null) {
+        _passthroughGesture.setPassthroughMix(effective);
+      }
+      _lastSentPassthroughMix = _passthroughGesture.passthroughMix;
+      _lastPassthroughHapticBucket = (_passthroughGesture.passthroughMix * 4)
+          .round();
+    });
+    _notifyPassthroughSettings();
+    // Do not echo this observation as an input, command, ACK or haptic. Only
+    // an explicit local slider/tap/gesture may request a camera change.
+    return true;
+  }
+
   Future<void> _openCast() async {
     if (!mounted || _castDialogOpen) return;
     final generation = _castGeneration;
@@ -1529,8 +1656,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   final session = VrCastSession.tryParse(input.text);
                   if (session == null) {
                     update(
-                      () => validation = VrJoystickTranslationConstants
-                          .castPasteFullLocalLink,
+                      () => validation =
+                          VrJoystickTranslationConstants.castPasteFullLocalLink,
                     );
                     return;
                   }
@@ -1622,7 +1749,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         !identical(_socket, socket)) {
       return;
     }
-    if (_acceptCastOffer(data)) return;
+    if (_acceptEffectivePassthroughState(data) || _acceptCastOffer(data)) {
+      return;
+    }
     final hadHostRequest = _hostModeSession.revision != null;
     final previousHostMode = _lastHostMode;
     final request = _hostModeSession.accept(data);
@@ -1747,6 +1876,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   void _onDisconnected(VrControllerLink socket, {Object? error}) {
     if (!mounted || !_surfaceMounted || !identical(_socket, socket)) return;
+    _connectionHapticTimer?.cancel();
+    _connectionHapticTimer = null;
     final target = _socketTarget;
     final expired = error != null && _isSessionExpired(error);
     final permanent =
@@ -1772,6 +1903,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     setState(() {
       _surfaceEpoch++;
       _isConnected = false;
+      _hasEffectivePassthroughState = false;
+      _pendingPassthroughMix = null;
       _isConnecting = false;
       _status = expired
           ? VrJoystickTranslationConstants.statusLinkExpired
@@ -1779,6 +1912,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           ? VrJoystickTranslationConstants.statusDisconnectedManual
           : VrJoystickTranslationConstants.statusDisconnectedReconnecting;
     });
+    _notifyPassthroughSettings();
     if (expired) {
       _notifySessionCallback(() => widget.onSessionExpired?.call(target));
     }
@@ -1831,6 +1965,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _stickClickActive = false;
     _searchSubmittedPulse = false;
     _passthroughGesture.cancelGesture();
+    _exclusiveControlPointers.clear();
     _throttlePedalHeld = false;
     _brakePedalHeld = false;
     _gripHoldTimer?.cancel();
@@ -1873,7 +2008,27 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
   }
 
+  void _notifyPassthroughSettings() {
+    if (mounted && _surfaceMounted) {
+      _passthroughSettingsRevision.value++;
+    }
+  }
+
+  bool get _canControlPassthrough =>
+      _isConnected &&
+      (_socket?.isOpen ?? false) &&
+      _hasEffectivePassthroughState;
+
+  String get _passthroughStatus => !_isConnected
+      ? 'Sin conexión · reconectar'
+      : !_hasEffectivePassthroughState
+      ? 'Sincronizando visor'
+      : _pendingPassthroughMix != null
+      ? 'Esperando visor'
+      : '${(_reportedPassthroughMix * 100).round()}${VrJoystickTranslationConstants.passthroughPercentSuffix}';
+
   void _setBreakthroughMix(double mix) {
+    if (!mix.isFinite || !_canControlPassthrough) return;
     final clamped = mix.clamp(0.0, 1.0);
     setState(() {
       _passthroughGesture.setPassthroughMix(clamped);
@@ -1883,40 +2038,52 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _lastPassthroughHapticBucket = bucket;
       _hapticClick();
     }
-    _sendPassthroughControlMessage(force: true);
+    _sendPassthroughControlMessage(force: true, userCommand: true);
     _sendState();
   }
 
+  Widget _exclusivePassthroughControl(Widget child) => Listener(
+    onPointerDown: (event) => _exclusiveControlPointers.add(event.pointer),
+    child: child,
+  );
+
   void _toggleBreakthroughMix() {
+    if (!_canControlPassthrough) return;
     final current = _passthroughGesture.passthroughMix;
-    final next = current < 0.25
-        ? 0.65
-        : (current < 0.85 ? 1.0 : 0.0);
+    final next = current < 0.25 ? 0.65 : (current < 0.85 ? 1.0 : 0.0);
     setState(() {
       _passthroughGesture.setPassthroughMix(next);
     });
     _hapticMedium();
-    _sendPassthroughControlMessage(force: true);
+    _sendPassthroughControlMessage(force: true, userCommand: true);
     _sendState(force: true);
   }
 
   void _toggleSpatialHud([bool? value]) {
+    if (!_canControlPassthrough) return;
     final next = value ?? !_spatialHudVisible;
     setState(() {
       _spatialHudVisible = next;
     });
-    if (next) {
-      unawaited(_visionService.start());
-    }
     _hapticClick();
     _sendPassthroughControlMessage(force: true);
     _sendState(force: true);
   }
 
-  void _sendPassthroughControlMessage({bool force = false}) {
+  void _sendPassthroughControlMessage({
+    bool force = false,
+    bool userCommand = false,
+  }) {
     final ws = _socket;
     if (ws == null || !ws.isOpen || !_isConnected) return;
     final mix = _passthroughGesture.passthroughMix;
+    if (userCommand) {
+      if (!_canControlPassthrough) return;
+      _pendingPassthroughMix = (mix - _reportedPassthroughMix).abs() > .005
+          ? mix
+          : null;
+      _notifyPassthroughSettings();
+    }
     if (!force &&
         (mix - _lastSentPassthroughMix).abs() < 0.015 &&
         _spatialHudVisible == _lastSentSpatialHudVisible) {
@@ -1925,8 +2092,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _lastSentPassthroughMix = mix;
     _lastSentSpatialHudVisible = _spatialHudVisible;
     final controlPayload = jsonEncode({
-      VrJoystickConstants.fieldType:
-          VrJoystickConstants.passthroughControlType,
+      VrJoystickConstants.fieldType: VrJoystickConstants.passthroughControlType,
+      if (userCommand) VrJoystickConstants.fieldPassthroughCommand: true,
       VrJoystickConstants.fieldPassthroughMix: mix,
       VrJoystickConstants.fieldPassthroughActive:
           _passthroughGesture.passthroughActive,
@@ -1939,6 +2106,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
   }
 
+  void _sendGesturePassthroughChange(double previousMix) {
+    if ((_passthroughGesture.passthroughMix - previousMix).abs() > 0.000001) {
+      _sendPassthroughControlMessage(force: true, userCommand: true);
+    }
+  }
+
   void _onVisionServiceUpdated() {
     if (!mounted || !_isForeground || !_isConnected) return;
     _sendVisionTelemetryMessageIfDue(_controllerClock.elapsedMicroseconds);
@@ -1947,7 +2120,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   void _sendVisionTelemetryMessageIfDue(int nowUs) {
     final ws = _socket;
     if (ws == null || !ws.isOpen || !_isConnected || !_isForeground) return;
-    final minIntervalUs = _showsBluetooth ? 650000 : 340000;
+    final minIntervalUs = _showsBluetooth ? 1500000 : 500000;
     if (nowUs - _lastVisionTelemetryUs < minIntervalUs) return;
     final payloadMap = _visionService.buildVisionTelemetryPayload(
       includeMiniFrame: !_showsBluetooth,
@@ -1972,10 +2145,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       final wireModeName = isLaserOverBle
           ? RemoteControllerMode.joystick.name
           : _activeMode.name;
-      final liveRangeMeters =
-          (_visionService.isCameraStreaming || _visionService.ultrasonicActive)
-          ? _visionService.currentRangeMeters
-          : 0.55;
+      final measuredRangeMeters = _visionService.currentRangeMeters;
+      final liveRangeMeters = measuredRangeMeters == null
+          ? null
+          : (measuredRangeMeters * 100.0).round() / 100.0;
       final state = <String, Object?>{
         VrJoystickConstants.fieldHostModeRevision: _hostModeSession.revision,
         VrJoystickConstants.fieldQx: _orientation.x,
@@ -2121,7 +2294,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   @override
   void dispose() {
+    _connectionHapticTimer?.cancel();
+    _connectionHapticTimer = null;
     _surfaceMounted = false;
+    _passthroughSettingsRevision.dispose();
     WidgetsBinding.instance.removeObserver(this);
     _stopAutomaticReconnect();
     _cancelPendingConnection();
@@ -2620,6 +2796,245 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                           setModalState(() {});
                         },
                       ),
+                      OutlinedButton.icon(
+                        key: const ValueKey(
+                          'controller-public-tracking-marker',
+                        ),
+                        onPressed: _openPublicTrackingMarker,
+                        icon: const Icon(Icons.qr_code_2, size: 16),
+                        label: const Text('Marcador de calibración'),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: const Color(0xFF7DD3FC),
+                        ),
+                      ),
+                      ListenableBuilder(
+                        listenable: _visionService,
+                        builder: (context, _) => Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            SwitchListTile(
+                              key: const ValueKey(
+                                'controller-auxiliary-camera',
+                              ),
+                              contentPadding: EdgeInsets.zero,
+                              value: _visionService.enableHardwareCameraStream,
+                              activeThumbColor: const Color(0xFF10B981),
+                              title: const Text(
+                                'Cámara auxiliar',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                ),
+                              ),
+                              subtitle: const Text(
+                                'Usa una lente de este mando. '
+                                'Permanece activa aunque ocultes el HUD; la cámara del visor es independiente.',
+                                style: TextStyle(
+                                  color: Colors.white60,
+                                  fontSize: 10,
+                                ),
+                              ),
+                              onChanged: _cameraSettingsBusy
+                                  ? null
+                                  : (enabled) async {
+                                      setModalState(
+                                        () => _cameraSettingsBusy = true,
+                                      );
+                                      _visionService
+                                              .enableHardwareCameraStream =
+                                          enabled;
+                                      try {
+                                        if (enabled) {
+                                          await _visionService.start();
+                                        } else {
+                                          await _visionService.stop();
+                                        }
+                                      } finally {
+                                        if (ctx.mounted) {
+                                          setModalState(
+                                            () => _cameraSettingsBusy = false,
+                                          );
+                                        } else {
+                                          _cameraSettingsBusy = false;
+                                        }
+                                      }
+                                    },
+                            ),
+                            if (_visionService.enableHardwareCameraStream) ...[
+                              SwitchListTile(
+                                key: const ValueKey(
+                                  'controller-body-detection',
+                                ),
+                                contentPadding: EdgeInsets.zero,
+                                value: _visionService.bodyDetectionEnabled,
+                                activeThumbColor: const Color(0xFF10B981),
+                                title: const Text(
+                                  'Detección corporal',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                subtitle: const Text(
+                                  'Modelo local de 33 puntos, una persona. Usa resolución media '
+                                  'y hasta 2 análisis/s con presupuesto adaptativo sobre esta misma cámara. No mide distancia.',
+                                  style: TextStyle(
+                                    color: Colors.white60,
+                                    fontSize: 10,
+                                  ),
+                                ),
+                                onChanged: _cameraSettingsBusy
+                                    ? null
+                                    : (enabled) async {
+                                        setModalState(
+                                          () => _cameraSettingsBusy = true,
+                                        );
+                                        try {
+                                          await _visionService
+                                              .setBodyDetectionEnabled(enabled);
+                                        } finally {
+                                          if (ctx.mounted) {
+                                            setModalState(
+                                              () => _cameraSettingsBusy = false,
+                                            );
+                                          } else {
+                                            _cameraSettingsBusy = false;
+                                          }
+                                        }
+                                      },
+                              ),
+                              if (_visionService.bodyDetectionEnabled)
+                                _buildBodyInferenceDiagnostic(),
+                              DropdownButton<String>(
+                                key: const ValueKey(
+                                  'controller-auxiliary-lens',
+                                ),
+                                isExpanded: true,
+                                dropdownColor: const Color(0xFF101528),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                ),
+                                value: _visionService.autoMultiplexLenses
+                                    ? 'auto'
+                                    : _visionService.activeRole,
+                                items: const [
+                                  DropdownMenuItem(
+                                    value: 'rear',
+                                    child: Text('Lente trasera · estable'),
+                                  ),
+                                  DropdownMenuItem(
+                                    value: 'front',
+                                    child: Text('Lente frontal · estable'),
+                                  ),
+                                  DropdownMenuItem(
+                                    value: 'auto',
+                                    child: Text(
+                                      'Auto · alterna lentes; no simultáneas',
+                                    ),
+                                  ),
+                                ],
+                                onChanged: _cameraSettingsBusy
+                                    ? null
+                                    : (mode) async {
+                                        if (mode == null) return;
+                                        setModalState(
+                                          () => _cameraSettingsBusy = true,
+                                        );
+                                        try {
+                                          await _visionService
+                                              .setCameraLensMode(mode);
+                                        } finally {
+                                          if (ctx.mounted) {
+                                            setModalState(
+                                              () => _cameraSettingsBusy = false,
+                                            );
+                                          } else {
+                                            _cameraSettingsBusy = false;
+                                          }
+                                        }
+                                      },
+                              ),
+                              Text(
+                                _cameraSettingsBusy
+                                    ? 'Preparando cámara…'
+                                    : _visionService.isCameraStreaming
+                                    ? 'Activa · ${_visionService.cameraFramesProcessed} analizados · '
+                                          '${_visionService.cameraFramesDropped} descartados · '
+                                          'análisis ${(_visionService.lastCameraProcessingMicroseconds / 1000).toStringAsFixed(2)} ms'
+                                    : _visionService.lastCameraError != null
+                                    ? 'Cámara no disponible: ${_visionService.lastCameraError}'
+                                    : 'Sin captura. Comprueba el permiso de cámara.',
+                                key: const ValueKey(
+                                  'controller-camera-performance',
+                                ),
+                                style: const TextStyle(
+                                  color: Colors.white60,
+                                  fontSize: 10,
+                                ),
+                              ),
+                              SwitchListTile(
+                                key: const ValueKey(
+                                  'controller-auxiliary-preview-toggle',
+                                ),
+                                contentPadding: EdgeInsets.zero,
+                                value: _showAuxiliaryCameraPreview,
+                                activeThumbColor: const Color(0xFF10B981),
+                                title: const Text(
+                                  'Ver cámara auxiliar',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                subtitle: const Text(
+                                  'Vista local para orientar la lente seleccionada, '
+                                  'compartiendo su captura activa.',
+                                  style: TextStyle(
+                                    color: Colors.white60,
+                                    fontSize: 10,
+                                  ),
+                                ),
+                                onChanged: (value) => setModalState(
+                                  () => _showAuxiliaryCameraPreview = value,
+                                ),
+                              ),
+                              if (_showAuxiliaryCameraPreview)
+                                _buildAuxiliaryCameraPreview(),
+                            ],
+                            SwitchListTile(
+                              key: const ValueKey(
+                                'controller-experimental-sonar',
+                              ),
+                              contentPadding: EdgeInsets.zero,
+                              value: _visionService.enableUltrasonicRanging,
+                              activeThumbColor: const Color(0xFFFF9100),
+                              title: const Text(
+                                'Sondeo acústico experimental',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                ),
+                              ),
+                              subtitle: Text(
+                                _visionService.ultrasonicUnavailable
+                                    ? 'Sin medición calibrada disponible. Desactiva y activa para reintentar.'
+                                    : 'Usa micrófono y altavoz. Sólo informa distancia con una medición calibrada; '
+                                          'no es sensado por Wi-Fi o Bluetooth.',
+                                style: const TextStyle(
+                                  color: Colors.white60,
+                                  fontSize: 10,
+                                ),
+                              ),
+                              onChanged: (enabled) {
+                                _visionService.enableUltrasonicRanging =
+                                    enabled;
+                                setModalState(() {});
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
                       SwitchListTile(
                         key: const ValueKey(
                           VrJoystickConstants.keyControllerDynamicOriginToggle,
@@ -2740,7 +3155,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       const SizedBox(height: 6),
                       SegmentedButton<VrRightStickLookMode>(
                         key: const ValueKey(
-                          VrJoystickConstants.keyControllerRightLookModeSelector,
+                          VrJoystickConstants
+                              .keyControllerRightLookModeSelector,
                         ),
                         segments: const [
                           ButtonSegment(
@@ -2792,68 +3208,85 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                         },
                       ),
                       const SizedBox(height: 8),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 8,
-                        ),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF080816),
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(
-                            color: _passthroughGesture.passthroughActive
-                                ? const Color(0xFF00E5FF)
-                                : Colors.white12,
+                      ValueListenableBuilder<int>(
+                        valueListenable: _passthroughSettingsRevision,
+                        builder: (context, revision, child) => Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 8,
                           ),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                const Expanded(
-                                  child: Text(
-                                    VrJoystickTranslationConstants
-                                        .settingsBreakthroughTitle,
-                                    style: TextStyle(
-                                      color: Color(0xFF00E5FF),
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.bold,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF080816),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: _passthroughGesture.passthroughActive
+                                  ? const Color(0xFF00E5FF)
+                                  : Colors.white12,
+                            ),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                mainAxisAlignment:
+                                    MainAxisAlignment.spaceBetween,
+                                children: [
+                                  const Expanded(
+                                    child: Text(
+                                      VrJoystickTranslationConstants
+                                          .settingsBreakthroughTitle,
+                                      style: TextStyle(
+                                        color: Color(0xFF00E5FF),
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.bold,
+                                      ),
                                     ),
                                   ),
-                                ),
-                                Text(
-                                  '${(_passthroughGesture.passthroughMix * 100).round()}${VrJoystickTranslationConstants.passthroughPercentSuffix}',
-                                  style: const TextStyle(
-                                    color: Color(0xFF10B981),
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w800,
+                                  Text(
+                                    _passthroughStatus,
+                                    key: const ValueKey(
+                                      'joystick_passthrough_settings_status',
+                                    ),
+                                    style: const TextStyle(
+                                      color: Color(0xFF10B981),
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w800,
+                                    ),
                                   ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 2),
-                            const Text(
-                              VrJoystickTranslationConstants
-                                  .settingsBreakthroughSubtitle,
-                              style: TextStyle(
-                                color: Colors.white60,
-                                fontSize: 9.5,
+                                ],
                               ),
-                            ),
-                            Slider(
-                              value: _passthroughGesture.passthroughMix,
-                              min: 0.0,
-                              max: 1.0,
-                              activeColor: const Color(0xFF00E5FF),
-                              inactiveColor: Colors.white24,
-                              onChanged: (val) {
-                                _setBreakthroughMix(val);
-                                setModalState(() {});
-                              },
-                            ),
-                          ],
+                              const SizedBox(height: 2),
+                              const Text(
+                                VrJoystickTranslationConstants
+                                    .settingsBreakthroughSubtitle,
+                                style: TextStyle(
+                                  color: Colors.white60,
+                                  fontSize: 9.5,
+                                ),
+                              ),
+                              Slider(
+                                key: const ValueKey(
+                                  'joystick_passthrough_settings_slider',
+                                ),
+                                value: _passthroughGesture.passthroughMix,
+                                min: 0.0,
+                                max: 1.0,
+                                activeColor: const Color(0xFF00E5FF),
+                                inactiveColor: Colors.white24,
+                                onChanged: !_canControlPassthrough
+                                    ? null
+                                    : (val) {
+                                        _setBreakthroughMix(val);
+                                        setModalState(() {});
+                                      },
+                                // A deliberate release also reapplies the same
+                                // chosen mix after the visor was switched OFF.
+                                onChangeEnd: _canControlPassthrough
+                                    ? _setBreakthroughMix
+                                    : null,
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                       const SizedBox(height: 6),
@@ -2888,6 +3321,165 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     ).whenComplete(() {
       if (mounted) setState(() => _settingsOpen = false);
     });
+  }
+
+  Widget _buildAuxiliaryCameraPreview() {
+    final controller = _visionService.previewController;
+    if (controller == null) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 8),
+        child: Text(
+          'Esperando la captura de la lente seleccionada…',
+          style: TextStyle(color: Colors.white60, fontSize: 10),
+        ),
+      );
+    }
+    final lens = switch (controller.description.lensDirection) {
+      CameraLensDirection.front => 'Frontal del mando',
+      CameraLensDirection.back => 'Trasera del mando',
+      CameraLensDirection.external => 'Lente externa del mando',
+    };
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          '$lens · vista local',
+          key: const ValueKey('controller-auxiliary-preview-lens'),
+          style: const TextStyle(color: Color(0xFF7DD3FC), fontSize: 11),
+        ),
+        const SizedBox(height: 6),
+        Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 360, maxHeight: 220),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              // CameraPreview uses the active controller's native texture and
+              // applies device orientation/aspect ratio without a YUV copy.
+              child: CameraPreview(controller, key: ObjectKey(controller)),
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+      ],
+    );
+  }
+
+  void _sendPublicTrackingMarker() {
+    final configuration = _trackingMarkerConfiguration;
+    final socket = _socket;
+    if (!_isConnected ||
+        socket == null ||
+        !socket.isOpen ||
+        configuration == null) {
+      return;
+    }
+    try {
+      socket.add(jsonEncode(configuration.toMessage()));
+    } catch (_) {
+      _onDisconnected(socket);
+    }
+  }
+
+  Future<void> _openPublicTrackingMarker() async {
+    final resend = Timer.periodic(
+      const Duration(milliseconds: 1500),
+      (_) => _sendPublicTrackingMarker(),
+    );
+    try {
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute(
+          builder: (_) => VrPublicTrackingMarkerPage(
+            initialConfiguration: _trackingMarkerConfiguration,
+            onConfiguration: (configuration) {
+              _trackingMarkerConfiguration = configuration;
+              _sendPublicTrackingMarker();
+            },
+          ),
+        ),
+      );
+    } finally {
+      resend.cancel();
+    }
+  }
+
+  Widget _buildBodyInferenceDiagnostic() {
+    final joints = _visionService.bodyLandmarks;
+    final reliable = joints
+        .where((joint) => joint.inFrameLikelihood >= .5)
+        .length;
+    final state = switch (_visionService.bodyStatus) {
+      'ready' =>
+        'Esqueleto estimado · $reliable/${joints.length} puntos con visibilidad ≥50%',
+      'no_person' => 'Modelo activo · sin propuesta corporal',
+      'thermal_backoff' =>
+        'Análisis pausado por temperatura · nivel ${_visionService.bodyThermalStatus ?? '—'}',
+      'confirming_pose' =>
+        'Propuesta en comprobación · ${_visionService.bodyStableFrames} imágenes estables',
+      'rejected_pose' => 'Propuesta descartada por visibilidad o geometría',
+      'stale' => 'Detección caducada · esperando imagen reciente',
+      'waiting_for_camera' ||
+      'waiting_for_frame' => 'Preparando captura para el modelo…',
+      'unsupported_resolution' =>
+        'Resolución insuficiente: requiere al menos 480×360',
+      'unavailable' => 'Modelo no disponible en esta plataforma',
+      _ => 'Estado del modelo: ${_visionService.bodyStatus}',
+    };
+    final latency = _visionService.bodyInferenceMs;
+    final roundTrip = _visionService.bodyRoundTripMs;
+    final du = _visionService.bodyDisplacementU;
+    final dv = _visionService.bodyDisplacementV;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Column(
+        key: const ValueKey('controller-body-diagnostic'),
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            state,
+            style: const TextStyle(color: Color(0xFF7DD3FC), fontSize: 10),
+          ),
+          if (_visionService.bodyStatus == 'thermal_backoff')
+            Text(
+              'Reintento en al menos ${((_visionService.bodyRetryAfterMs ?? 2000) / 1000).toStringAsFixed(0)} s. '
+              'Sin puntos corporales vigentes durante la pausa.',
+              style: const TextStyle(color: Colors.white60, fontSize: 10),
+            ),
+          if (latency != null || roundTrip != null)
+            Text(
+              'ML Kit local · inferencia ${latency?.toStringAsFixed(1) ?? '—'} ms · '
+              'total ${roundTrip?.toStringAsFixed(1) ?? '—'} ms · '
+              'máximo ${_visionService.bodyInferenceMaxHz.toStringAsFixed(1)} análisis/s · '
+              '${_visionService.bodyInferenceFramesDropped} imágenes omitidas',
+              style: const TextStyle(color: Colors.white60, fontSize: 10),
+            ),
+          Text(
+            '${_visionService.bodyRawLandmarkCount} puntos propuestos · '
+            'filtro: ${_visionService.bodyGateReason}. Una propuesta aceptada todavía puede ser incorrecta.',
+            style: const TextStyle(color: Colors.white60, fontSize: 10),
+          ),
+          if (du != null && dv != null)
+            Text(
+              'Cambio 2D desde la referencia: X ${(du * 100).toStringAsFixed(1)}%, '
+              'Y ${(dv * 100).toStringAsFixed(1)}% de la imagen. '
+              'Incluye movimiento de la cámara; no identifica personas ni acciones.',
+              style: const TextStyle(color: Colors.white60, fontSize: 10),
+            ),
+          if (_showAuxiliaryCameraPreview && joints.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            const Text(
+              'Mapa 2D del modelo · imagen orientada, sin espejo',
+              style: TextStyle(color: Colors.white60, fontSize: 10),
+            ),
+            SizedBox(
+              height: 120,
+              child: CustomPaint(
+                painter: _BodyLandmarkDiagnosticPainter(joints),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
   }
 
   Widget _buildSettingsModeCard({
@@ -3106,17 +3698,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   Widget _buildChildRoleBanner() {
     final syncing = _isConnecting && !_isConnected;
     return Container(
-      padding: EdgeInsets.symmetric(
-        horizontal: 8,
-        vertical: syncing ? 5 : 3,
-      ),
+      padding: EdgeInsets.symmetric(horizontal: 8, vertical: syncing ? 5 : 3),
       decoration: BoxDecoration(
         color: const Color(0xFF00E5FF).withValues(alpha: syncing ? 0.20 : 0.08),
         borderRadius: BorderRadius.circular(8),
         border: syncing
-            ? Border.all(
-                color: const Color(0xFF00E5FF).withValues(alpha: 0.65),
-              )
+            ? Border.all(color: const Color(0xFF00E5FF).withValues(alpha: 0.65))
             : null,
       ),
       child: Row(
@@ -3640,28 +4227,30 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           );
           return Positioned.fromRect(
             rect: rect,
-            child: VrControllerRegion(
-              key: ValueKey(
-                '${VrJoystickConstants.keyJoystickButtonPrefix}$title',
+            child: _exclusivePassthroughControl(
+              VrControllerRegion(
+                key: ValueKey(
+                  '${VrJoystickConstants.keyJoystickButtonPrefix}$title',
+                ),
+                path: _joystickLocalPaths[control]!,
+                labelPosition: label - rect.topLeft,
+                label: title,
+                active: active,
+                colors: colors,
+                textColor: textColor,
+                onDown: () {
+                  if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                  onDown();
+                  _hapticMedium();
+                  _sendState();
+                },
+                onUp: () {
+                  if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                  onUp();
+                  _hapticLight();
+                  _sendState();
+                },
               ),
-              path: _joystickLocalPaths[control]!,
-              labelPosition: label - rect.topLeft,
-              label: title,
-              active: active,
-              colors: colors,
-              textColor: textColor,
-              onDown: () {
-                if (!_acceptsSurfaceInput(surfaceEpoch)) return;
-                onDown();
-                _hapticMedium();
-                _sendState();
-              },
-              onUp: () {
-                if (!_acceptsSurfaceInput(surfaceEpoch)) return;
-                onUp();
-                _hapticLight();
-                _sendState();
-              },
             ),
           );
         }
@@ -3717,10 +4306,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                         _pulseStickClick();
                       }
                     }
-                    _motionLook.setActive(
-                      pressed && _motionLookEnabled,
-                      nowUs,
-                    );
+                    _motionLook.setActive(pressed && _motionLookEnabled, nowUs);
                     if (!pressed) _lookResponse.reset();
                     _updateJoystick(nowUs: nowUs);
                     _sendState(force: true);
@@ -3815,8 +4401,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           behavior: HitTestBehavior.translucent,
           onPointerDown: (event) {
             if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+            if (!_canControlPassthrough) return;
+            if (_exclusiveControlPointers.contains(event.pointer)) return;
             final normX = event.localPosition.dx / constraints.maxWidth;
             final normY = event.localPosition.dy / constraints.maxHeight;
+            final previousMix = _passthroughGesture.passthroughMix;
             final changed = _passthroughGesture.onPointerDown(
               pointerId: event.pointer,
               normX: normX,
@@ -3824,6 +4413,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               timestampUs: _controllerClock.elapsedMicroseconds,
             );
             if (changed) {
+              _sendGesturePassthroughChange(previousMix);
               _lastPassthroughHapticBucket =
                   (_passthroughGesture.passthroughMix * 4).round();
               _hapticLight();
@@ -3832,8 +4422,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           },
           onPointerMove: (event) {
             if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+            if (!_canControlPassthrough) return;
+            if (_exclusiveControlPointers.contains(event.pointer)) return;
             final normX = event.localPosition.dx / constraints.maxWidth;
             final normY = event.localPosition.dy / constraints.maxHeight;
+            final previousMix = _passthroughGesture.passthroughMix;
             final changed = _passthroughGesture.onPointerMove(
               pointerId: event.pointer,
               normX: normX,
@@ -3841,6 +4434,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               timestampUs: _controllerClock.elapsedMicroseconds,
             );
             if (changed) {
+              _sendGesturePassthroughChange(previousMix);
               final bucket = (_passthroughGesture.passthroughMix * 4).round();
               if (bucket != _lastPassthroughHapticBucket) {
                 _lastPassthroughHapticBucket = bucket;
@@ -3851,22 +4445,28 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             }
           },
           onPointerUp: (event) {
+            if (_exclusiveControlPointers.remove(event.pointer)) return;
+            final previousMix = _passthroughGesture.passthroughMix;
             final changed = _passthroughGesture.onPointerUpOrCancel(
               pointerId: event.pointer,
               timestampUs: _controllerClock.elapsedMicroseconds,
             );
             if (changed && mounted) {
+              _sendGesturePassthroughChange(previousMix);
               _hapticMedium();
               setState(() {});
               _sendState(force: true);
             }
           },
           onPointerCancel: (event) {
+            if (_exclusiveControlPointers.remove(event.pointer)) return;
+            final previousMix = _passthroughGesture.passthroughMix;
             final changed = _passthroughGesture.onPointerUpOrCancel(
               pointerId: event.pointer,
               timestampUs: _controllerClock.elapsedMicroseconds,
             );
             if (changed && mounted) {
+              _sendGesturePassthroughChange(previousMix);
               setState(() {});
               _sendState(force: true);
             }
@@ -4014,8 +4614,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 height: geometry.footerHeight,
                 child: driving ? _buildDrivingStatus() : _buildJoystickStatus(),
               ),
-              if (_passthroughGesture.isGestureActive ||
-                  _passthroughGesture.passthroughActive)
+              if (_canControlPassthrough &&
+                  _pendingPassthroughMix == null &&
+                  (_passthroughGesture.isGestureActive ||
+                      _reportedPassthroughMix > .01))
                 Positioned.fill(
                   child: IgnorePointer(
                     key: const ValueKey(
@@ -4024,7 +4626,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                     child: CustomPaint(
                       painter: VrPassthroughCurtainOverlayPainter(
                         mode: _passthroughGesture.mode,
-                        passthroughMix: _passthroughGesture.passthroughMix,
+                        passthroughMix: _reportedPassthroughMix,
                         spread: _passthroughGesture.currentSpread,
                         leftThumbNormX: _passthroughGesture.leftThumbNormX,
                         rightThumbNormX: _passthroughGesture.rightThumbNormX,
@@ -4151,12 +4753,17 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               ),
             ),
           if (constraints.maxHeight >= 112) ...[
-            VrBreakthroughCurtainBar(
-              passthroughMix: _passthroughGesture.passthroughMix,
-              spatialHudVisible: _spatialHudVisible,
-              onMixChanged: _setBreakthroughMix,
-              onToggleMix: _toggleBreakthroughMix,
-              onToggleSpatialHud: () => _toggleSpatialHud(),
+            _exclusivePassthroughControl(
+              VrBreakthroughCurtainBar(
+                passthroughMix: _reportedPassthroughMix,
+                connected: _isConnected,
+                synchronized: _hasEffectivePassthroughState,
+                pending: _pendingPassthroughMix != null,
+                spatialHudVisible: _spatialHudVisible,
+                onMixChanged: _setBreakthroughMix,
+                onToggleMix: _toggleBreakthroughMix,
+                onToggleSpatialHud: () => _toggleSpatialHud(),
+              ),
             ),
             const SizedBox(height: 4),
           ],

@@ -357,7 +357,7 @@ void main() {
       );
       expect(
         blePayload[VrJoystickConstants.fieldRangeMeters],
-        closeTo(0.54, 0.08),
+        isNull,
       );
       expect(
         blePayload[VrJoystickConstants.fieldLeftFootU],
@@ -445,6 +445,31 @@ void main() {
       expect(service.latestState.rightFootU, closeTo(0.67, 1e-3));
       expect(service.latestState.handU, closeTo(0.51, 1e-3));
       expect(service.latestState.joystickCameraRole, 'rear_floor');
+
+      // Expiration is explicit; do not revive the old range via HUD or input.
+      link.incoming.add(
+        '{"type":"vrlizate.visionTelemetry","rangeMeters":null}',
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 15));
+      expect(service.latestState.rangeMeters, isNull);
+      service.setPassthroughMix(0.65);
+      expect(service.latestState.rangeMeters, isNull);
+      link.incoming.add('{"sequence":2,"stickX":0.2,"qw":1}');
+      await Future<void>.delayed(const Duration(milliseconds: 15));
+      expect(service.latestState.rangeMeters, isNull);
+      nowUs += 250000;
+      await Future<void>.delayed(const Duration(milliseconds: 45));
+      expect(service.latestState.rangeMeters, isNull);
+      link.incoming.add(
+        '{"sequence":3,"qw":1,"rangeMeters":0.7}',
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 15));
+      expect(service.latestState.rangeMeters, closeTo(0.7, 1e-3));
+      link.incoming.add(
+        '{"sequence":4,"qw":1,"rangeMeters":null,"range":0.5}',
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 15));
+      expect(service.latestState.rangeMeters, isNull);
     });
   });
 }

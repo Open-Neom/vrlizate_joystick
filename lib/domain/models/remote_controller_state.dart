@@ -62,6 +62,10 @@ class RemoteControllerState {
   final bool searchSubmitted;
   final double passthroughMix;
   final bool passthroughActive;
+
+  /// Receiver-owned action counter, never read from an ordinary wire snapshot.
+  /// Retained state may repeat a revision; consumers apply each revision once.
+  final int passthroughCommandRevision;
   final bool spatialHudVisible;
   final double? leftFootU;
   final double? leftFootV;
@@ -117,6 +121,7 @@ class RemoteControllerState {
     this.searchQuery,
     this.searchSubmitted = false,
     this.passthroughMix = 0.0,
+    this.passthroughCommandRevision = 0,
     bool? passthroughActive,
     this.spatialHudVisible = false,
     this.leftFootU,

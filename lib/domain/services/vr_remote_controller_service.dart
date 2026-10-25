@@ -22,6 +22,7 @@ import '../models/remote_controller_state.dart';
 import '../models/vr_controller_mode_request.dart';
 import '../models/vr_controller_telemetry.dart';
 import '../models/vr_local_address_candidate.dart';
+import '../models/vr_tracking_marker_configuration.dart';
 import 'vr_controller_link.dart';
 import 'vr_local_network_address.dart';
 import 'vr_web_socket_controller_link.dart';
@@ -51,6 +52,8 @@ class VrRemoteControllerService {
   Timer? _beaconTimer;
   Timer? _inputWatchdog;
   VrControllerLink? _client;
+  VrTrackingMarkerConfiguration? _trackingMarker;
+  VrTrackingMarkerConfiguration? get trackingMarker => _trackingMarker;
   StreamSubscription<Object?>? _clientSubscription;
   final Stopwatch _clock = Stopwatch()..start();
   final int Function()? _nowMicroseconds;
@@ -84,6 +87,11 @@ class VrRemoteControllerService {
   int? _heldCaptionAckRevision;
   bool _modeControlSupported = false;
   Uri? _castPreviewUri;
+  double? _effectivePassthroughMix;
+  bool _effectiveCameraEnabled = false;
+  int _effectivePassthroughRevision = 0;
+  Timer? _effectivePassthroughTimer;
+  int? _lastEffectivePassthroughSentUs;
 
   static const int _maxMessageCharacters = 4096;
   static const int _maxMessagesPerSecond = 240;
@@ -103,9 +111,7 @@ class VrRemoteControllerService {
        _localAddressCandidates =
            localAddressCandidates ?? _systemLocalAddressCandidates {
     if (inputTimeout <= Duration.zero || watchdogInterval <= Duration.zero) {
-      throw ArgumentError(
-        VrJoystickTranslationConstants.errorPositiveTimeouts,
-      );
+      throw ArgumentError(VrJoystickTranslationConstants.errorPositiveTimeouts);
     }
     if (this.sessionToken.isEmpty) {
       throw ArgumentError.value(
@@ -182,6 +188,10 @@ class VrRemoteControllerService {
     _localHandheldActive = active;
     if (_client == null) {
       _latestState = RemoteControllerState(
+        passthroughCommandRevision: _passthroughCommandRevision,
+        passthroughMix: _latchedPassthroughMix,
+        passthroughActive: _latchedPassthroughActive,
+        spatialHudVisible: _latchedSpatialHudVisible,
         orientation: _latestState.orientation.clone(),
         mode: _modeRequest.mode,
         controllerVisible: false,
@@ -207,7 +217,60 @@ class VrRemoteControllerService {
     _latestState = state;
     _lastAcceptedStateUs = _nowUs;
     _acceptedStates++;
-    _stateController.add(_latestState);
+    _emitWithLatchedPassthrough();
+  }
+
+  /// Mirrors the visor's effective setting. This is feedback, never a camera
+  /// command, and does not mutate the received input or its command revisions.
+  /// Deduplication keeps normal tracking/frame updates off the BLE channel.
+  void setEffectivePassthroughState({
+    required double mix,
+    required bool cameraEnabled,
+  }) {
+    if (_disposed || !mix.isFinite) return;
+    final effective = cameraEnabled ? mix.clamp(0.0, 1.0) : 0.0;
+    if (_effectivePassthroughMix == effective &&
+        _effectiveCameraEnabled == cameraEnabled) {
+      return;
+    }
+    _effectivePassthroughMix = effective;
+    _effectiveCameraEnabled = cameraEnabled;
+    _effectivePassthroughRevision++;
+    final last = _lastEffectivePassthroughSentUs;
+    final elapsed = last == null ? 100000 : _nowUs - last;
+    if (!cameraEnabled || _client == null || elapsed >= 100000) {
+      _sendEffectivePassthroughState();
+    } else {
+      _effectivePassthroughTimer ??= Timer(
+        Duration(microseconds: 100000 - elapsed),
+        _sendEffectivePassthroughState,
+      );
+    }
+  }
+
+  void _sendEffectivePassthroughState() {
+    _effectivePassthroughTimer?.cancel();
+    _effectivePassthroughTimer = null;
+    final mix = _effectivePassthroughMix;
+    final client = _client;
+    if (_disposed || client == null || mix == null) return;
+    _lastEffectivePassthroughSentUs = _nowUs;
+    try {
+      client.add(
+        jsonEncode({
+          VrJoystickConstants.fieldType:
+              VrJoystickConstants.passthroughStateMessageType,
+          VrJoystickConstants.fieldRevision: _effectivePassthroughRevision,
+          VrJoystickConstants.fieldPassthroughMix: mix,
+          'cameraEnabled': _effectiveCameraEnabled,
+        }),
+      );
+    } catch (_) {
+      _disconnectClient(
+        client,
+        reason: VrControllerDisconnectReason.transportError,
+      );
+    }
   }
 
   /// Announces a separately hosted, read-only preview to the paired controller.
@@ -300,6 +363,10 @@ class VrRemoteControllerService {
     if (!sameProfile) {
       if (_localHandheldActive && _client == null) {
         _latestState = RemoteControllerState(
+          passthroughCommandRevision: _passthroughCommandRevision,
+          passthroughMix: _latchedPassthroughMix,
+          passthroughActive: _latchedPassthroughActive,
+          spatialHudVisible: _latchedSpatialHudVisible,
           orientation: _latestState.orientation.clone(),
           mode: mode,
           controllerVisible: false,
@@ -547,6 +614,7 @@ class VrRemoteControllerService {
   }
 
   void _handleControllerLink(VrControllerLink socket) {
+    _trackingMarker = null;
     // One controller owns the input state. A reconnect replaces it atomically;
     // late onDone/onError callbacks from the old socket cannot clear the new one.
     final previous = _client;
@@ -642,6 +710,10 @@ class VrRemoteControllerService {
             _lastStateReceivedUs = now;
 
             _latestState = RemoteControllerState(
+              passthroughCommandRevision: _passthroughCommandRevision,
+              passthroughMix: _latchedPassthroughMix,
+              passthroughActive: _latchedPassthroughActive,
+              spatialHudVisible: _latchedSpatialHudVisible,
               orientation: _predictedOrientation.clone(),
               angularVelocity: pose.angularVelocity,
               isTriggerPressed: trigger,
@@ -677,11 +749,24 @@ class VrRemoteControllerService {
             return;
           }
           final json = decoded;
+          if (json['type'] == VrTrackingMarkerConfiguration.messageType) {
+            final marker = VrTrackingMarkerConfiguration.fromMessage(json);
+            if (marker == null) {
+              _rejectedStates++;
+              return;
+            }
+            _trackingMarker = marker;
+            _emitWithLatchedPassthrough();
+            return;
+          }
           if (json[VrJoystickConstants.fieldType] ==
               VrJoystickConstants.passthroughControlType) {
             final rawMix = json[VrJoystickConstants.fieldPassthroughMix];
             if (rawMix is num && rawMix.isFinite) {
               _latchedPassthroughMix = rawMix.toDouble().clamp(0.0, 1.0);
+              if (json[VrJoystickConstants.fieldPassthroughCommand] == true) {
+                _passthroughCommandRevision++;
+              }
             }
             final rawActive = json[VrJoystickConstants.fieldPassthroughActive];
             _latchedPassthroughActive = rawActive is bool
@@ -794,10 +879,14 @@ class VrRemoteControllerService {
               (json[VrJoystickConstants.fieldAimY] as num?)?.toDouble() ??
               0.0;
           final bool recenter = json[VrJoystickConstants.fieldRecenter] == true;
+          final rawRange =
+              json.containsKey(VrJoystickConstants.fieldRangeMeters)
+              ? json[VrJoystickConstants.fieldRangeMeters]
+              : json[VrJoystickConstants.fieldRange];
           final double? rangeMeters =
-              (json[VrJoystickConstants.fieldRangeMeters] as num?)
-                  ?.toDouble() ??
-              (json[VrJoystickConstants.fieldRange] as num?)?.toDouble();
+              rawRange is num && rawRange.isFinite && rawRange > 0
+              ? rawRange.toDouble()
+              : null;
 
           final String modeStr =
               json[VrJoystickConstants.fieldMode] as String? ??
@@ -859,8 +948,8 @@ class VrRemoteControllerService {
           if (json.containsKey(VrJoystickConstants.fieldPassthroughMix)) {
             _latchedPassthroughMix =
                 ((json[VrJoystickConstants.fieldPassthroughMix] as num?)
-                        ?.toDouble() ??
-                    0.0)
+                            ?.toDouble() ??
+                        0.0)
                     .clamp(0.0, 1.0);
           }
           if (json.containsKey(VrJoystickConstants.fieldPassthroughActive)) {
@@ -869,12 +958,21 @@ class VrRemoteControllerService {
           } else {
             _latchedPassthroughActive = _latchedPassthroughMix > 0.01;
           }
+          if (json.containsKey(VrJoystickConstants.fieldRangeMeters) ||
+              json.containsKey(VrJoystickConstants.fieldRange)) {
+            _hasRangeTelemetry = true;
+            _latchedRangeMeters =
+                rangeMeters != null && rangeMeters.isFinite && rangeMeters > 0
+                ? rangeMeters
+                : null;
+          }
           if (json.containsKey(VrJoystickConstants.fieldSpatialHudVisible)) {
             _latchedSpatialHudVisible =
                 json[VrJoystickConstants.fieldSpatialHudVisible] == true;
           }
 
           _latestState = RemoteControllerState(
+            passthroughCommandRevision: _passthroughCommandRevision,
             orientation: _predictedOrientation.clone(),
             angularVelocity: angularVelocity,
             isTriggerPressed: trigger || btnR,
@@ -911,7 +1009,7 @@ class VrRemoteControllerService {
             drivingPaused: drivingPaused,
             motionAvailable:
                 json[VrJoystickConstants.fieldMotionAvailable] == true,
-            rangeMeters: rangeMeters ?? _latchedRangeMeters,
+            rangeMeters: _latchedRangeMeters,
             searchQuery: searchQuery,
             searchSubmitted: searchSubmitted,
             passthroughMix: _latchedPassthroughMix,
@@ -948,14 +1046,17 @@ class VrRemoteControllerService {
       cancelOnError: true,
     );
     _sendControllerMode();
+    _sendEffectivePassthroughState();
     final preview = _castPreviewUri;
     if (preview != null) _sendCastPreview(_castPreviewMessage(preview));
   }
 
   double _latchedPassthroughMix = 0.0;
+  int _passthroughCommandRevision = 0;
   bool _latchedPassthroughActive = false;
   bool _latchedSpatialHudVisible = false;
   double? _latchedRangeMeters;
+  bool _hasRangeTelemetry = false;
   double? _latchedLeftFootU;
   double? _latchedLeftFootV;
   double? _latchedRightFootU;
@@ -976,8 +1077,13 @@ class VrRemoteControllerService {
       return (v is num && v.isFinite) ? v.toDouble() : null;
     }
 
-    _latchedRangeMeters =
-        finiteNum(VrJoystickConstants.fieldRangeMeters) ?? _latchedRangeMeters;
+    if (json.containsKey(VrJoystickConstants.fieldRangeMeters)) {
+      // Absence is a partial update; an explicit null invalidates the previous
+      // measurement. Never resurrect it from a retained controller state.
+      _hasRangeTelemetry = true;
+      final range = finiteNum(VrJoystickConstants.fieldRangeMeters);
+      _latchedRangeMeters = range != null && range > 0 ? range : null;
+    }
     _latchedLeftFootU =
         finiteNum(VrJoystickConstants.fieldLeftFootU) ?? _latchedLeftFootU;
     _latchedLeftFootV =
@@ -1013,9 +1119,10 @@ class VrRemoteControllerService {
   /// Directly updates the latched Breakthrough/Passthrough mix (`0.0 .. 1.0`)
   /// on the Visor host and notifies listeners.
   void setPassthroughMix(double mix) {
-    if (_disposed) return;
+    if (_disposed || !mix.isFinite) return;
     _latchedPassthroughMix = mix.clamp(0.0, 1.0);
     _latchedPassthroughActive = _latchedPassthroughMix > 0.01;
+    _passthroughCommandRevision++;
     _emitWithLatchedPassthrough();
   }
 
@@ -1029,6 +1136,7 @@ class VrRemoteControllerService {
   void _emitWithLatchedPassthrough() {
     final prev = _latestState;
     _latestState = RemoteControllerState(
+      passthroughCommandRevision: _passthroughCommandRevision,
       orientation: prev.orientation.clone(),
       angularVelocity: prev.angularVelocity.clone(),
       isTriggerPressed: prev.isTriggerPressed,
@@ -1060,7 +1168,7 @@ class VrRemoteControllerService {
       drivingPaused: prev.drivingPaused,
       motionAvailable: prev.motionAvailable,
       isNeutralized: prev.isNeutralized,
-      rangeMeters: _latchedRangeMeters ?? prev.rangeMeters,
+      rangeMeters: _hasRangeTelemetry ? _latchedRangeMeters : prev.rangeMeters,
       searchQuery: prev.searchQuery,
       searchSubmitted: prev.searchSubmitted,
       passthroughMix: _latchedPassthroughMix,
@@ -1129,6 +1237,9 @@ class VrRemoteControllerService {
         VrControllerDisconnectReason.connectionClosed,
   }) {
     if (!identical(socket, _client)) return;
+    _effectivePassthroughTimer?.cancel();
+    _effectivePassthroughTimer = null;
+    _trackingMarker = null;
     _lastDisconnectReason = reason;
     _client = null;
     _heldCaptionAckRevision = null;
@@ -1144,12 +1255,15 @@ class VrRemoteControllerService {
   void _releaseInputs({bool? controllerVisible}) {
     _posePredictor.reset();
     _latestState = RemoteControllerState(
+      passthroughCommandRevision: _passthroughCommandRevision,
       orientation: _latestState.orientation.clone(),
       mode: _latestState.mode,
       drivingPaused: _latestState.mode == RemoteControllerMode.driving,
       isNeutralized: true,
       controllerVisible: controllerVisible ?? _latestState.controllerVisible,
-      rangeMeters: _latchedRangeMeters ?? _latestState.rangeMeters,
+      rangeMeters: _hasRangeTelemetry
+          ? _latchedRangeMeters
+          : _latestState.rangeMeters,
       passthroughMix: _latchedPassthroughMix,
       passthroughActive: _latchedPassthroughActive,
       spatialHudVisible: _latchedSpatialHudVisible,
@@ -1188,6 +1302,8 @@ class VrRemoteControllerService {
   }
 
   void stop() {
+    _effectivePassthroughTimer?.cancel();
+    _effectivePassthroughTimer = null;
     _lifecycleGeneration++;
     _castPreviewUri = null;
     _startOperation = null;

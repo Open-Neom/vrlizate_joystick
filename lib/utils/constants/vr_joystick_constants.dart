@@ -183,6 +183,7 @@ abstract final class VrJoystickConstants {
   static const String fieldSearchSubmitted = 'searchSubmitted';
   static const String fieldPassthroughMix = 'passthroughMix';
   static const String fieldPassthroughActive = 'passthroughActive';
+  static const String fieldPassthroughCommand = 'passthroughCommand';
   static const int maxSearchQueryLength = 120;
 
   // Dual-Thumb Center-to-Lateral Passthrough Split Gesture Constants
@@ -204,6 +205,8 @@ abstract final class VrJoystickConstants {
   static const int passthroughDoubleTapMaxIntervalUs = 450000;
   static const int passthroughSonarPulseDurationUs = 1200000;
   static const String passthroughControlType = 'vrlizate.passthrough';
+  static const String passthroughStateMessageType =
+      'vrlizate.passthrough.state';
   static const String visionTelemetryMessageType = 'vrlizate.visionTelemetry';
   static const String fieldPassthroughStyle = 'passthroughStyle';
   static const String fieldPassthroughSonarPulse = 'passthroughSonarPulse';
@@ -316,11 +319,7 @@ abstract final class VrJoystickConstants {
     fieldPassthroughMix,
   ];
 
-  static const List<String> angularVelocityKeys = [
-    fieldWx,
-    fieldWy,
-    fieldWz,
-  ];
+  static const List<String> angularVelocityKeys = [fieldWx, fieldWy, fieldWz];
 
   static const List<String> neutralButtonKeys = [
     fieldTrigger,

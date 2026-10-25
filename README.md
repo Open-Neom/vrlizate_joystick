@@ -62,6 +62,70 @@ Navigator.of(context).push(
 - **Supresión de dwell:** mientras hay un teléfono mando conectado, el anfitrión desactiva la selección automática por tiempo de mirada (`setDwellSuppressed(remotePhone, true)`).
 - **Seguridad en cambios de modo y reconexión:** todo cambio de perfil o reconexión exige un acuse en estado neutral; el watchdog de 500 ms neutraliza entradas obsoletas y `driving` permanece en pausa hasta pulsar `CONTINUAR`.
 
+## Estado de Breakthrough / passthrough
+
+El visor conserva la autoridad sobre su cámara y publica el ajuste efectivo al
+mando mediante el enlace dúplex ya autenticado, incluido Bluetooth LE. La app
+debe comunicar sus cambios locales o persistidos al servicio:
+
+```dart
+service.setEffectivePassthroughState(
+  mix: .65,
+  cameraEnabled: true,
+);
+```
+
+El mensaje visor → mando es una observación de estado:
+
+```json
+{
+  "type": "vrlizate.passthrough.state",
+  "revision": 7,
+  "passthroughMix": 0.65,
+  "cameraEnabled": true
+}
+```
+
+- `revision`: contador creciente del visor. El mando descarta revisiones ya
+  observadas dentro del enlace actual; una reconexión establece una nueva base.
+- `passthroughMix`: mezcla efectiva entre `0.0` y `1.0`. Cuando
+  `cameraEnabled` es `false`, el servicio publica `0.0`.
+- `cameraEnabled`: ajuste vigente del visor. Este mensaje no certifica por sí
+  solo permisos de cámara, recepción de vídeo ni latencia de la transmisión.
+
+Se publica al cambiar el estado y se entrega el último snapshot inmediatamente
+al conectar un mando autenticado. Los cambios ON durante un arrastre se agrupan
+cada 100 ms, hasta 10 actualizaciones por segundo, conservando el valor más
+reciente. OFF (`cameraEnabled: false`) se envía inmediatamente y cancela la
+actualización pendiente. Desconectar o detener el servicio cancela sus timers;
+no existe polling periódico de confirmación ni tráfico por cada frame de VR.
+
+Recibir este estado no genera comandos, acuses de entrada, vibración ni cambios
+de cámara. Tampoco modifica `latestState` o `passthroughCommandRevision` en el
+visor. Una acción deliberada del usuario mantiene el contrato mando → visor
+`type: "vrlizate.passthrough"` con `passthroughCommand: true`; los snapshots
+retenidos y las observaciones del visor nunca se convierten en esa acción.
+El apagado local y las protecciones existentes contra revisiones obsoletas
+siguen siendo responsabilidad del visor.
+
+La barra y Ajustes distinguen lo confirmado de lo solicitado:
+
+- **Sincronizando visor:** enlace conectado, todavía sin snapshot válido; los
+  controles de passthrough permanecen deshabilitados.
+- **Esperando visor:** hay un cambio solicitado sin confirmar. La barra conserva
+  el último porcentaje confirmado y sólo resuelve la espera cuando observa una
+  revisión nueva con el valor solicitado. Es confirmación del estado observado,
+  no un ACK independiente por cada paquete.
+- **Sin conexión · reconectar:** el estado actual es desconocido y se bloquean
+  barra, slider y gestos de cámara. No se guardan órdenes OFF u ON para enviarlas
+  posteriormente; al reconectar se recibe el estado vigente del visor.
+
+Por ello, pulsar OFF no muestra 0 % como si ya estuviera aplicado cuando el
+enlace perdió la orden. El overlay de porcentaje se oculta durante la espera o
+desconexión, y los Ajustes abiertos se actualizan al recibir la confirmación o
+perder el enlace. Este protocolo es independiente del streaming Wi-Fi: una
+imagen pausada no confirma el estado de la cámara ni del enlace Bluetooth.
+
 ## Verificación
 
 ```sh

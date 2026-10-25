@@ -10,7 +10,8 @@ import '../domain/services/vr_remote_controller_service.dart';
 /// Application-owned video session. Controller links only advertise its URL;
 /// they never carry frames or start a second controller transport.
 class VrAppCast {
-  VrAppCast({VrCastHost? host}) : host = host ?? VrCastHost() {
+  VrAppCast({VrCastHost? host})
+    : host = host ?? VrCastHost(realtime: VrCastRealtimeHost()) {
     this.host.addListener(_announce);
   }
 
@@ -20,6 +21,12 @@ class VrAppCast {
   bool _autoAllowed = true;
   bool _automatic = false;
   bool _disposed = false;
+
+  bool get hasVideoSession => host.realtime?.hasVideoSession ?? false;
+
+  Future<void> suspendVideoBeforeNavigation() async {
+    await host.realtime?.suspendBeforeNavigation();
+  }
 
   void _connectionChanged() {
     if (_disposed) return;
@@ -121,11 +128,13 @@ class VrCastExperience extends StatefulWidget {
     required this.child,
     this.active = true,
     this.remoteController,
+    this.realtimeStereo = true,
   });
 
   final Widget child;
   final bool active;
   final VrRemoteControllerService? remoteController;
+  final bool realtimeStereo;
 
   @override
   State<VrCastExperience> createState() => _VrCastExperienceState();
@@ -169,7 +178,10 @@ class _VrCastExperienceState extends State<VrCastExperience> {
     if (cast == null) return widget.child;
     return VrCastSurface(
       host: cast.host,
-      enabled: widget.active && (ModalRoute.isCurrentOf(context) ?? true),
+      // The surface owns route/lifecycle admission, including the short
+      // inactive-to-resumed handoff after native screen-capture permission.
+      enabled: widget.active,
+      realtimeStereo: widget.realtimeStereo,
       child: widget.child,
     );
   }
@@ -276,9 +288,10 @@ class _CastSettingsState extends State<_CastSettings> {
                 ),
                 const SizedBox(height: 12),
                 const Text(
-                  'Vista previa · un ojo · 360 px · hasta 3 FPS · sin audio. '
-                  'Comienza al entrar en una experiencia y abrir un receptor; '
-                  'se pausa en los ajustes y al salir de la app.',
+                  'Vídeo por Wi-Fi · un ojo · objetivo 24 FPS · sin audio. '
+                  'El visor solicita permiso de captura al conectar el receptor. '
+                  'Si el vídeo no está disponible se conserva la vista previa. '
+                  'Se detiene al abrir otra pantalla o salir de la app.',
                   style: TextStyle(color: Colors.white70),
                 ),
                 const SizedBox(height: 12),

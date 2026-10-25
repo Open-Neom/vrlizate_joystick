@@ -6,14 +6,36 @@ import 'dart:math' as math;
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../../utils/constants/vr_joystick_constants.dart';
+import 'vr_body_pose_gate.dart';
+import 'vr_camera_analysis_budget.dart';
+import 'vr_vision_inference_budget.dart';
+import 'vr_vision_inference_client.dart';
 
-/// Real-time dual-camera Computer Vision (Cám 2 Piso/Pies + Cám 3 Manos/Visor)
-/// and High-Frequency Ultrasonic ToF (18.6–20.1 kHz) ranging service running on
-/// the Joystick smartphone.
-class VrJoystickCameraVisionService extends ChangeNotifier {
+export 'vr_body_pose_gate.dart' show VrBodyLandmark;
+
+/// Low-rate optical heuristics on the controller phone, independent of the
+/// headset camera. Rear/front cameras are multiplexed, never claimed concurrent.
+/// Acoustic ranging is optional and requires a real native implementation.
+class VrJoystickCameraVisionService extends ChangeNotifier
+    with WidgetsBindingObserver {
+  VrJoystickCameraVisionService({
+    @visibleForTesting int Function()? monotonicMicroseconds,
+    @visibleForTesting VrVisionInferenceClient? inferenceClient,
+  }) : _inferenceClient = inferenceClient ?? VrVisionInferenceClient() {
+    _nowMicroseconds =
+        monotonicMicroseconds ?? () => _clock.elapsedMicroseconds;
+  }
+
+  static const int _frameIntervalUs = 150000;
+  static const int _sampleFreshnessUs = 2000000;
+  static const int _ultrasonicFreshnessUs = 1600000;
+  static const Duration _ultrasonicTimeout = Duration(seconds: 2);
+  final Stopwatch _clock = Stopwatch()..start();
+  late final int Function() _nowMicroseconds;
   static const MethodChannel _ultrasonicChannel = MethodChannel(
     VrJoystickConstants.ultrasonicSonarChannelName,
   );
@@ -26,18 +48,67 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
   bool _starting = false;
   bool _disposed = false;
   final bool _enabled = true;
-  bool enableHardwareCameraStream = false;
-  bool _autoMultiplexLenses = true;
+  bool _enableHardwareCameraStream = false;
+  bool _enableUltrasonicRanging = false;
+  bool _ultrasonicPermissionGranted = false;
+  bool _ultrasonicUnavailable = false;
+  bool _configuringUltrasonic = false;
+  bool _observingLifecycle = false;
+  bool _suspended = false;
+  bool _wantsCameraRunning = false;
+  int _cameraGeneration = 0;
+  Future<void> _cameraOperation = Future<void>.value();
+  bool _autoMultiplexLenses = false;
   String _activeRole = VrJoystickConstants.cameraRoleRear;
 
-  DateTime _lastFrameProcessedAt = DateTime.fromMillisecondsSinceEpoch(0);
-  DateTime _lastLensSwitchAt = DateTime.fromMillisecondsSinceEpoch(0);
-  DateTime _lastUltrasonicPingAt = DateTime.fromMillisecondsSinceEpoch(0);
+  int? _lastFrameProcessedUs;
+  int? _lastRearFrameUs;
+  int? _lastFrontFrameUs;
+  int _lastLensSwitchUs = 0;
+  int? _lastUltrasonicPingUs;
+  int? _lastUltrasonicSampleUs;
   bool _ultrasonicPingInFlight = false;
+  int _ultrasonicGeneration = 0;
+  int _cameraFramesReceived = 0;
+  int _cameraFramesProcessed = 0;
+  int _cameraFramesDropped = 0;
+  int _lastCameraProcessingUs = 0;
+  int _maxCameraProcessingUs = 0;
+  int _lastMetricsLogUs = 0;
+  String? _lastCameraError;
+  bool _cameraBudgetStatusInFlight = false;
+  final VrVisionInferenceClient _inferenceClient;
+  final VrBodyPoseGate _bodyPoseGate = VrBodyPoseGate();
+  final VrVisionInferenceBudget _inferenceBudget = VrVisionInferenceBudget();
+  bool _bodyDetectionEnabled = false;
+  bool _bodyUnavailable = false;
+  int _bodyEpoch = 0;
+  int? _lastBodySampleUs;
+  int _inferenceSequence = 0;
+  int _inferenceFramesDropped = 0;
+  int _lastBodyMetricsLogUs = 0;
+  String _bodyStatus = 'disabled';
+  String _bodyGateReason = 'no_pose';
+  int _bodyRawLandmarkCount = 0;
+  int _bodyStableFrames = 0;
+  int? _bodyThermalStatus;
+  int? _bodyRetryAfterMs;
+  String? _bodySourceId;
+  String? _bodyBaselineSource;
+  int? _bodyBaselineRotation;
+  double? _bodyInferenceMs;
+  double? _bodyRoundTripMs;
+  List<VrBodyLandmark> _bodyLandmarks = const [];
+  Map<int, VrBodyLandmark>? _bodyBaseline;
+  double? _bodyDisplacementU;
+  double? _bodyDisplacementV;
+  double? _bodyJointDisplacement;
+  List<Map<String, Object?>> _publicMarkers = const [];
 
   Uint8List? _rearMiniFrame;
   Uint8List? _frontMiniFrame;
   String? _latestMiniFrameBase64;
+  Uint8List? _latestMiniFrame;
 
   // Real-time Cám 2 (Rear / Floor) CV landmarks: left & right feet UV
   double _leftFootU = VrJoystickConstants.defaultLeftFootU;
@@ -53,17 +124,146 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
   double _visorU = VrJoystickConstants.defaultVisorU;
   double _visorV = VrJoystickConstants.defaultVisorV;
   double _visorWidth = VrJoystickConstants.defaultVisorWidth;
+  bool _hasOpticalVisor = false;
 
-  // High-frequency ultrasonic + optical + IMU fused distance d_VJ (meters)
-  double _currentRangeMeters = VrJoystickConstants.defaultRangeMeters;
-  double _ultrasonicEchoMeters = VrJoystickConstants.defaultRangeMeters;
+  // Only a calibrated acoustic backend can supply metres. Chroma silhouettes
+  // and IMU posture have no calibrated scale and cannot create a range.
+  double? _currentRangeMeters;
+  double? _ultrasonicEchoMeters;
   double _ultrasonicSnrDb = 0.0;
   bool _ultrasonicActive = false;
+  bool _hasLiveSensorSample = false;
   double _imuPitchRadians = 0.0;
+  double _imuRollRadians = 0.0;
 
   bool get enabled => _enabled;
-  bool get isCameraStreaming =>
-      _controller != null && (_controller?.value.isInitialized ?? false);
+  bool get hasLiveSensorSample => _hasLiveSensorSample;
+  double get imuPitchRadians => _imuPitchRadians;
+  double get imuRollRadians => _imuRollRadians;
+  bool get isCameraStreaming => _controller?.value.isStreamingImages ?? false;
+
+  /// Borrowed texture controller for a diagnostic [CameraPreview]. Ownership
+  /// stays here: consumers must not initialize, stop, or dispose this controller.
+  /// Reading the getter never opens a camera or starts another image stream.
+  CameraController? get previewController =>
+      isCameraStreaming ? _controller : null;
+  bool get enableHardwareCameraStream => _enableHardwareCameraStream;
+  set enableHardwareCameraStream(bool value) {
+    _enableHardwareCameraStream = value;
+    if (!value) unawaited(stop());
+  }
+
+  /// Microphone permission is requested only after explicit acoustic opt-in.
+  bool get enableUltrasonicRanging => _enableUltrasonicRanging;
+  set enableUltrasonicRanging(bool value) {
+    if (_enableUltrasonicRanging == value || _disposed) return;
+    _enableUltrasonicRanging = value;
+    _ultrasonicGeneration++;
+    _ultrasonicActive = false;
+    _ultrasonicSnrDb = 0;
+    _ultrasonicUnavailable = false;
+    _lastUltrasonicPingUs = null;
+    if (value) {
+      _observeLifecycle();
+      unawaited(_configureUltrasonic());
+    }
+  }
+
+  bool get hasCameraSample =>
+      _lastRearFrameUs != null || _lastFrontFrameUs != null;
+  bool get hasFreshRearCameraSample => _isFresh(_lastRearFrameUs);
+  bool get hasFreshFrontCameraSample => _isFresh(_lastFrontFrameUs);
+  bool get hasFreshCameraSample =>
+      hasFreshRearCameraSample || hasFreshFrontCameraSample;
+  bool get hasFreshVisorEstimate =>
+      _hasOpticalVisor && hasFreshFrontCameraSample;
+  Duration? get cameraSampleAge {
+    final last = _lastRearFrameUs == null
+        ? _lastFrontFrameUs
+        : _lastFrontFrameUs == null
+        ? _lastRearFrameUs
+        : math.max(_lastRearFrameUs!, _lastFrontFrameUs!);
+    return last == null
+        ? null
+        : Duration(microseconds: math.max(0, _nowMicroseconds() - last));
+  }
+
+  int get cameraFramesReceived => _cameraFramesReceived;
+  int get cameraFramesProcessed => _cameraFramesProcessed;
+  int get cameraFramesDropped => _cameraFramesDropped;
+  int get lastCameraProcessingMicroseconds => _lastCameraProcessingUs;
+  int get maxCameraProcessingMicroseconds => _maxCameraProcessingUs;
+  String? get lastCameraError => _lastCameraError;
+  bool get bodyDetectionEnabled => _bodyDetectionEnabled;
+  bool get bodyInferenceInFlight => _inferenceClient.isBusy;
+  String get bodyStatus =>
+      (_bodyStatus == 'ready' ||
+              _bodyStatus == 'no_person' ||
+              _bodyStatus == 'confirming_pose' ||
+              _bodyStatus == 'rejected_pose') &&
+          !hasFreshBodySample
+      ? 'stale'
+      : _bodyStatus;
+  bool get hasFreshBodySample => _isFresh(_lastBodySampleUs);
+  bool get bodyPresent => hasFreshBodySample && _bodyLandmarks.isNotEmpty;
+  List<VrBodyLandmark> get bodyLandmarks =>
+      hasFreshBodySample ? _bodyLandmarks : const [];
+  String? get bodySourceId => _bodySourceId;
+  double? get bodyInferenceMs => _bodyInferenceMs;
+  double? get bodyRoundTripMs => _bodyRoundTripMs;
+  int get bodyInferenceFramesDropped => _inferenceFramesDropped;
+  int get bodyRawLandmarkCount =>
+      hasFreshBodySample ? _bodyRawLandmarkCount : 0;
+  int get bodyStableFrames => hasFreshBodySample ? _bodyStableFrames : 0;
+  String get bodyGateReason => _bodyGateReason;
+  double get bodyInferenceMaxHz => _inferenceBudget.effectiveMaxHz;
+  int? get bodyThermalStatus => _bodyThermalStatus;
+  int? get bodyRetryAfterMs => _bodyRetryAfterMs;
+  double? get bodyDisplacementU => bodyPresent ? _bodyDisplacementU : null;
+  double? get bodyDisplacementV => bodyPresent ? _bodyDisplacementV : null;
+  double? get bodyJointDisplacement =>
+      bodyPresent ? _bodyJointDisplacement : null;
+  List<Map<String, Object?>> get publicMarkers =>
+      hasFreshBodySample ? _publicMarkers : const [];
+
+  /// Explicit opt-in raises this same camera to medium resolution. It does not
+  /// create another camera session. Model absence remains unavailable.
+  Future<void> setBodyDetectionEnabled(bool enabled) async {
+    if (_disposed || _bodyDetectionEnabled == enabled) return;
+    _bodyDetectionEnabled = enabled;
+    _bodyUnavailable = false;
+    _invalidateBody(enabled ? 'waiting_for_camera' : 'disabled');
+    notifyListeners();
+    if (_wantsCameraRunning && _cameras.isNotEmpty && !_suspended) {
+      await _queueLensOpen(_activeRole, ++_cameraGeneration);
+    }
+  }
+
+  void _invalidateBody(String status) {
+    _bodyEpoch++;
+    _inferenceClient.cancelPendingResults();
+    _bodyStatus = status;
+    _bodyPoseGate.reset();
+    _inferenceBudget.reset();
+    _bodyGateReason = 'no_pose';
+    _bodyRawLandmarkCount = 0;
+    _bodyStableFrames = 0;
+    _bodyThermalStatus = null;
+    _bodyRetryAfterMs = null;
+    _lastBodySampleUs = null;
+    _bodyLandmarks = const [];
+    _bodyBaseline = null;
+    _bodyBaselineSource = null;
+    _bodyBaselineRotation = null;
+    _bodyDisplacementU = null;
+    _bodyDisplacementV = null;
+    _bodyJointDisplacement = null;
+    _publicMarkers = const [];
+    _bodyInferenceMs = null;
+    _bodyRoundTripMs = null;
+  }
+
+  bool get ultrasonicUnavailable => _ultrasonicUnavailable;
   bool get autoMultiplexLenses => _autoMultiplexLenses;
   String get activeRole => _activeRole;
   Uint8List? get rearMiniFrame => _rearMiniFrame;
@@ -72,18 +272,30 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
   double get leftFootV => _leftFootV;
   double get rightFootU => _rightFootU;
   double get rightFootV => _rightFootV;
-  double get feetConfidence => _feetConfidence;
+  double get feetConfidence => hasFreshRearCameraSample ? _feetConfidence : 0;
   double get handU => _handU;
   double get handV => _handV;
-  double get handConfidence => _handConfidence;
+  double get handConfidence => hasFreshFrontCameraSample ? _handConfidence : 0;
   double get visorU => _visorU;
   double get visorV => _visorV;
   double get visorWidth => _visorWidth;
-  double get currentRangeMeters => _currentRangeMeters;
+  double? get currentRangeMeters =>
+      ultrasonicActive ? _currentRangeMeters : null;
+  bool get hasValidMetricRange => currentRangeMeters != null;
   double get ultrasonicSnrDb => _ultrasonicSnrDb;
-  bool get ultrasonicActive => _ultrasonicActive;
+  bool get ultrasonicActive =>
+      _ultrasonicActive &&
+      _isFresh(_lastUltrasonicSampleUs, _ultrasonicFreshnessUs);
 
-  bool get _isFlutterTestEnvironment {
+  bool _isFresh(int? sampledAt, [int maxAgeUs = _sampleFreshnessUs]) =>
+      sampledAt != null &&
+      _nowMicroseconds() - sampledAt >= 0 &&
+      _nowMicroseconds() - sampledAt <= maxAgeUs;
+
+  static final bool _testEnvironment = _detectFlutterTestEnvironment();
+  bool get _isFlutterTestEnvironment => _testEnvironment;
+
+  static bool _detectFlutterTestEnvironment() {
     if (kIsWeb) return false;
     try {
       return Platform.environment.containsKey(
@@ -94,171 +306,323 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
     }
   }
 
-  /// Starts real-time camera CV and ultrasonic ToF ranging on mobile devices.
+  /// Starts one low-resolution camera. Calls are idempotent; stale permission
+  /// or initialization completions cannot resurrect a stopped service.
   Future<void> start() async {
     if (_disposed || _starting || _isFlutterTestEnvironment) return;
-    if (!enableHardwareCameraStream) {
-      notifyListeners();
+    if (!enableHardwareCameraStream) return;
+    if (kIsWeb || !(Platform.isAndroid || Platform.isIOS)) return;
+    _wantsCameraRunning = true;
+    _observeLifecycle();
+    if (_suspended || isCameraStreaming) return;
+    _starting = true;
+    final generation = ++_cameraGeneration;
+    try {
+      var status = await Permission.camera.status;
+      if (!status.isGranted) status = await Permission.camera.request();
+      if (!status.isGranted || !_canOpen(generation)) return;
+      _cameras = await availableCameras();
+      if (_cameras.isEmpty || !_canOpen(generation)) return;
+      await _queueLensOpen(_activeRole, generation);
+    } catch (error) {
+      _lastCameraError = error is CameraException
+          ? error.code
+          : error.runtimeType.toString();
+    } finally {
+      _starting = false;
+      if (!_disposed &&
+          !_suspended &&
+          _wantsCameraRunning &&
+          enableHardwareCameraStream &&
+          generation != _cameraGeneration &&
+          !isCameraStreaming) {
+        unawaited(start());
+      }
+    }
+  }
+
+  bool _canOpen(int generation) =>
+      !_disposed &&
+      !_suspended &&
+      enableHardwareCameraStream &&
+      _wantsCameraRunning &&
+      generation == _cameraGeneration;
+
+  void _observeLifecycle() {
+    if (_observingLifecycle || _isFlutterTestEnvironment) return;
+    WidgetsBinding.instance.addObserver(this);
+    _observingLifecycle = true;
+  }
+
+  /// Releases camera hardware without affecting the controller or IMU stream.
+  Future<void> stop() => _stopCamera(clearIntent: true);
+
+  Future<void> _stopCamera({required bool clearIntent}) {
+    if (clearIntent) _wantsCameraRunning = false;
+    _cameraGeneration++;
+    _invalidateBody(_bodyDetectionEnabled ? 'waiting_for_camera' : 'disabled');
+    _cameraOperation = _cameraOperation.then((_) async {
+      final controller = _controller;
+      _controller = null;
+      if (!_disposed) notifyListeners();
+      await _releaseController(controller);
+    });
+    return _cameraOperation;
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _suspended = state != AppLifecycleState.resumed;
+    if (_suspended) {
+      unawaited(_stopCamera(clearIntent: false));
+      _ultrasonicActive = false;
+      _ultrasonicGeneration++;
+    } else if (_wantsCameraRunning && enableHardwareCameraStream) {
+      unawaited(start());
+    }
+  }
+
+  Future<void> _configureUltrasonic() async {
+    if (_configuringUltrasonic || _disposed || _isFlutterTestEnvironment) {
       return;
     }
     if (kIsWeb || !(Platform.isAndroid || Platform.isIOS)) return;
-    _starting = true;
+    _configuringUltrasonic = true;
     try {
-      final camStatus = await Permission.camera.status;
-      if (!camStatus.isGranted) {
-        await Permission.camera.request();
-      }
-      final micStatus = await Permission.microphone.status;
-      if (!micStatus.isGranted) {
-        await Permission.microphone.request();
-      }
-      _cameras = await availableCameras();
-      if (_cameras.isEmpty || _disposed) return;
-      await _openLens(_activeRole);
+      var status = await Permission.microphone.status;
+      if (!status.isGranted) status = await Permission.microphone.request();
+      _ultrasonicPermissionGranted = status.isGranted;
     } catch (_) {
-      // Safe fallback if camera hardware is unavailable in test/emulator.
+      _ultrasonicPermissionGranted = false;
     } finally {
-      _starting = false;
+      _configuringUltrasonic = false;
     }
   }
 
   /// Cycles between Rear (`Cám 2 Piso`), Front (`Cám 3 Manos`), and Auto-Multiplex.
   Future<void> cycleCameraLensMode() async {
-    if (_autoMultiplexLenses) {
-      _autoMultiplexLenses = false;
-      await switchLens(VrJoystickConstants.cameraRoleRear);
-    } else if (_activeRole == VrJoystickConstants.cameraRoleRear) {
-      await switchLens(VrJoystickConstants.cameraRoleFront);
-    } else {
-      _autoMultiplexLenses = true;
-      await switchLens(VrJoystickConstants.cameraRoleRear);
-    }
+    await setCameraLensMode(
+      _autoMultiplexLenses
+          ? VrJoystickConstants.cameraRoleRear
+          : _activeRole == VrJoystickConstants.cameraRoleRear
+          ? VrJoystickConstants.cameraRoleFront
+          : 'auto',
+    );
+  }
+
+  /// Selects a stable rear/front lens or explicit sequential auto-multiplexing.
+  Future<void> setCameraLensMode(String mode) async {
+    if (_disposed) return;
+    _autoMultiplexLenses = mode == 'auto';
+    await switchLens(
+      mode == VrJoystickConstants.cameraRoleFront
+          ? VrJoystickConstants.cameraRoleFront
+          : VrJoystickConstants.cameraRoleRear,
+    );
+    if (_disposed) return;
     notifyListeners();
   }
 
-  /// Switches the active physical camera lens to `'rear'` (Cám 2) or `'front'` (Cám 3).
+  /// Switches one physical lens. The plugin does not expose a portable
+  /// concurrent front/rear capture capability, so camera operations are serial.
   Future<void> switchLens(String role) async {
-    if (_disposed || _isFlutterTestEnvironment) return;
+    if (_disposed) return;
     final normalized = role == VrJoystickConstants.cameraRoleFront
         ? VrJoystickConstants.cameraRoleFront
         : VrJoystickConstants.cameraRoleRear;
-    _activeRole = normalized;
-    _lastLensSwitchAt = DateTime.now();
-    if (_cameras.isEmpty) return;
-    await _openLens(normalized);
-  }
-
-  Future<void> _openLens(String role) async {
-    if (_disposed || _cameras.isEmpty) return;
-    final desiredDirection = role == VrJoystickConstants.cameraRoleFront
+    final direction = normalized == VrJoystickConstants.cameraRoleFront
         ? CameraLensDirection.front
         : CameraLensDirection.back;
-    CameraDescription selected = _cameras.first;
-    for (final cam in _cameras) {
-      if (cam.lensDirection == desiredDirection) {
-        selected = cam;
-        break;
-      }
+    if (_cameras.isNotEmpty &&
+        !_cameras.any((camera) => camera.lensDirection == direction)) {
+      _lastCameraError = 'CameraLensUnavailable';
+      notifyListeners();
+      return;
     }
+    if (_activeRole == normalized && isCameraStreaming) return;
+    _activeRole = normalized;
+    _lastLensSwitchUs = _nowMicroseconds();
+    if (_cameras.isEmpty || !_wantsCameraRunning) return;
+    await _queueLensOpen(normalized, ++_cameraGeneration);
+  }
 
+  Future<void> _queueLensOpen(String role, int generation) {
+    _cameraOperation = _cameraOperation.then((_) async {
+      if (!_canOpen(generation)) return;
+      await _openLens(role, generation);
+    });
+    return _cameraOperation;
+  }
+
+  Future<void> _releaseController(CameraController? controller) async {
+    if (controller == null) return;
+    try {
+      if (controller.value.isStreamingImages) {
+        await controller.stopImageStream();
+      }
+    } catch (_) {
+      // Disposal must still run when the stream was interrupted by the OS.
+    }
+    try {
+      await controller.dispose();
+    } catch (_) {
+      // A disconnected camera may already have been released by the platform.
+    }
+  }
+
+  Future<void> _openLens(String role, int generation) async {
+    if (!_canOpen(generation) || _cameras.isEmpty) return;
+    final direction = role == VrJoystickConstants.cameraRoleFront
+        ? CameraLensDirection.front
+        : CameraLensDirection.back;
+    final matching = _cameras.where(
+      (camera) => camera.lensDirection == direction,
+    );
+    if (matching.isEmpty) return;
+    final selected = matching.first;
+    final resolution = _bodyDetectionEnabled
+        ? ResolutionPreset.medium
+        : ResolutionPreset.low;
+    if (_controller?.description.name == selected.name &&
+        _controller?.resolutionPreset == resolution &&
+        isCameraStreaming) {
+      return;
+    }
+    _invalidateBody(_bodyDetectionEnabled ? 'waiting_for_frame' : 'disabled');
     final previous = _controller;
     _controller = null;
-    if (previous != null) {
-      try {
-        if (previous.value.isStreamingImages) {
-          await previous.stopImageStream();
-        }
-      } catch (_) {}
-      try {
-        await previous.dispose();
-      } catch (_) {}
-    }
-    if (_disposed) return;
+    if (!_disposed) notifyListeners();
+    await _releaseController(previous);
+    if (!_canOpen(generation)) return;
 
     final controller = CameraController(
       selected,
-      ResolutionPreset.low,
+      resolution,
       enableAudio: false,
+      fps: 12,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
     try {
       await controller.initialize();
-      if (_disposed) {
-        await controller.dispose();
+      if (!_canOpen(generation)) {
+        await _releaseController(controller);
         return;
       }
       _controller = controller;
-      _lastLensSwitchAt = DateTime.now();
-      await controller.startImageStream(_onCameraImage);
+      _lastFrameProcessedUs = null;
+      final analysisConfigured = await VrCameraAnalysisBudget.configure(
+        controller,
+        intervalMs: 140,
+      );
+      if (!kReleaseMode) {
+        debugPrint(
+          '[VrCameraAnalysisBudget] role=$role cameraId=${controller.cameraId} configured=$analysisConfigured intervalMs=140',
+        );
+      }
+      if (!_canOpen(generation)) {
+        _controller = null;
+        await _releaseController(controller);
+        return;
+      }
+      await controller.startImageStream((image) {
+        if (_canOpen(generation) && identical(_controller, controller)) {
+          unawaited(
+            _maybeAnalyzeBody(
+              image,
+              camera: selected,
+              orientation: controller.value.deviceOrientation,
+            ),
+          );
+          _onCameraImage(image, role: role);
+        }
+      });
+      if (!_canOpen(generation)) {
+        _controller = null;
+        await _releaseController(controller);
+        return;
+      }
+      _lastLensSwitchUs = _nowMicroseconds();
+      _lastCameraError = null;
       notifyListeners();
-    } catch (_) {
-      try {
-        await controller.dispose();
-      } catch (_) {}
+    } catch (error) {
+      if (identical(_controller, controller)) _controller = null;
+      _lastCameraError = error is CameraException
+          ? error.code
+          : error.runtimeType.toString();
+      await _releaseController(controller);
     }
   }
 
   /// Updates the IMU gravity vector so optical + ultrasonic ranging can fuse
   /// arm inclination ergonomics in real time.
   void updateImuGravity(double gx, double gy, double gz) {
+    if (_disposed || !gx.isFinite || !gy.isFinite || !gz.isFinite) return;
     final norm = math.sqrt(gx * gx + gy * gy + gz * gz);
     if (norm < 1.0) return;
-    // Estimate pitch inclination of the held phone
+    // Estimate pitch and roll inclination of the held landscape phone
     _imuPitchRadians = math.asin((gz / norm).clamp(-1.0, 1.0));
+    _imuRollRadians = math.asin((gy / norm).clamp(-1.0, 1.0));
+    // IMU orientation is not optical evidence: leave hand/foot confidence at
+    // zero until a recent camera frame was actually analyzed.
+    if (!_isFlutterTestEnvironment) _hasLiveSensorSample = true;
     _recomputeFusedRange();
   }
 
   /// Triggers an ultrasonic 18.6–20.1 kHz chirp ToF measurement if due, and
   /// multiplexes between Rear (C2) and Front (C3) cameras when auto mode is on.
   void tick() {
-    if (_disposed || !_enabled || _isFlutterTestEnvironment) return;
-    final now = DateTime.now();
+    if (_disposed || !_enabled || _suspended || _isFlutterTestEnvironment) {
+      return;
+    }
+    final now = _nowMicroseconds();
 
-    if (!_ultrasonicPingInFlight &&
-        now.difference(_lastUltrasonicPingAt).inMilliseconds >=
-            VrJoystickConstants.ultrasonicPingIntervalMs) {
-      _lastUltrasonicPingAt = now;
+    if (enableUltrasonicRanging &&
+        _ultrasonicPermissionGranted &&
+        !_ultrasonicUnavailable &&
+        !_ultrasonicPingInFlight &&
+        (_lastUltrasonicPingUs == null ||
+            now - _lastUltrasonicPingUs! >=
+                VrJoystickConstants.ultrasonicPingIntervalMs * 1000)) {
+      _lastUltrasonicPingUs = now;
       _ultrasonicPingInFlight = true;
+      final generation = _ultrasonicGeneration;
       _ultrasonicChannel
           .invokeMapMethod<String, dynamic>(
             VrJoystickConstants.ultrasonicPingMethod,
           )
+          .timeout(_ultrasonicTimeout)
           .then((result) {
-            _ultrasonicPingInFlight = false;
-            if (_disposed || result == null) return;
-            final distance =
-                (result[VrJoystickConstants.ultrasonicFieldEchoDistanceMeters]
-                        as num?)
-                    ?.toDouble();
-            final snrDb =
-                (result[VrJoystickConstants.ultrasonicFieldSnrDb] as num?)
-                    ?.toDouble() ??
-                0.0;
-            _ultrasonicSnrDb = snrDb;
-            if (distance != null &&
-                distance.isFinite &&
-                snrDb >= VrJoystickConstants.minValidUltrasonicSnrDb) {
-              _ultrasonicActive = true;
-              _ultrasonicEchoMeters = distance.clamp(
-                VrJoystickConstants.minUltrasonicEchoMeters,
-                VrJoystickConstants.maxUltrasonicEchoMeters,
-              );
-              _recomputeFusedRange();
+            if (_disposed ||
+                generation != _ultrasonicGeneration ||
+                result == null) {
+              return;
             }
+            _acceptUltrasonicResult(result);
           })
-          .catchError((_) {
-            _ultrasonicPingInFlight = false;
-          });
+          .catchError((Object error) {
+            if (_disposed || generation != _ultrasonicGeneration) return;
+            _ultrasonicActive = false;
+            // Missing/blocked native probes must not compete with every control
+            // tick. Explicit off/on opt-in is required to retry after failure.
+            _ultrasonicUnavailable = true;
+          })
+          .whenComplete(() => _ultrasonicPingInFlight = false);
     }
 
-    // Time-multiplex between Cám 2 (Rear Floor) and Cám 3 (Front Hands/Visor)
-    // every 3.4 seconds when both cameras exist so both monitors stay fresh.
+    final hasBothDirections =
+        _cameras.any(
+          (camera) => camera.lensDirection == CameraLensDirection.back,
+        ) &&
+        _cameras.any(
+          (camera) => camera.lensDirection == CameraLensDirection.front,
+        );
     if (_autoMultiplexLenses &&
-        _cameras.length >= 2 &&
+        hasBothDirections &&
+        isCameraStreaming &&
         !_starting &&
-        now.difference(_lastLensSwitchAt).inMilliseconds >=
-            VrJoystickConstants.cameraLensMultiplexIntervalMs) {
-      _lastLensSwitchAt = now;
+        now - _lastLensSwitchUs >=
+            VrJoystickConstants.cameraLensMultiplexIntervalMs * 1000) {
+      _lastLensSwitchUs = now;
       final nextRole = _activeRole == VrJoystickConstants.cameraRoleRear
           ? VrJoystickConstants.cameraRoleFront
           : VrJoystickConstants.cameraRoleRear;
@@ -266,72 +630,378 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
     }
   }
 
-  void _recomputeFusedRange() {
-    // 1. Ergonomic arm-posture baseline from IMU pitch
-    final imuBaseline = (0.53 - _imuPitchRadians * 0.11).clamp(0.26, 0.88);
-    // 2. Optical Cám 3 visor angular width estimate (d ≈ W_real / W_uv)
-    final opticalEstimate = (0.105 / _visorWidth.clamp(0.11, 0.45)).clamp(
-      0.24,
-      0.95,
-    );
-    // 3. Fuse ultrasonic ToF echo when acoustic SNR is strong
-    final double targetRange;
-    if (_ultrasonicActive && _ultrasonicSnrDb >= 4.0) {
-      targetRange =
-          _ultrasonicEchoMeters * 0.62 +
-          opticalEstimate * 0.23 +
-          imuBaseline * 0.15;
-    } else {
-      targetRange = opticalEstimate * 0.55 + imuBaseline * 0.45;
-    }
-    _currentRangeMeters =
-        (_currentRangeMeters * 0.72 + targetRange * 0.28).clamp(0.22, 1.10);
+  @visibleForTesting
+  void ingestUltrasonicResult(Map<String, dynamic> result) {
+    if (!_disposed) _acceptUltrasonicResult(result);
   }
 
-  void _onCameraImage(CameraImage image) {
-    if (_disposed || !_enabled || image.planes.isEmpty) return;
-    final now = DateTime.now();
-    if (now.difference(_lastFrameProcessedAt).inMilliseconds < 150) {
+  void _acceptUltrasonicResult(Map<String, dynamic> result) {
+    final distance =
+        (result[VrJoystickConstants.ultrasonicFieldEchoDistanceMeters] as num?)
+            ?.toDouble();
+    final snrDb =
+        (result[VrJoystickConstants.ultrasonicFieldSnrDb] as num?)
+            ?.toDouble() ??
+        0.0;
+    _ultrasonicSnrDb = snrDb.isFinite ? snrDb : 0;
+    final calibrated = result['calibrated'] == true;
+    final analyzed = result['micAnalyzed'] == true;
+    final emitted = result['emitted'] == true;
+    // An uncalibrated/emitter-only implementation cannot become a range sensor
+    // through repeated polling. Retry only after an explicit off/on request.
+    _ultrasonicUnavailable = !calibrated || !analyzed || !emitted;
+    if (result['measurementValid'] == true &&
+        calibrated &&
+        analyzed &&
+        emitted &&
+        distance != null &&
+        distance.isFinite &&
+        distance >= VrJoystickConstants.minUltrasonicEchoMeters &&
+        distance <= VrJoystickConstants.maxUltrasonicEchoMeters &&
+        snrDb.isFinite &&
+        snrDb >= VrJoystickConstants.minValidUltrasonicSnrDb) {
+      _ultrasonicActive = true;
+      _lastUltrasonicSampleUs = _nowMicroseconds();
+      _ultrasonicEchoMeters = distance;
+    } else {
+      _ultrasonicActive = false;
+    }
+    _recomputeFusedRange();
+    notifyListeners();
+  }
+
+  void _recomputeFusedRange() {
+    // Do not mix an acoustic measurement with invented ergonomic baselines or
+    // apparent silhouette width. Echo distance also does not establish the
+    // relative pose of the phones or identify the reflecting object.
+    _currentRangeMeters = ultrasonicActive ? _ultrasonicEchoMeters : null;
+  }
+
+  /// Uses the exact hardware-frame sampling path without requiring permissions.
+  @visibleForTesting
+  void ingestCameraImage(CameraImage image, {String? role}) =>
+      _onCameraImage(image, role: role);
+
+  @visibleForTesting
+  Future<void> ingestInferenceCameraImage(
+    CameraImage image, {
+    required CameraDescription camera,
+    required DeviceOrientation orientation,
+  }) => _maybeAnalyzeBody(image, camera: camera, orientation: orientation);
+
+  Future<void> _maybeAnalyzeBody(
+    CameraImage image, {
+    required CameraDescription camera,
+    required DeviceOrientation orientation,
+  }) async {
+    if (_disposed || _suspended || !_bodyDetectionEnabled || _bodyUnavailable) {
       return;
     }
-    _lastFrameProcessedAt = now;
+    final now = _nowMicroseconds();
+    if (_inferenceClient.isBusy || !_inferenceBudget.tryStart(now)) {
+      _inferenceFramesDropped++;
+      return;
+    }
+    final epoch = _bodyEpoch;
+    final sourceId = 'joystick:${camera.lensDirection.name}:${camera.name}';
+    final startedAt = _clock.elapsedMicroseconds;
+    try {
+      final result = await _inferenceClient.analyzeFrame(
+        image,
+        camera: camera,
+        orientation: orientation,
+        sourceId: sourceId,
+        sequence: ++_inferenceSequence,
+        detectPose: true,
+        detectMarker: false,
+      );
+      if (_disposed || _suspended || epoch != _bodyEpoch) return;
+      _bodyRoundTripMs = (_clock.elapsedMicroseconds - startedAt) / 1000;
+      _acceptBodyResult(result, sourceId, now);
+    } finally {
+      _inferenceBudget.recordCompletion(
+        startedUs: now,
+        finishedUs: _nowMicroseconds(),
+        confirmedBody: bodyPresent,
+      );
+    }
+    if (!kReleaseMode && now - _lastBodyMetricsLogUs >= 5000000) {
+      _lastBodyMetricsLogUs = now;
+      debugPrint(
+        '[JoystickInference] source=$sourceId status=$bodyStatus '
+        'sequence=$_inferenceSequence joints=${bodyLandmarks.length} '
+        'raw=$bodyRawLandmarkCount accepted=$bodyPresent reason=$bodyGateReason '
+        'intervalUs=${_inferenceBudget.intervalUs} '
+        'inferenceMs=$_bodyInferenceMs totalMs=$_bodyRoundTripMs '
+        'dropped=$_inferenceFramesDropped',
+      );
+    }
+    notifyListeners();
+  }
 
-    final yPlane = image.planes.first;
-    final yBytes = yPlane.bytes;
+  void _acceptBodyResult(
+    Map<String, dynamic> result,
+    String sourceId,
+    int capturedAt,
+  ) {
+    final status = result['status'];
+    _bodySourceId = sourceId;
+    _bodyThermalStatus = null;
+    _bodyRetryAfterMs = null;
+    if (status != 'ok' && status != 'partial') {
+      _bodyStatus = status is String ? status : 'unavailable';
+      _bodyGateReason = _bodyStatus;
+      _bodyLandmarks = const [];
+      _lastBodySampleUs = null;
+      _bodyBaseline = null;
+      _publicMarkers = const [];
+      _bodyInferenceMs = null;
+      _bodyUnavailable = status == 'unavailable';
+      _bodyPoseGate.reset();
+      _bodyRawLandmarkCount = 0;
+      _bodyStableFrames = 0;
+      if (status == 'thermal_backoff') {
+        final thermal = result['thermalStatus'];
+        final rawRetry = result['retryAfterMs'];
+        _bodyThermalStatus = thermal is int && thermal >= 0 && thermal <= 6
+            ? thermal
+            : null;
+        _bodyRetryAfterMs = rawRetry is num && rawRetry.isFinite
+            ? rawRetry.toInt().clamp(2000, 60000)
+            : 2000;
+        _bodyRoundTripMs = null; // A refused request did not execute inference.
+        _bodyDisplacementU = null;
+        _bodyDisplacementV = null;
+        _bodyJointDisplacement = null;
+        _inferenceBudget.deferFor(
+          _nowMicroseconds(),
+          retryAfterUs: _bodyRetryAfterMs! * 1000,
+        );
+      }
+      return;
+    }
+    final inferenceMs = result['inferenceMs'];
+    _bodyInferenceMs = inferenceMs is num && inferenceMs.isFinite
+        ? inferenceMs.toDouble()
+        : null;
+    final imageWidth = result['imageWidth'];
+    final imageHeight = result['imageHeight'];
+    final pose = result['pose'];
+    if (imageWidth is! num ||
+        imageHeight is! num ||
+        imageWidth <= 0 ||
+        imageHeight <= 0 ||
+        pose is! Map ||
+        pose['status'] != 'ok') {
+      _bodyStatus = 'unavailable';
+      _bodyLandmarks = const [];
+      _lastBodySampleUs = null;
+      _bodyBaseline = null;
+      _bodyPoseGate.reset();
+      _bodyRawLandmarkCount = 0;
+      _bodyStableFrames = 0;
+      return;
+    }
+    final rawPoints = VrBodyLandmark.fromNative(
+      pose['landmarks'],
+      imageWidth: imageWidth.toInt(),
+      imageHeight: imageHeight.toInt(),
+    );
+    final gate = _bodyPoseGate.evaluate(
+      landmarks: rawPoints,
+      present: pose['present'] == true,
+      sourceId: sourceId,
+      rotationDegrees: result['rotationDegrees'] as int,
+      capturedAtUs: capturedAt,
+      imageWidth: imageWidth.toInt(),
+      imageHeight: imageHeight.toInt(),
+    );
+    _bodyGateReason = gate.reason;
+    _bodyRawLandmarkCount = gate.rawCount;
+    _bodyStableFrames = gate.stableFrames;
+    final byType = <int, VrBodyLandmark>{
+      if (gate.accepted)
+        for (final point in rawPoints) point.type: point,
+    };
+    if (_lastBodySampleUs == null ||
+        capturedAt - _lastBodySampleUs! > _sampleFreshnessUs) {
+      _bodyBaseline = null;
+    }
+    _lastBodySampleUs = capturedAt;
+    _bodyLandmarks = List.unmodifiable(byType.values);
+    _bodyStatus = gate.accepted
+        ? 'ready'
+        : !(pose['present'] == true) || rawPoints.isEmpty
+        ? 'no_person'
+        : gate.stableFrames > 0
+        ? 'confirming_pose'
+        : 'rejected_pose';
+    _publicMarkers = const []; // Body inference never requests marker scanning.
+    if (byType.isEmpty) {
+      _bodyBaseline = null;
+      _bodyDisplacementU = null;
+      _bodyDisplacementV = null;
+      _bodyJointDisplacement = null;
+      return;
+    }
+    final rotation = result['rotationDegrees'] as int?;
+    if (_bodyBaselineSource != sourceId || _bodyBaselineRotation != rotation) {
+      _bodyBaseline = null;
+    }
+    final reliable = <int, VrBodyLandmark>{
+      for (final entry in byType.entries)
+        if (entry.value.inFrameLikelihood >= .5) entry.key: entry.value,
+    };
+    _bodyBaseline ??= reliable.length >= 3 ? reliable : null;
+    _bodyBaselineSource = sourceId;
+    _bodyBaselineRotation = rotation;
+    final baseline = _bodyBaseline;
+    var du = 0.0;
+    var dv = 0.0;
+    var squaredDisplacement = 0.0;
+    var count = 0;
+    if (baseline != null) {
+      for (final entry in reliable.entries) {
+        final prior = baseline[entry.key];
+        if (prior == null) continue;
+        final dx = entry.value.u - prior.u;
+        final dy = entry.value.v - prior.v;
+        du += dx;
+        dv += dy;
+        squaredDisplacement += dx * dx + dy * dy;
+        count++;
+      }
+    }
+    _bodyDisplacementU = count >= 3 ? du / count : null;
+    _bodyDisplacementV = count >= 3 ? dv / count : null;
+    _bodyJointDisplacement = count >= 3
+        ? math.sqrt(squaredDisplacement / count)
+        : null;
+  }
+
+  void _onCameraImage(CameraImage image, {String? role}) {
+    if (_disposed || !_enabled || _suspended) return;
+    _cameraFramesReceived++;
+    final now = _nowMicroseconds();
+    // Drop before allocating, downsampling, or encoding. There is deliberately
+    // no async full-frame queue: the next accepted callback is the latest frame.
+    if (_lastFrameProcessedUs != null &&
+        now - _lastFrameProcessedUs! < _frameIntervalUs) {
+      _cameraFramesDropped++;
+      return;
+    }
     final width = image.width;
     final height = image.height;
-    final rowStride = yPlane.bytesPerRow;
-    if (width <= 8 || height <= 8 || yBytes.isEmpty) return;
-
-    final hasChroma = image.planes.length >= 3;
-    final uPlane = hasChroma ? image.planes[1] : null;
-    final vPlane = hasChroma ? image.planes[2] : null;
-
-    // 1. Extract 24x18 luminance thumbnail for live HUD monitor streaming
+    if (width <= 8 || height <= 8 || image.planes.isEmpty) {
+      _cameraFramesDropped++;
+      return;
+    }
+    final plane = image.planes.first;
+    final bgra = image.format.group == ImageFormatGroup.bgra8888;
+    final yuv =
+        image.format.group == ImageFormatGroup.yuv420 ||
+        image.format.group == ImageFormatGroup.nv21;
+    if ((!bgra && !yuv) || plane.bytes.isEmpty || plane.bytesPerRow <= 0) {
+      _cameraFramesDropped++;
+      return;
+    }
+    final pixelStride = bgra ? 4 : (plane.bytesPerPixel ?? 1);
+    final requiredRowBytes = (width - 1) * pixelStride + (bgra ? 4 : 1);
+    if (pixelStride <= 0 ||
+        plane.bytesPerRow < requiredRowBytes ||
+        plane.bytes.length <
+            (height - 1) * plane.bytesPerRow + requiredRowBytes) {
+      _cameraFramesDropped++;
+      return;
+    }
+    final startedAt = _clock.elapsedMicroseconds;
     final mini = Uint8List(gridWidth * gridHeight);
     var lumaSum = 0.0;
     for (var gy = 0; gy < gridHeight; gy++) {
-      final py = ((gy + 0.5) * height / gridHeight).floor().clamp(
-        0,
-        height - 1,
-      );
-      final rowOffset = py * rowStride;
+      final py = ((gy + 0.5) * height / gridHeight).floor();
+      final rowOffset = py * plane.bytesPerRow;
       for (var gx = 0; gx < gridWidth; gx++) {
-        final px = ((gx + 0.5) * width / gridWidth).floor().clamp(0, width - 1);
-        final idx = (rowOffset + px).clamp(0, yBytes.length - 1);
-        final luma = yBytes[idx];
+        final px = ((gx + 0.5) * width / gridWidth).floor();
+        final index = rowOffset + px * pixelStride;
+        final luma = bgra
+            ? (plane.bytes[index + 2] * 77 +
+                      plane.bytes[index + 1] * 150 +
+                      plane.bytes[index] * 29) >>
+                  8
+            : plane.bytes[index];
         mini[gy * gridWidth + gx] = luma;
         lumaSum += luma;
       }
     }
-    final meanLuma = lumaSum / (gridWidth * gridHeight);
+    _lastFrameProcessedUs = now;
+    _cameraFramesProcessed++;
+    _activeRole = role == VrJoystickConstants.cameraRoleFront
+        ? VrJoystickConstants.cameraRoleFront
+        : role == VrJoystickConstants.cameraRoleRear
+        ? VrJoystickConstants.cameraRoleRear
+        : _activeRole;
+    _acceptMiniFrame(
+      mini,
+      lumaSum / mini.length,
+      now,
+      width: width,
+      height: height,
+      uPlane: yuv && image.planes.length >= 3 ? image.planes[1] : null,
+      vPlane: yuv && image.planes.length >= 3 ? image.planes[2] : null,
+    );
+    _lastCameraProcessingUs = _clock.elapsedMicroseconds - startedAt;
+    _maxCameraProcessingUs = math.max(
+      _maxCameraProcessingUs,
+      _lastCameraProcessingUs,
+    );
+    if (!kReleaseMode && now - _lastMetricsLogUs >= 5000000) {
+      _lastMetricsLogUs = now;
+      debugPrint(
+        '[JoystickVision] role=$_activeRole '
+        'received=$_cameraFramesReceived analyzed=$_cameraFramesProcessed '
+        'dropped=$_cameraFramesDropped cpuUs=$_lastCameraProcessingUs '
+        'maxCpuUs=$_maxCameraProcessingUs',
+      );
+      final camera = _controller;
+      if (camera != null && !_cameraBudgetStatusInFlight) {
+        unawaited(_logCameraBudgetStatus(camera));
+      }
+    }
+    notifyListeners();
+  }
 
-    _latestMiniFrameBase64 = base64Encode(mini);
+  Future<void> _logCameraBudgetStatus(CameraController camera) async {
+    _cameraBudgetStatusInFlight = true;
+    try {
+      final status = await VrCameraAnalysisBudget.status(camera);
+      if (!_disposed && identical(camera, _controller) && status != null) {
+        debugPrint(
+          '[VrCameraAnalysisBudget] role=$_activeRole ${jsonEncode(status)}',
+        );
+      }
+    } finally {
+      _cameraBudgetStatusInFlight = false;
+    }
+  }
+
+  void _acceptMiniFrame(
+    Uint8List mini,
+    double meanLuma,
+    int sampledAt, {
+    required int width,
+    required int height,
+    Plane? uPlane,
+    Plane? vPlane,
+  }) {
+    _latestMiniFrame = mini;
+    _latestMiniFrameBase64 = null;
     if (_activeRole == VrJoystickConstants.cameraRoleRear) {
       _rearMiniFrame = mini;
+      _lastRearFrameUs = sampledAt;
       _analyzeRearFloorAndFeet(mini, meanLuma);
     } else {
       _frontMiniFrame = mini;
+      _lastFrontFrameUs = sampledAt;
       _analyzeFrontHandsAndVisor(
         mini: mini,
         meanLuma: meanLuma,
@@ -342,11 +1012,12 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
       );
     }
     _recomputeFusedRange();
-    notifyListeners();
   }
 
-  /// Processes a pre-downsampled 24x18 grayscale mini-frame (432 bytes) and
-  /// optional ultrasonic echo for unit tests and on-device CV verification.
+  /// Processes a pre-downsampled 24x18 grayscale mini-frame (432 bytes).
+  /// Legacy acoustic arguments do not grant calibrated measurement provenance;
+  /// test a native result explicitly with [ingestUltrasonicResult] instead.
+  @visibleForTesting
   void ingestSyntheticMiniFrame(
     Uint8List mini, {
     String role = VrJoystickConstants.cameraRoleRear,
@@ -357,36 +1028,19 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
     _activeRole = role == VrJoystickConstants.cameraRoleFront
         ? VrJoystickConstants.cameraRoleFront
         : VrJoystickConstants.cameraRoleRear;
+    // Own the small buffer: callers may reuse or mutate their source image.
+    final owned = Uint8List.fromList(mini.sublist(0, gridWidth * gridHeight));
     var lumaSum = 0.0;
-    for (var i = 0; i < gridWidth * gridHeight; i++) {
-      lumaSum += mini[i];
+    for (final value in owned) {
+      lumaSum += value;
     }
-    final meanLuma = lumaSum / (gridWidth * gridHeight);
-    _latestMiniFrameBase64 = base64Encode(
-      mini.sublist(0, gridWidth * gridHeight),
+    _acceptMiniFrame(
+      owned,
+      lumaSum / owned.length,
+      _nowMicroseconds(),
+      width: gridWidth,
+      height: gridHeight,
     );
-    if (_activeRole == VrJoystickConstants.cameraRoleRear) {
-      _rearMiniFrame = mini;
-      _analyzeRearFloorAndFeet(mini, meanLuma);
-    } else {
-      _frontMiniFrame = mini;
-      _analyzeFrontHandsAndVisor(
-        mini: mini,
-        meanLuma: meanLuma,
-        width: gridWidth,
-        height: gridHeight,
-        uPlane: null,
-        vPlane: null,
-      );
-    }
-    if (ultrasonicEchoMeters != null && ultrasonicEchoMeters.isFinite) {
-      _ultrasonicActive = true;
-      _ultrasonicSnrDb = ultrasonicSnrDb;
-      _ultrasonicEchoMeters = ultrasonicEchoMeters.clamp(
-        VrJoystickConstants.minUltrasonicEchoMeters,
-        VrJoystickConstants.maxUltrasonicEchoMeters,
-      );
-    }
     _recomputeFusedRange();
     notifyListeners();
   }
@@ -443,7 +1097,8 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
       _rightFootV = _rightFootV * 0.62 + targetV * 0.38;
     }
     final combinedEnergy = (leftWeightSum + rightWeightSum) / 950.0;
-    _feetConfidence = combinedEnergy.clamp(0.25, 0.99);
+    // Heuristic score, not an ML probability or semantic foot identification.
+    _feetConfidence = combinedEnergy.clamp(0.0, 0.35);
   }
 
   /// Real-time Cám 3 (Front upward camera) YCbCr skin-chroma + Sobel edge
@@ -485,16 +1140,19 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
             0,
             (height ~/ 2) - 1,
           );
-          final uvStride = uPlane.bytesPerRow;
-          final uvPixelStride = uPlane.bytesPerPixel ?? 1;
-          final uvIdx = (uvY * uvStride + uvX * uvPixelStride).clamp(
-            0,
-            math.min(uPlane.bytes.length, vPlane.bytes.length) - 1,
-          );
-          final cb = uPlane.bytes[uvIdx];
-          final cr = vPlane.bytes[uvIdx];
-          if (c > 42 && cb >= 77 && cb <= 129 && cr >= 131 && cr <= 176) {
-            skinBoost = 42.0;
+          final uIndex =
+              uvY * uPlane.bytesPerRow + uvX * (uPlane.bytesPerPixel ?? 1);
+          final vIndex =
+              uvY * vPlane.bytesPerRow + uvX * (vPlane.bytesPerPixel ?? 1);
+          if (uIndex >= 0 &&
+              uIndex < uPlane.bytes.length &&
+              vIndex >= 0 &&
+              vIndex < vPlane.bytes.length) {
+            final cb = uPlane.bytes[uIndex];
+            final cr = vPlane.bytes[vIndex];
+            if (c > 42 && cb >= 77 && cb <= 129 && cr >= 131 && cr <= 176) {
+              skinBoost = 42.0;
+            }
           }
         }
 
@@ -529,9 +1187,13 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
       final targetV = (handVSum / handWeightSum).clamp(0.32, 0.90);
       _handU = _handU * 0.58 + targetU * 0.42;
       _handV = _handV * 0.58 + targetV * 0.42;
-      _handConfidence = (handWeightSum / 950.0).clamp(0.30, 0.99);
+      // Heuristic score, not an ML probability or articulated hand tracking.
+      _handConfidence = (handWeightSum / 950.0).clamp(0.0, 0.35);
+    } else {
+      _handConfidence = 0;
     }
 
+    _hasOpticalVisor = visorWeightSum > 35.0;
     if (visorWeightSum > 35.0) {
       final targetU = (visorUSum / visorWeightSum).clamp(0.20, 0.80);
       final targetV = (visorVSum / visorWeightSum).clamp(0.10, 0.45);
@@ -549,57 +1211,65 @@ class VrJoystickCameraVisionService extends ChangeNotifier {
 
   static double _round3(double v) => (v * 1000.0).round() / 1000.0;
 
-  /// Builds the dedicated `vrlizate.visionTelemetry` packet (~3 Hz) containing
-  /// the live 24x18 camera thumbnail, CV landmarks, and ultrasonic range.
+  /// Builds optional vision telemetry; the caller budgets transport cadence.
+  /// Optical coordinates are estimated heuristics. Metric range is absent
+  /// unless the acoustic backend reports a valid, calibrated, fresh sample.
   ///
-  /// When [includeMiniFrame] is false (e.g. over 20-byte ATT Bluetooth LE),
-  /// omits the 576-byte base64 thumbnail so the packet fits in ~185 bytes.
+  /// When [includeMiniFrame] is false, no base64 encoding is performed. BLE
+  /// still fragments the scalar JSON packet according to its negotiated MTU.
   Map<String, Object?>? buildVisionTelemetryPayload({
     bool includeMiniFrame = true,
   }) {
-    if (_latestMiniFrameBase64 == null && !_ultrasonicActive) {
+    if (_disposed ||
+        (!hasFreshCameraSample && !ultrasonicActive && !_hasLiveSensorSample)) {
       return null;
     }
+    final latestRoleIsFresh = _activeRole == VrJoystickConstants.cameraRoleRear
+        ? hasFreshRearCameraSample
+        : hasFreshFrontCameraSample;
+    if (includeMiniFrame && latestRoleIsFresh && _latestMiniFrame != null) {
+      _latestMiniFrameBase64 ??= base64Encode(_latestMiniFrame!);
+    }
+    final metricRange = currentRangeMeters;
     return <String, Object?>{
       VrJoystickConstants.fieldType:
           VrJoystickConstants.visionTelemetryMessageType,
-      VrJoystickConstants.fieldRangeMeters: _round3(_currentRangeMeters),
+      VrJoystickConstants.fieldRangeMeters: metricRange == null
+          ? null
+          : _round3(metricRange),
+      'rangeSource': metricRange == null ? null : 'calibrated_acoustic_echo',
+      'opticalEstimated': true,
+      'opticalSource': 'heuristic_edges_chroma',
       VrJoystickConstants.fieldLeftFootU: _round3(_leftFootU),
       VrJoystickConstants.fieldLeftFootV: _round3(_leftFootV),
       VrJoystickConstants.fieldRightFootU: _round3(_rightFootU),
       VrJoystickConstants.fieldRightFootV: _round3(_rightFootV),
-      VrJoystickConstants.fieldFeetConfidence: _round3(_feetConfidence),
+      VrJoystickConstants.fieldFeetConfidence: _round3(feetConfidence),
       VrJoystickConstants.fieldHandU: _round3(_handU),
       VrJoystickConstants.fieldHandV: _round3(_handV),
-      VrJoystickConstants.fieldHandConfidence: _round3(_handConfidence),
+      VrJoystickConstants.fieldHandConfidence: _round3(handConfidence),
       VrJoystickConstants.fieldVisorU: _round3(_visorU),
       VrJoystickConstants.fieldVisorV: _round3(_visorV),
       VrJoystickConstants.fieldVisorWidth: _round3(_visorWidth),
       VrJoystickConstants.fieldJoystickCameraRole: _activeRole,
-      if (includeMiniFrame && _latestMiniFrameBase64 != null)
+      if (includeMiniFrame &&
+          latestRoleIsFresh &&
+          _latestMiniFrameBase64 != null)
         VrJoystickConstants.fieldJoystickMiniFrame: _latestMiniFrameBase64,
     };
   }
 
   @override
   void dispose() {
+    if (_disposed) return;
     _disposed = true;
-    final controller = _controller;
-    _controller = null;
-    if (controller != null) {
-      unawaited(
-        Future<void>(() async {
-          try {
-            if (controller.value.isStreamingImages) {
-              await controller.stopImageStream();
-            }
-          } catch (_) {}
-          try {
-            await controller.dispose();
-          } catch (_) {}
-        }),
-      );
+    _ultrasonicGeneration++;
+    _inferenceClient.dispose();
+    if (_observingLifecycle) {
+      WidgetsBinding.instance.removeObserver(this);
+      _observingLifecycle = false;
     }
+    unawaited(_stopCamera(clearIntent: true));
     super.dispose();
   }
 }

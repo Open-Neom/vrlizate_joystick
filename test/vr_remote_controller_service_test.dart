@@ -78,6 +78,129 @@ void main() {
   });
 
   test(
+    'only explicit finite control increments receiver passthrough revision',
+    () async {
+      final socket = await connect();
+      expect(service.latestState.passthroughCommandRevision, 0);
+      socket.add(
+        jsonEncode({
+          'sequence': 1,
+          'passthroughMix': .65,
+          'passthroughCommand': true,
+          'passthroughCommandRevision': 9999,
+        }),
+      );
+      await waitUntil(() => service.latestState.passthroughMix == .65);
+      expect(service.latestState.passthroughCommandRevision, 0);
+      socket.add(
+        jsonEncode({
+          'type': 'vrlizate.passthrough',
+          'passthroughMix': .65,
+          'spatialHudVisible': true,
+        }),
+      );
+      await waitUntil(() => service.latestState.spatialHudVisible);
+      expect(service.latestState.passthroughCommandRevision, 0);
+      for (final expected in [1, 2]) {
+        socket.add(
+          jsonEncode({
+            'type': 'vrlizate.passthrough',
+            'passthroughMix': .65,
+            'passthroughCommand': true,
+          }),
+        );
+        await waitUntil(
+          () => service.latestState.passthroughCommandRevision == expected,
+        );
+      }
+      socket.add(
+        jsonEncode({'sequence': 2, 'passthroughMix': .65, 'btnX': true}),
+      );
+      await waitUntil(() => service.latestState.btnX);
+      expect(service.latestState.passthroughCommandRevision, 2);
+      socket.add(
+        jsonEncode({
+          'type': 'vrlizate.passthrough',
+          'passthroughMix': null,
+          'passthroughCommand': true,
+          'spatialHudVisible': false,
+        }),
+      );
+      await waitUntil(() => !service.latestState.spatialHudVisible);
+      expect(service.latestState.passthroughCommandRevision, 2);
+    },
+  );
+
+  test(
+    'HUD, safety release and reconnect preserve but never generate a command',
+    () async {
+      var socket = await connect();
+      socket.add(jsonEncode({'sequence': 1, 'btnA': true}));
+      await waitUntil(() => service.latestState.btnA);
+      service.setPassthroughMix(.65);
+      expect(service.latestState.passthroughCommandRevision, 1);
+      service.setSpatialHudVisible(true);
+      expect(service.latestState.passthroughCommandRevision, 1);
+      await waitUntil(() => service.latestState.isNeutralized);
+      expect(service.latestState.passthroughCommandRevision, 1);
+      await socket.close();
+      await waitUntil(() => !service.isConnected);
+      socket = await connect();
+      expect(service.latestState.passthroughCommandRevision, 1);
+      socket.add(jsonEncode({'sequence': 1, 'passthroughMix': .65}));
+      await waitUntil(() => !service.latestState.isNeutralized);
+      expect(service.latestState.passthroughCommandRevision, 1);
+      service.setPassthroughMix(.65);
+      expect(service.latestState.passthroughCommandRevision, 2);
+      service.setPassthroughMix(double.nan);
+      expect(service.latestState.passthroughCommandRevision, 2);
+    },
+  );
+
+  test(
+    'binary and handheld state copies retain the receiver action revision',
+    () async {
+      service.setPassthroughMix(.65);
+      service.setLocalHandheldActive(true);
+      service.emitLocalHandheldState(
+        RemoteControllerState(
+          orientation: vm.Quaternion.identity(),
+          btnA: true,
+        ),
+      );
+      expect(service.latestState.passthroughCommandRevision, 1);
+      expect(service.latestState.passthroughMix, .65);
+      service.setLocalHandheldActive(false);
+      final socket = await connect();
+      socket.add(binaryPose(1));
+      await waitUntil(() => service.telemetry.acceptedStates >= 2);
+      expect(service.latestState.passthroughCommandRevision, 1);
+      expect(service.latestState.passthroughMix, .65);
+    },
+  );
+
+  test('button remapping preserves passthrough command and its value', () {
+    final input = RemoteControllerState(
+      orientation: vm.Quaternion.identity(),
+      btnA: true,
+      passthroughMix: .65,
+      passthroughCommandRevision: 7,
+      spatialHudVisible: true,
+      searchQuery: 'retained',
+      feetConfidence: .3,
+    );
+    final mapped = const VrButtonMapping(
+      swapConfirmCancel: true,
+    ).applyToState(input);
+    expect(mapped.btnB, isTrue);
+    expect(mapped.passthroughCommandRevision, 7);
+    expect(mapped.passthroughMix, .65);
+    expect(mapped.spatialHudVisible, isTrue);
+    expect(mapped.searchQuery, 'retained');
+    expect(mapped.feetConfidence, .3);
+  });
+
+  test(
     'controller visibility survives timeout and repeats without toggling',
     () async {
       final socket = await connect();

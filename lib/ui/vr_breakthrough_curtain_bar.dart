@@ -14,6 +14,9 @@ class VrBreakthroughCurtainBar extends StatelessWidget {
     required this.onMixChanged,
     required this.onToggleMix,
     required this.onToggleSpatialHud,
+    this.connected = true,
+    this.synchronized = true,
+    this.pending = false,
   });
 
   final double passthroughMix;
@@ -21,12 +24,16 @@ class VrBreakthroughCurtainBar extends StatelessWidget {
   final ValueChanged<double> onMixChanged;
   final VoidCallback onToggleMix;
   final VoidCallback onToggleSpatialHud;
+  final bool connected;
+  final bool synchronized;
+  final bool pending;
 
   @override
   Widget build(BuildContext context) {
     final mixClamped = passthroughMix.clamp(0.0, 1.0);
     final pct = (mixClamped * 100).round();
-    final isActive = mixClamped > 0.01;
+    final ready = connected && synchronized;
+    final isActive = ready && mixClamped > 0.01;
 
     return Row(
       children: [
@@ -48,11 +55,13 @@ class VrBreakthroughCurtainBar extends StatelessWidget {
                   VrJoystickConstants.keyBreakthroughCenterBar,
                 ),
                 behavior: HitTestBehavior.opaque,
-                onTap: onToggleMix,
-                onHorizontalDragStart: (details) =>
-                    handleDragPosition(details.localPosition.dx),
-                onHorizontalDragUpdate: (details) =>
-                    handleDragPosition(details.localPosition.dx),
+                onTap: ready ? onToggleMix : null,
+                onHorizontalDragStart: !ready
+                    ? null
+                    : (details) => handleDragPosition(details.localPosition.dx),
+                onHorizontalDragUpdate: !ready
+                    ? null
+                    : (details) => handleDragPosition(details.localPosition.dx),
                 child: Container(
                   height: 28,
                   decoration: BoxDecoration(
@@ -77,9 +86,15 @@ class VrBreakthroughCurtainBar extends StatelessWidget {
                             decoration: BoxDecoration(
                               gradient: LinearGradient(
                                 colors: [
-                                  const Color(0xFF10B981).withValues(alpha: 0.38),
-                                  const Color(0xFF00E5FF).withValues(alpha: 0.50),
-                                  const Color(0xFF10B981).withValues(alpha: 0.38),
+                                  const Color(
+                                    0xFF10B981,
+                                  ).withValues(alpha: 0.38),
+                                  const Color(
+                                    0xFF00E5FF,
+                                  ).withValues(alpha: 0.50),
+                                  const Color(
+                                    0xFF10B981,
+                                  ).withValues(alpha: 0.38),
                                 ],
                               ),
                               borderRadius: BorderRadius.circular(7),
@@ -91,7 +106,13 @@ class VrBreakthroughCurtainBar extends StatelessWidget {
                         child: FittedBox(
                           fit: BoxFit.scaleDown,
                           child: Text(
-                            isActive
+                            !connected
+                                ? 'SIN CONEXIÓN · RECONECTAR'
+                                : !synchronized
+                                ? 'SINCRONIZANDO VISOR'
+                                : pending
+                                ? 'ESPERANDO VISOR'
+                                : isActive
                                 ? '${VrJoystickTranslationConstants.breakthroughBarActivePrefix}$pct${VrJoystickTranslationConstants.breakthroughBarActiveSuffix}'
                                 : VrJoystickTranslationConstants
                                       .breakthroughBarIdleLabel,
@@ -116,7 +137,7 @@ class VrBreakthroughCurtainBar extends StatelessWidget {
         const SizedBox(width: 4),
         GestureDetector(
           key: const ValueKey(VrJoystickConstants.keySpatialHudToggle),
-          onTap: onToggleSpatialHud,
+          onTap: ready ? onToggleSpatialHud : null,
           child: Container(
             height: 28,
             padding: const EdgeInsets.symmetric(horizontal: 7),
