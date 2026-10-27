@@ -1221,7 +1221,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
     bool includeMiniFrame = true,
   }) {
     if (_disposed ||
-        (!hasFreshCameraSample && !ultrasonicActive && !_hasLiveSensorSample)) {
+        (!hasFreshCameraSample && !ultrasonicActive && !hasFreshBodySample)) {
       return null;
     }
     final latestRoleIsFresh = _activeRole == VrJoystickConstants.cameraRoleRear

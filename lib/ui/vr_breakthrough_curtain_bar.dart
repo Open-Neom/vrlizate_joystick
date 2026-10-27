@@ -17,6 +17,7 @@ class VrBreakthroughCurtainBar extends StatelessWidget {
     this.connected = true,
     this.synchronized = true,
     this.pending = false,
+    this.showSpatialHudToggle = true,
   });
 
   final double passthroughMix;
@@ -27,6 +28,7 @@ class VrBreakthroughCurtainBar extends StatelessWidget {
   final bool connected;
   final bool synchronized;
   final bool pending;
+  final bool showSpatialHudToggle;
 
   @override
   Widget build(BuildContext context) {
@@ -134,50 +136,52 @@ class VrBreakthroughCurtainBar extends StatelessWidget {
             },
           ),
         ),
-        const SizedBox(width: 4),
-        GestureDetector(
-          key: const ValueKey(VrJoystickConstants.keySpatialHudToggle),
-          onTap: ready ? onToggleSpatialHud : null,
-          child: Container(
-            height: 28,
-            padding: const EdgeInsets.symmetric(horizontal: 7),
-            decoration: BoxDecoration(
-              color: spatialHudVisible
-                  ? const Color(0xFF10B981).withValues(alpha: 0.25)
-                  : const Color(0xFF162035),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(
+        if (showSpatialHudToggle) ...[
+          const SizedBox(width: 4),
+          GestureDetector(
+            key: const ValueKey(VrJoystickConstants.keySpatialHudToggle),
+            onTap: ready ? onToggleSpatialHud : null,
+            child: Container(
+              height: 28,
+              padding: const EdgeInsets.symmetric(horizontal: 7),
+              decoration: BoxDecoration(
                 color: spatialHudVisible
-                    ? const Color(0xFF10B981)
-                    : Colors.white24,
-                width: spatialHudVisible ? 1.5 : 1.0,
-              ),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.linked_camera_rounded,
-                  size: 13,
+                    ? const Color(0xFF10B981).withValues(alpha: 0.25)
+                    : const Color(0xFF162035),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
                   color: spatialHudVisible
                       ? const Color(0xFF10B981)
-                      : Colors.white70,
+                      : Colors.white24,
+                  width: spatialHudVisible ? 1.5 : 1.0,
                 ),
-                const SizedBox(width: 3),
-                Text(
-                  VrJoystickTranslationConstants.spatialHudButtonLabel,
-                  style: TextStyle(
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.linked_camera_rounded,
+                    size: 13,
                     color: spatialHudVisible
                         ? const Color(0xFF10B981)
                         : Colors.white70,
-                    fontSize: 9,
-                    fontWeight: FontWeight.bold,
                   ),
-                ),
-              ],
+                  const SizedBox(width: 3),
+                  Text(
+                    VrJoystickTranslationConstants.spatialHudButtonLabel,
+                    style: TextStyle(
+                      color: spatialHudVisible
+                          ? const Color(0xFF10B981)
+                          : Colors.white70,
+                      fontSize: 9,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
-        ),
+        ],
       ],
     );
   }

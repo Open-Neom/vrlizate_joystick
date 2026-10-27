@@ -9,6 +9,7 @@ export 'domain/models/remote_controller_state.dart';
 export 'domain/models/vr_button_mapping.dart';
 export 'domain/models/vr_controller_connection_exception.dart';
 export 'domain/models/vr_controller_connection_target.dart';
+export 'domain/models/vr_controller_link_quality.dart';
 export 'domain/models/vr_controller_mode_request.dart';
 export 'domain/models/vr_controller_telemetry.dart';
 export 'domain/models/vr_joystick_geometry.dart';

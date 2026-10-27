@@ -62,4 +62,56 @@ abstract final class VrLocalNetworkAddress {
     }
     return selectedAddress;
   }
+
+  /// Returns up to [limit] distinct valid LAN/Hotspot IPv4 addresses ordered by
+  /// interface priority (Wi-Fi/Hotspot first, Ethernet second, private LAN
+  /// third), excluding loopback, link-local, multicast, VPN, and cellular.
+  static List<String> selectAll(
+    Iterable<VrLocalAddressCandidate> candidates, {
+    int limit = 4,
+  }) {
+    final scored = <({String address, String name, int rank, int number})>[];
+    final seen = <String>{};
+    for (final candidate in candidates) {
+      final name = candidate.interfaceName.toLowerCase();
+      if (_excluded.hasMatch(name)) continue;
+      final octets = candidate.address.split(VrJoystickConstants.dotSeparator);
+      if (octets.length != 4) continue;
+      final bytes = <int>[];
+      for (final octet in octets) {
+        final value = int.tryParse(octet);
+        if (value == null || value < 0 || value > 255 || '$value' != octet) {
+          break;
+        }
+        bytes.add(value);
+      }
+      if (bytes.length != 4) continue;
+      final a = bytes[0], b = bytes[1];
+      if (a == 0 || a == 127 || a >= 224 || (a == 169 && b == 254)) {
+        continue;
+      }
+      final privateLan =
+          a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168);
+      final rank = _wifi.hasMatch(name)
+          ? 0
+          : (_ethernet.hasMatch(name) ? 1 : 2);
+      if (rank == 2 && !privateLan) continue;
+      if (!seen.add(candidate.address)) continue;
+      final number = (a << 24) | (b << 16) | (bytes[2] << 8) | bytes[3];
+      scored.add((
+        address: candidate.address,
+        name: name,
+        rank: rank,
+        number: number,
+      ));
+    }
+    scored.sort((x, y) {
+      final r = x.rank.compareTo(y.rank);
+      if (r != 0) return r;
+      final n = x.name.compareTo(y.name);
+      if (n != 0) return n;
+      return x.number.compareTo(y.number);
+    });
+    return [for (final item in scored.take(limit)) item.address];
+  }
 }

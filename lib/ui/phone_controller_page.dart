@@ -16,6 +16,7 @@ import 'package:wordsphere/wordsphere.dart';
 
 import '../domain/models/vr_controller_connection_exception.dart';
 import '../domain/models/vr_controller_connection_target.dart';
+import '../domain/models/vr_controller_link_quality.dart';
 import '../domain/models/vr_joystick_geometry.dart';
 import '../domain/models/vr_steering_state.dart';
 import '../domain/models/vr_tracking_marker_configuration.dart';
@@ -240,6 +241,17 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   final ValueNotifier<Uri?> _castPreview = ValueNotifier(null);
   int _castGeneration = 0;
   bool _castDialogOpen = false;
+  static const MethodChannel _deviceCapabilitiesChannel = MethodChannel(
+    'vrlizate/device_capabilities',
+  );
+  bool? _deviceHasHardwareGyroscope;
+  bool? _deviceHasConcurrentCameras;
+  bool _deviceIsLowRam = false;
+  VrObservableControllerLink? _observableLink;
+  VrControllerLinkQuality? _linkQuality;
+  String? _dismissedAdvisoryCode;
+  int _streamIntervalMs = 16;
+  double _lastPaintedLaserDwellProgress = -1.0;
 
   /// Generic role of each button, shown until a host captions it. Must match
   /// the host runner: X cycles modes, Y is the special action, L utility, R
@@ -441,6 +453,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
     _startGyroTracking();
     _startShakeDetection();
+    _syncImuSubscriptions();
+    unawaited(_probeLocalHardwareCapabilities());
     _visionService.addListener(_onVisionServiceUpdated);
     unawaited(_visionService.start());
 
@@ -532,7 +546,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               // Driving tilt remains available when shake-to-hide is disabled.
               _steering.updateGravity(event.x, event.y, event.z, nowUs);
               _motionLook.updateGravity(event.x, event.y, event.z, nowUs);
-              _visionService.updateImuGravity(event.x, event.y, event.z);
+              if (_visionService.enableHardwareCameraStream ||
+                  _visionService.enableUltrasonicRanging ||
+                  _visionService.bodyDetectionEnabled) {
+                _visionService.updateImuGravity(event.x, event.y, event.z);
+              }
               if (!_settingsOpen && !_castDialogOpen) {
                 final sensorTimeUs = event.timestamp.microsecondsSinceEpoch;
                 final effectiveUs = sensorTimeUs > 0 ? sensorTimeUs : nowUs;
@@ -889,9 +907,84 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _setMotionCapability(VrMotionCapability.unavailable);
     }
 
-    // Sample controls at 60 Hz. The sender paces analog updates and keeps idle
-    // links alive without serializing/transmitting identical state each tick.
-    _streamTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+    // Sample controls at 60 Hz (or 120 Hz on upgraded Pro 5/6 GHz links). The
+    // sender paces analog updates and keeps idle links alive without
+    // serializing/transmitting identical state each tick.
+    _restartStreamTimer(16);
+  }
+
+  Future<void> _probeLocalHardwareCapabilities() async {
+    try {
+      final raw = await _deviceCapabilitiesChannel.invokeMethod<Object?>(
+        'read',
+      );
+      if (!mounted || raw is! Map) return;
+      final hasGyro = raw['hasHardwareGyroscope'];
+      final hasCam3 = raw['hasConcurrentCameras'];
+      final ramMb = raw['totalRamMb'];
+      final lowRam =
+          raw['isLowRamDevice'] == true || (ramMb is int && ramMb <= 4200);
+      setState(() {
+        if (hasGyro is bool) _deviceHasHardwareGyroscope = hasGyro;
+        if (hasCam3 is bool) _deviceHasConcurrentCameras = hasCam3;
+        _deviceIsLowRam = lowRam;
+        if (_deviceIsLowRam && _castPreview.value == null) {
+          _castAutoEnabled = false;
+        }
+        if (_deviceHasHardwareGyroscope == false) {
+          _motionLookEnabled = false;
+          _motionLook.setActive(false, _controllerClock.elapsedMicroseconds);
+        }
+      });
+      if (_deviceHasHardwareGyroscope == false) {
+        await _gyroSub?.cancel();
+        _gyroSub = null;
+        _setMotionCapability(VrMotionCapability.unavailable);
+      } else {
+        _syncImuSubscriptions();
+      }
+    } catch (_) {
+      // Optional native probe; widget tests and platforms without the channel
+      // retain default capabilities.
+    }
+  }
+
+  void _syncImuSubscriptions() {
+    final needGyro =
+        _isForeground &&
+        _deviceHasHardwareGyroscope != false &&
+        _activeMode != RemoteControllerMode.nes;
+    final gyro = _gyroSub;
+    if (gyro != null) {
+      if (needGyro && gyro.isPaused) {
+        _lastGyroTime = null;
+        gyro.resume();
+      } else if (!needGyro && !gyro.isPaused) {
+        gyro.pause();
+        _lastGyroOmegaMag = 0.0;
+        _lastGyroTime = null;
+      }
+    }
+
+    final needAccel =
+        _isForeground &&
+        (_activeMode != RemoteControllerMode.nes || _shakeToToggleEnabled);
+    final accel = _accelSub;
+    if (accel != null) {
+      if (needAccel && accel.isPaused) {
+        accel.resume();
+      } else if (!needAccel && !accel.isPaused) {
+        accel.pause();
+      }
+    }
+  }
+
+  void _restartStreamTimer(int intervalMs) {
+    final clamped = intervalMs.clamp(8, 33);
+    if (_streamTimer != null && _streamIntervalMs == clamped) return;
+    _streamIntervalMs = clamped;
+    _streamTimer?.cancel();
+    _streamTimer = Timer.periodic(Duration(milliseconds: clamped), (_) {
       if (!mounted || !_isForeground) return;
       final now = _controllerClock.elapsedMicroseconds;
       final dtSeconds = (now - _lastDrivingTickUs) / 1e6;
@@ -909,9 +1002,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           paused: _wordsphereSearchSheetVisible || _settingsOpen,
         );
         if (triggered) {
+          _lastPaintedLaserDwellProgress = _laserSteadyDwell.progress;
           _pulseLaserClick();
-        } else if (now - _lastDrivingPaintUs >= 33333) {
+        } else if (now - _lastDrivingPaintUs >= 33333 &&
+            (_laserSteadyDwell.progress - _lastPaintedLaserDwellProgress)
+                    .abs() >=
+                0.005) {
           _lastDrivingPaintUs = now;
+          _lastPaintedLaserDwellProgress = _laserSteadyDwell.progress;
           setState(() {});
         }
       }
@@ -935,8 +1033,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         }
       }
       _lastDrivingTickUs = now;
-      _visionService.tick();
-      _sendVisionTelemetryMessageIfDue(now);
+      if (_visionService.enableHardwareCameraStream ||
+          _visionService.enableUltrasonicRanging ||
+          _visionService.bodyDetectionEnabled) {
+        _visionService.tick();
+        _sendVisionTelemetryMessageIfDue(now);
+      }
       _sendState();
     });
   }
@@ -1059,6 +1161,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _steering.calibrate(_wheelOrientation);
       _lastDrivingTickUs = _controllerClock.elapsedMicroseconds;
     });
+    _syncImuSubscriptions();
     _hapticClick();
     _sendState(force: true);
   }
@@ -1414,6 +1517,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _socket = socket;
       _socketTarget = target;
       _socketGeneration = generation;
+      _attachLinkQuality(socket);
       _hostModeSession.reset();
       _effectivePassthroughRevision = -1;
       _hasEffectivePassthroughState = false;
@@ -1501,14 +1605,60 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
   }
 
+  void _attachLinkQuality(VrControllerLink socket) {
+    _detachLinkQuality(notify: false);
+    if (socket is VrObservableControllerLink) {
+      _observableLink = socket;
+      _linkQuality = socket.linkQualityListenable.value;
+      socket.linkQualityListenable.addListener(_onLinkQualityChanged);
+      _applyLinkQuality(_linkQuality);
+    }
+  }
+
+  void _detachLinkQuality({bool notify = true}) {
+    final prev = _observableLink;
+    if (prev != null) {
+      prev.linkQualityListenable.removeListener(_onLinkQualityChanged);
+    }
+    _observableLink = null;
+    _linkQuality = null;
+    _restartStreamTimer(16);
+    if (notify && mounted) setState(() {});
+  }
+
+  void _onLinkQualityChanged() {
+    final current = _observableLink?.linkQualityListenable.value;
+    if (!mounted || current == _linkQuality) return;
+    setState(() {
+      _linkQuality = current;
+    });
+    _applyLinkQuality(current);
+  }
+
+  void _applyLinkQuality(VrControllerLinkQuality? quality) {
+    final targetMs = (quality != null && quality.recommendedHz >= 120) ? 8 : 16;
+    _restartStreamTimer(targetMs);
+    if (quality != null && !quality.canCarryVideoCast) {
+      if (_castPreview.value != null) _castPreview.value = null;
+    } else if (_isForeground &&
+        _castAutoEnabled &&
+        !_deviceIsLowRam &&
+        _castOffer != null &&
+        _castPreview.value == null) {
+      _castPreview.value = _castOffer;
+    }
+  }
+
   void _clearCast({bool forgetOffer = true}) {
     _castGeneration++;
     if (forgetOffer) {
       _castOffer = null;
-      _castAutoEnabled = true;
+      _castAutoEnabled = !_deviceIsLowRam;
     }
     _castPreview.value = null;
   }
+
+  bool get _canDisplayCastUi => _linkQuality?.canCarryVideoCast ?? true;
 
   bool _acceptCastOffer(Object? data) {
     if (data is! String || data.length > 2048) return false;
@@ -1531,7 +1681,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     if (uri != _castOffer) {
       _clearCast();
       _castOffer = uri;
-      if (_isForeground && _castAutoEnabled) _castPreview.value = uri;
+      if (_isForeground && _castAutoEnabled && _canDisplayCastUi) {
+        _castPreview.value = uri;
+      }
       if (mounted) setState(() {});
     }
     return true;
@@ -1789,6 +1941,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           ? VrJoystickTranslationConstants.statusNesReady
           : VrJoystickTranslationConstants.statusJoystickReady;
     });
+    _syncImuSubscriptions();
     // Even while backgrounded the host must receive a neutral mode ACK.
     _sendState(force: true);
   }
@@ -1887,6 +2040,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     if (expired || permanent) _stopAutomaticReconnect();
     _socket = null;
     _socketTarget = null;
+    _detachLinkQuality(notify: false);
     _linkSubscription?.cancel();
     _linkSubscription = null;
     unawaited(_closeLink(socket));
@@ -1980,6 +2134,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _shakeDetector.reset();
     _isForeground = state == AppLifecycleState.resumed;
+    _syncImuSubscriptions();
     if (!_isForeground) {
       _clearCast(forgetOffer: false);
       _reconnectTimer?.cancel();
@@ -1996,7 +2151,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       });
     } else {
       _lastGyroTime = null;
-      if (_castAutoEnabled) _castPreview.value = _castOffer;
+      if (_castAutoEnabled && _canDisplayCastUi) {
+        _castPreview.value = _castOffer;
+      }
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
       final socket = _socket;
       if (socket != null && !socket.isOpen) _onDisconnected(socket);
@@ -2217,13 +2374,25 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             _passthroughGesture.passthroughActive,
         VrJoystickConstants.fieldSpatialHudVisible: _spatialHudVisible,
       };
+      final quality = _linkQuality;
+      final customInterval = quality == null
+          ? null
+          : (quality.recommendedHz >= 120
+                ? const Duration(microseconds: 8000)
+                : (quality.isUdpUpgraded ||
+                          quality.transport ==
+                              VrControllerFastTransport.bleSinglePacket
+                      ? VrControllerStatePacer.socketAnalogInterval
+                      : VrControllerStatePacer.bleAnalogInterval));
       if (!_statePacer.shouldSend(
         state,
         nowUs: _controllerClock.elapsedMicroseconds,
         bluetooth:
             widget.transportType == VrTransportType.bluetoothLe &&
-            !_useWifiOverride,
+            !_useWifiOverride &&
+            !(quality?.isUdpUpgraded ?? false),
         force: force,
+        customAnalogInterval: customInterval,
       )) {
         return;
       }
@@ -2297,6 +2466,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _connectionHapticTimer?.cancel();
     _connectionHapticTimer = null;
     _surfaceMounted = false;
+    _detachLinkQuality(notify: false);
     _passthroughSettingsRevision.dispose();
     WidgetsBinding.instance.removeObserver(this);
     _stopAutomaticReconnect();
@@ -3676,6 +3846,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
               const SizedBox(height: 3),
 
+              if (_isConnected &&
+                  _linkQuality?.advisory != null &&
+                  _dismissedAdvisoryCode != _linkQuality!.advisory!.code &&
+                  MediaQuery.sizeOf(context).height >= 360) ...[
+                _buildLinkAdvisoryBanner(_linkQuality!.advisory!),
+                const SizedBox(height: 2),
+              ],
+
               // Real-time Telemetry Bar
               _buildTelemetryBar(),
               if (_motionCapability != VrMotionCapability.available)
@@ -4685,6 +4863,13 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       valueListenable: _castPreview,
       builder: (context, uri, _) => Column(
         children: [
+          if (constraints.maxHeight >= 150 &&
+              _isConnected &&
+              _linkQuality?.advisory != null &&
+              _dismissedAdvisoryCode != _linkQuality!.advisory!.code) ...[
+            _buildLinkAdvisoryBanner(_linkQuality!.advisory!),
+            const SizedBox(height: 3),
+          ],
           if (constraints.maxHeight >= 100)
             Expanded(
               child: uri == null
@@ -4720,7 +4905,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       ),
                     ),
             ),
-          if (constraints.maxHeight >= 76)
+          if (constraints.maxHeight >= 76 && _canDisplayCastUi)
             SizedBox(
               height: 30,
               child: TextButton.icon(
@@ -4760,6 +4945,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 synchronized: _hasEffectivePassthroughState,
                 pending: _pendingPassthroughMix != null,
                 spatialHudVisible: _spatialHudVisible,
+                showSpatialHudToggle:
+                    _deviceHasConcurrentCameras != false ||
+                    (_linkQuality?.peerSupportsConcurrentCameras ?? false),
                 onMixChanged: _setBreakthroughMix,
                 onToggleMix: _toggleBreakthroughMix,
                 onToggleSpatialHud: () => _toggleSpatialHud(),
@@ -4960,6 +5148,37 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                     ),
                   ),
                 ),
+                if (_isConnected && _linkQuality != null) ...[
+                  const SizedBox(width: 4),
+                  Container(
+                    key: const ValueKey('controller_link_quality_badge'),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 5,
+                      vertical: 1.5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: _linkQuality!.isUdpUpgraded
+                          ? const Color(0xFF10B981).withValues(alpha: 0.18)
+                          : const Color(0xFF00E5FF).withValues(alpha: 0.14),
+                      borderRadius: BorderRadius.circular(5),
+                      border: Border.all(
+                        color: _linkQuality!.isUdpUpgraded
+                            ? const Color(0xFF10B981).withValues(alpha: 0.65)
+                            : const Color(0xFF00E5FF).withValues(alpha: 0.45),
+                      ),
+                    ),
+                    child: Text(
+                      _linkQuality!.compactBadgeLabel,
+                      style: TextStyle(
+                        color: _linkQuality!.isUdpUpgraded
+                            ? const Color(0xFF10B981)
+                            : const Color(0xFF7DD3FC),
+                        fontSize: 8.0,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
@@ -5486,6 +5705,34 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 ],
               ),
             ),
+            if (_isConnected && _linkQuality != null) ...[
+              const SizedBox(width: 6),
+              Container(
+                key: const ValueKey('controller_link_quality_badge'),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: _linkQuality!.isUdpUpgraded
+                      ? const Color(0xFF10B981).withValues(alpha: 0.18)
+                      : const Color(0xFF00E5FF).withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(
+                    color: _linkQuality!.isUdpUpgraded
+                        ? const Color(0xFF10B981).withValues(alpha: 0.65)
+                        : const Color(0xFF00E5FF).withValues(alpha: 0.45),
+                  ),
+                ),
+                child: Text(
+                  _linkQuality!.compactBadgeLabel,
+                  style: TextStyle(
+                    color: _linkQuality!.isUdpUpgraded
+                        ? const Color(0xFF10B981)
+                        : const Color(0xFF7DD3FC),
+                    fontSize: 8.5,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
             if (MediaQuery.sizeOf(context).width >= 740) ...[
               const SizedBox(width: 8),
               Text(
@@ -5498,6 +5745,51 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 ),
               ),
             ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLinkAdvisoryBanner(VrLinkPerformanceAdvisory advisory) {
+    final isWarning = advisory.severity == VrLinkAdvisorySeverity.warning;
+    final accent = isWarning
+        ? const Color(0xFFFFB74D)
+        : const Color(0xFF7DD3FC);
+    return GestureDetector(
+      key: const ValueKey('controller_link_advisory_banner'),
+      onTap: () => setState(() => _dismissedAdvisoryCode = advisory.code),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: accent.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: accent.withValues(alpha: 0.45)),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              isWarning
+                  ? Icons.speed_rounded
+                  : Icons.tips_and_updates_outlined,
+              size: 12,
+              color: accent,
+            ),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                advisory.message,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: accent,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            const SizedBox(width: 4),
+            Icon(Icons.close_rounded, size: 12, color: accent),
           ],
         ),
       ),

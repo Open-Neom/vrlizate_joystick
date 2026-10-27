@@ -25,6 +25,7 @@ class VrControllerStatePacer {
     required int nowUs,
     required bool bluetooth,
     bool force = false,
+    Duration? customAnalogInterval,
   }) {
     final previous = _lastState;
     final elapsed = _lastSentUs == null ? null : nowUs - _lastSentUs!;
@@ -37,7 +38,9 @@ class VrControllerStatePacer {
               entry.key == VrJoystickConstants.fieldHostModeRevision ||
               (_releaseAxes.contains(entry.key) && entry.value == 0);
         });
-    final interval = bluetooth ? bleAnalogInterval : socketAnalogInterval;
+    final interval =
+        customAnalogInterval ??
+        (bluetooth ? bleAnalogInterval : socketAnalogInterval);
     if (!force && previous != null && elapsed != null && elapsed >= 0) {
       if (mapEquals(state, previous)) {
         if (elapsed < keepAliveInterval.inMicroseconds) return false;
