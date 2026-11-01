@@ -815,4 +815,63 @@ void main() {
       expect(received.any((state) => state.btnA), isFalse);
     },
   );
+
+  test(
+    'setDesktopBridgeState preserves topologyMode and deduplicates repeated updates',
+    () async {
+      final outbound = <String>[];
+      final fakeLink = _RecordingLink(outbound);
+      expect(
+        service.attachControllerLink(
+          fakeLink,
+          sessionToken: service.sessionToken,
+        ),
+        isTrue,
+      );
+      const bridgeState = VrDesktopBridgeState(
+        revision: 1,
+        stationConnected: true,
+        stationName: 'VRlizate Desktop Faro',
+        castOffloadedToDesktop: true,
+        visionOffloadedToDesktop: true,
+        recommendedJoystickHz: 120,
+        deskClearanceMeters: 1.42,
+        topologyMode: 'hybridSplitCompute',
+        substituteGyroWithPcVision: true,
+      );
+      for (var i = 0; i < 10; i++) {
+        service.setDesktopBridgeState(bridgeState);
+      }
+      final bridgeMessages = outbound
+          .where((m) => m.contains(VrDesktopBridgeState.messageType))
+          .toList();
+      expect(bridgeMessages.length, 1);
+      expect(service.desktopBridgeState?.topologyMode, 'hybridSplitCompute');
+      expect(service.desktopBridgeState?.substituteGyroWithPcVision, isTrue);
+    },
+  );
+}
+
+class _RecordingLink implements VrControllerLink {
+  _RecordingLink(this.sent);
+
+  final List<String> sent;
+  final _incoming = const Stream<Object?>.empty();
+  bool _open = true;
+
+  @override
+  Stream<Object?> get messages => _incoming;
+
+  @override
+  bool get isOpen => _open;
+
+  @override
+  void add(Object data) {
+    if (data is String) sent.add(data);
+  }
+
+  @override
+  Future<void> close([int? code, String? reason]) async {
+    _open = false;
+  }
 }

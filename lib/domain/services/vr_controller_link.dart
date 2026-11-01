@@ -10,3 +10,10 @@ abstract class VrControllerLink {
   void add(Object data);
   Future<void> close([int? code, String? reason]);
 }
+
+/// Optional capability implemented by high-speed links (such as the `3D Set`
+/// `VRB1` UDP relay) that natively transport `46-byte` binary
+/// `VrCompactGamepadFrame` snapshots without `jsonEncode`/`jsonDecode`.
+abstract interface class VrCompactGamepadCapableLink {
+  bool get supportsCompactGamepadFrames;
+}

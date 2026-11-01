@@ -55,6 +55,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
   bool _configuringUltrasonic = false;
   bool _observingLifecycle = false;
   bool _suspended = false;
+  bool _desktopOffloadPaused = false;
   bool _wantsCameraRunning = false;
   int _cameraGeneration = 0;
   Future<void> _cameraOperation = Future<void>.value();
@@ -306,6 +307,27 @@ class VrJoystickCameraVisionService extends ChangeNotifier
     }
   }
 
+  bool get isDesktopOffloadPaused => _desktopOffloadPaused;
+
+  /// Pauses local Joystick camera capture and ML body inference while a
+  /// connected Desktop computer (`Estación Faro`) maintains high-confidence AI
+  /// tracking, saving battery, CPU/GPU, and thermal budget on the controller.
+  /// Automatically resumes if the PC disconnects or loses visual lock.
+  Future<void> setDesktopOffloadPaused(bool paused) async {
+    if (_disposed || _desktopOffloadPaused == paused) return;
+    _desktopOffloadPaused = paused;
+    if (paused) {
+      _ultrasonicActive = false;
+      _ultrasonicGeneration++;
+      await _stopCamera(clearIntent: false);
+    } else if (!_suspended &&
+        _wantsCameraRunning &&
+        enableHardwareCameraStream) {
+      unawaited(start());
+    }
+    if (!_disposed) notifyListeners();
+  }
+
   /// Starts one low-resolution camera. Calls are idempotent; stale permission
   /// or initialization completions cannot resurrect a stopped service.
   Future<void> start() async {
@@ -314,7 +336,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
     if (kIsWeb || !(Platform.isAndroid || Platform.isIOS)) return;
     _wantsCameraRunning = true;
     _observeLifecycle();
-    if (_suspended || isCameraStreaming) return;
+    if (_suspended || _desktopOffloadPaused || isCameraStreaming) return;
     _starting = true;
     final generation = ++_cameraGeneration;
     try {
@@ -332,6 +354,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
       _starting = false;
       if (!_disposed &&
           !_suspended &&
+          !_desktopOffloadPaused &&
           _wantsCameraRunning &&
           enableHardwareCameraStream &&
           generation != _cameraGeneration &&
@@ -344,6 +367,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
   bool _canOpen(int generation) =>
       !_disposed &&
       !_suspended &&
+      !_desktopOffloadPaused &&
       enableHardwareCameraStream &&
       _wantsCameraRunning &&
       generation == _cameraGeneration;
@@ -377,7 +401,9 @@ class VrJoystickCameraVisionService extends ChangeNotifier
       unawaited(_stopCamera(clearIntent: false));
       _ultrasonicActive = false;
       _ultrasonicGeneration++;
-    } else if (_wantsCameraRunning && enableHardwareCameraStream) {
+    } else if (!_desktopOffloadPaused &&
+        _wantsCameraRunning &&
+        enableHardwareCameraStream) {
       unawaited(start());
     }
   }

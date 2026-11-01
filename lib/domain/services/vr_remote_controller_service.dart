@@ -8,6 +8,8 @@ import 'package:flutter/services.dart';
 import 'package:vector_math/vector_math.dart' as vm;
 import 'package:vrlizate/vrlizate.dart'
     show
+        VrCompactGamepadCodec,
+        VrCompactGamepadFrame,
         VrRangeSource,
         VrRemoteBinaryCodec,
         VrRemotePoseFrame,
@@ -21,6 +23,7 @@ import '../../utils/enums/vr_controller_wire_format.dart';
 import '../models/remote_controller_state.dart';
 import '../models/vr_controller_mode_request.dart';
 import '../models/vr_controller_telemetry.dart';
+import '../models/vr_desktop_bridge_state.dart';
 import '../models/vr_local_address_candidate.dart';
 import '../models/vr_tracking_marker_configuration.dart';
 import 'vr_controller_link.dart';
@@ -87,6 +90,8 @@ class VrRemoteControllerService {
   int? _heldCaptionAckRevision;
   bool _modeControlSupported = false;
   Uri? _castPreviewUri;
+  VrDesktopBridgeState? _desktopBridgeState;
+  int _desktopBridgeRevision = 0;
   double? _effectivePassthroughMix;
   bool _effectiveCameraEnabled = false;
   int _effectivePassthroughRevision = 0;
@@ -133,6 +138,12 @@ class VrRemoteControllerService {
   RemoteControllerState _latestState = RemoteControllerState(
     orientation: vm.Quaternion.identity(),
   );
+  RemoteControllerState _rawLatestState = RemoteControllerState(
+    orientation: vm.Quaternion.identity(),
+  );
+  bool _systemOverlayCaptured = false;
+  bool _awaitReleaseAfterOverlay = false;
+  final List<void Function(RemoteControllerState)> _rawStateListeners = [];
 
   final StreamController<RemoteControllerState> _stateController =
       StreamController<RemoteControllerState>.broadcast();
@@ -144,9 +155,325 @@ class VrRemoteControllerService {
   Stream<bool> get onConnectionChanged => _connectionController.stream;
 
   bool _localHandheldActive = false;
+  bool _handsFreeVirtualActive = false;
+  Timer? _voiceLocomotionTimer;
+  Timer? _voiceLocomotionStopTimer;
+  Timer? _voiceButtonReleaseTimer;
+  double _voiceStickX = 0.0;
+  double _voiceStickY = 0.0;
+  double _voiceTurnRate = 0.0;
 
-  bool get isConnected => _client != null || _localHandheldActive;
+  bool get isConnected =>
+      _client != null || _localHandheldActive || _handsFreeVirtualActive;
   bool get isLocalHandheldActive => _localHandheldActive;
+  bool get isHandsFreeVirtualActive => _handsFreeVirtualActive;
+  bool get isVoiceLocomotionActive =>
+      _voiceLocomotionTimer != null &&
+      (_voiceLocomotionStopTimer?.isActive ?? false);
+  bool get isSystemOverlayCaptured => _systemOverlayCaptured;
+  RemoteControllerState get rawLatestState => _rawLatestState;
+
+  /// Returns true when [link] is currently the active controller link.
+  bool isLinkAttached(VrControllerLink link) => identical(_client, link);
+
+  /// Registers a system-level listener (e.g. Universal Subtle Floating Menu)
+  /// that observes un-neutralized controller states even while overlay capture
+  /// is active.
+  void addRawStateListener(void Function(RemoteControllerState) listener) {
+    if (_disposed || _rawStateListeners.contains(listener)) return;
+    _rawStateListeners.add(listener);
+  }
+
+  void removeRawStateListener(void Function(RemoteControllerState) listener) {
+    _rawStateListeners.remove(listener);
+  }
+
+  /// Captures controller sticks/buttons for a system overlay (such as the
+  /// Universal Subtle Quick Menu) so underlying 3D scenes receive neutralized
+  /// locomotion/actions while the overlay is open — and latches button release
+  /// when closing so the closing press never leaks into the underlying scene.
+  void setSystemOverlayCapture(bool captured) {
+    if (_disposed || _systemOverlayCaptured == captured) return;
+    _systemOverlayCaptured = captured;
+    if (!captured && _hasHeldOverlayButtons(_rawLatestState)) {
+      _awaitReleaseAfterOverlay = true;
+    } else if (captured) {
+      _awaitReleaseAfterOverlay = false;
+    }
+    _publishState(_neutralizedSnapshotFrom(_rawLatestState), notifyRaw: false);
+  }
+
+  static bool _hasHeldOverlayButtons(RemoteControllerState s) =>
+      s.btnA ||
+      s.btnB ||
+      s.btnL ||
+      s.btnR ||
+      s.isTriggerPressed ||
+      s.isActionPressed;
+
+  /// Emits a synthetic `recenter` pulse to the active VR scene (`Home`,
+  /// `Plazas Famosas`, `Worlds`, or any running `DemoRunner` app).
+  void pulseRecenter() {
+    if (_disposed) return;
+    final base = _neutralizedSnapshotFrom(_rawLatestState);
+    final pulse = RemoteControllerState(
+      passthroughCommandRevision: base.passthroughCommandRevision,
+      orientation: base.orientation.clone(),
+      angularVelocity: base.angularVelocity.clone(),
+      mode: base.mode,
+      recenter: true,
+      drivingPaused: base.drivingPaused,
+      controllerVisible: base.controllerVisible,
+      rangeMeters: base.rangeMeters,
+      passthroughMix: base.passthroughMix,
+      passthroughActive: base.passthroughActive,
+      spatialHudVisible: base.spatialHudVisible,
+    );
+    _stateController.add(pulse);
+    _stateController.add(base);
+  }
+
+  void _ensureHandsFreeVirtualConnected() {
+    if (_disposed || _client != null || _localHandheldActive) return;
+    if (!_handsFreeVirtualActive) {
+      _handsFreeVirtualActive = true;
+      _connectionController.add(true);
+    }
+  }
+
+  /// Drives smooth 3D spatial walking, strafing, or turning from a spoken Itzli
+  /// voice command or facial gesture — even when zero physical Joystick is paired!
+  void driveVoiceLocomotion({
+    double stickX = 0.0,
+    double stickY = 0.0,
+    double turnRate = 0.0,
+    Duration duration = const Duration(milliseconds: 2200),
+  }) {
+    if (_disposed) return;
+    final sx = stickX.isFinite ? stickX.clamp(-1.0, 1.0) : 0.0;
+    final sy = stickY.isFinite ? stickY.clamp(-1.0, 1.0) : 0.0;
+    final tr = turnRate.isFinite ? turnRate.clamp(-1.0, 1.0) : 0.0;
+    if ((sx.abs() < 0.005 && sy.abs() < 0.005 && tr.abs() < 0.005) ||
+        duration <= Duration.zero) {
+      stopVoiceLocomotion();
+      return;
+    }
+
+    _ensureHandsFreeVirtualConnected();
+    _voiceStickX = sx;
+    _voiceStickY = sy;
+    _voiceTurnRate = tr;
+    _voiceLocomotionTimer?.cancel();
+    _voiceLocomotionStopTimer?.cancel();
+
+    void emitStep() {
+      if (_disposed) {
+        stopVoiceLocomotion();
+        return;
+      }
+      if (_client == null) {
+        final base = _rawLatestState;
+        _publishState(
+          RemoteControllerState(
+            passthroughCommandRevision: base.passthroughCommandRevision,
+            orientation: base.orientation.clone(),
+            angularVelocity: base.angularVelocity.clone(),
+            mode: base.mode,
+            stickX: _voiceStickX,
+            stickY: _voiceStickY,
+            moveAtEdge: false,
+            turnRate: _voiceTurnRate,
+            controllerVisible: _localHandheldActive,
+            rangeMeters: base.rangeMeters,
+            passthroughMix: base.passthroughMix,
+            passthroughActive: base.passthroughActive,
+            spatialHudVisible: base.spatialHudVisible,
+          ),
+        );
+      }
+    }
+
+    _voiceLocomotionStopTimer = Timer(duration, stopVoiceLocomotion);
+    emitStep();
+    _voiceLocomotionTimer = Timer.periodic(
+      const Duration(milliseconds: 50),
+      (_) => emitStep(),
+    );
+  }
+
+  /// Immediately halts any active voice-driven locomotion and neutralizes sticks.
+  void stopVoiceLocomotion() {
+    final wasActive = _voiceLocomotionTimer != null ||
+        _voiceLocomotionStopTimer != null ||
+        _voiceStickX != 0.0 ||
+        _voiceStickY != 0.0 ||
+        _voiceTurnRate != 0.0;
+    _voiceLocomotionTimer?.cancel();
+    _voiceLocomotionTimer = null;
+    _voiceLocomotionStopTimer?.cancel();
+    _voiceLocomotionStopTimer = null;
+    _voiceStickX = 0.0;
+    _voiceStickY = 0.0;
+    _voiceTurnRate = 0.0;
+    if (wasActive && !_disposed && _client == null) {
+      _publishState(_neutralizedSnapshotFrom(_rawLatestState));
+    }
+  }
+
+  /// Emits a hands-free primary confirm/click (`btnA` + `trigger`) to the active
+  /// VR scene (works with or without a paired Joystick).
+  void pulsePrimarySelect() {
+    if (_disposed) return;
+    _ensureHandsFreeVirtualConnected();
+    _voiceButtonReleaseTimer?.cancel();
+    final base = _neutralizedSnapshotFrom(_rawLatestState);
+    final pressed = RemoteControllerState(
+      passthroughCommandRevision: base.passthroughCommandRevision,
+      orientation: base.orientation.clone(),
+      angularVelocity: base.angularVelocity.clone(),
+      mode: base.mode,
+      btnA: true,
+      isTriggerPressed: true,
+      controllerVisible: _client != null ? base.controllerVisible : false,
+      rangeMeters: base.rangeMeters,
+      passthroughMix: base.passthroughMix,
+      passthroughActive: base.passthroughActive,
+      spatialHudVisible: base.spatialHudVisible,
+    );
+    _publishState(pressed);
+    _voiceButtonReleaseTimer = Timer(const Duration(milliseconds: 55), () {
+      if (_disposed) return;
+      _publishState(_neutralizedSnapshotFrom(_rawLatestState));
+    });
+  }
+
+  /// Emits a hands-free back/cancel pulse (`btnB` + `action`) to the active VR scene.
+  void pulseBackAction() {
+    if (_disposed) return;
+    _ensureHandsFreeVirtualConnected();
+    _voiceButtonReleaseTimer?.cancel();
+    final base = _neutralizedSnapshotFrom(_rawLatestState);
+    final pressed = RemoteControllerState(
+      passthroughCommandRevision: base.passthroughCommandRevision,
+      orientation: base.orientation.clone(),
+      angularVelocity: base.angularVelocity.clone(),
+      mode: base.mode,
+      btnB: true,
+      isActionPressed: true,
+      controllerVisible: _client != null ? base.controllerVisible : false,
+      rangeMeters: base.rangeMeters,
+      passthroughMix: base.passthroughMix,
+      passthroughActive: base.passthroughActive,
+      spatialHudVisible: base.spatialHudVisible,
+    );
+    _publishState(pressed);
+    _voiceButtonReleaseTimer = Timer(const Duration(milliseconds: 55), () {
+      if (_disposed) return;
+      _publishState(_neutralizedSnapshotFrom(_rawLatestState));
+    });
+  }
+
+  RemoteControllerState _neutralizedSnapshotFrom(RemoteControllerState src) =>
+      RemoteControllerState(
+        passthroughCommandRevision: src.passthroughCommandRevision,
+        orientation: src.orientation.clone(),
+        angularVelocity: src.angularVelocity.clone(),
+        mode: src.mode,
+        drivingPaused: src.mode == RemoteControllerMode.driving,
+        isNeutralized: true,
+        controllerVisible: src.controllerVisible,
+        rangeMeters: src.rangeMeters,
+        passthroughMix: src.passthroughMix,
+        passthroughActive: src.passthroughActive,
+        spatialHudVisible: src.spatialHudVisible,
+        leftFootU: src.leftFootU,
+        leftFootV: src.leftFootV,
+        rightFootU: src.rightFootU,
+        rightFootV: src.rightFootV,
+        feetConfidence: src.feetConfidence,
+        handU: src.handU,
+        handV: src.handV,
+        handConfidence: src.handConfidence,
+        visorU: src.visorU,
+        visorV: src.visorV,
+        visorWidth: src.visorWidth,
+        joystickCameraRole: src.joystickCameraRole,
+        joystickMiniFrame: src.joystickMiniFrame,
+      );
+
+  void _publishState(RemoteControllerState next, {bool notifyRaw = true}) {
+    var effectiveNext = next;
+    if (_voiceLocomotionTimer != null) {
+      if (!(_voiceLocomotionStopTimer?.isActive ?? false)) {
+        _voiceLocomotionTimer?.cancel();
+        _voiceLocomotionTimer = null;
+        _voiceLocomotionStopTimer?.cancel();
+        _voiceLocomotionStopTimer = null;
+        _voiceStickX = 0.0;
+        _voiceStickY = 0.0;
+        _voiceTurnRate = 0.0;
+      } else if (_client != null && notifyRaw) {
+        final manualIntent =
+            next.stickX.abs() > 0.14 ||
+            next.stickY.abs() > 0.14 ||
+            next.turnRate.abs() > 0.14 ||
+            next.btnA ||
+            next.btnB ||
+            next.isTriggerPressed ||
+            next.isActionPressed;
+        if (manualIntent) {
+          _voiceLocomotionTimer?.cancel();
+          _voiceLocomotionTimer = null;
+          _voiceLocomotionStopTimer?.cancel();
+          _voiceLocomotionStopTimer = null;
+          _voiceStickX = 0.0;
+          _voiceStickY = 0.0;
+          _voiceTurnRate = 0.0;
+        } else {
+          effectiveNext = RemoteControllerState(
+            passthroughCommandRevision: next.passthroughCommandRevision,
+            orientation: next.orientation.clone(),
+            angularVelocity: next.angularVelocity.clone(),
+            mode: next.mode,
+            stickX: _voiceStickX,
+            stickY: _voiceStickY,
+            moveAtEdge: false,
+            turnRate: _voiceTurnRate,
+            pitchRate: next.pitchRate,
+            controllerVisible: next.controllerVisible,
+            rangeMeters: next.rangeMeters,
+            passthroughMix: next.passthroughMix,
+            passthroughActive: next.passthroughActive,
+            spatialHudVisible: next.spatialHudVisible,
+          );
+        }
+      }
+    }
+    final capturedBeforeRaw = _systemOverlayCaptured;
+    if (notifyRaw) {
+      _rawLatestState = effectiveNext;
+      if (_awaitReleaseAfterOverlay && !_hasHeldOverlayButtons(effectiveNext)) {
+        _awaitReleaseAfterOverlay = false;
+      }
+    }
+    if (notifyRaw && _rawStateListeners.isNotEmpty) {
+      for (final listener in List<void Function(RemoteControllerState)>.of(
+        _rawStateListeners,
+      )) {
+        listener(effectiveNext);
+      }
+    }
+    final shouldNeutralize =
+        capturedBeforeRaw ||
+        _systemOverlayCaptured ||
+        _awaitReleaseAfterOverlay;
+    _latestState = shouldNeutralize
+        ? _neutralizedSnapshotFrom(effectiveNext)
+        : effectiveNext;
+    if (!_disposed) {
+      _stateController.add(_latestState);
+    }
+  }
   bool get isRunning => _isRunning;
   int? get serverPort => _server?.port;
   String? get serverUrl => _isRunning && _localIp != null
@@ -310,6 +637,61 @@ class VrRemoteControllerService {
   void _sendCastPreview(String message) {
     final client = _client;
     if (client == null || _disposed) return;
+    try {
+      client.add(message);
+    } catch (_) {
+      _disconnectClient(
+        client,
+        reason: VrControllerDisconnectReason.transportError,
+      );
+    }
+  }
+
+  VrDesktopBridgeState? get desktopBridgeState => _desktopBridgeState;
+  Uri? get castPreviewUri => _castPreviewUri;
+
+  /// Publishes autonomous Desktop Estación Faro bridge state and offload
+  /// directives (`castOffload`, `visionOffload`, `recommendedHz`, `haptic`) to
+  /// the connected Joystick smartphone over BLE or WebSocket.
+  void setDesktopBridgeState(VrDesktopBridgeState? state) {
+    if (_disposed) return;
+    final current = _desktopBridgeState;
+    if (state == null) {
+      if (current == null || !current.stationConnected) return;
+      final next = VrDesktopBridgeState.disconnected(
+        revision: ++_desktopBridgeRevision,
+      );
+      _desktopBridgeState = next;
+      _sendDesktopBridge(next);
+      return;
+    }
+    if (current != null &&
+        current.sameConfigurationAs(state) &&
+        state.hapticAlert == null) {
+      return;
+    }
+    final stamped = VrDesktopBridgeState(
+      revision: ++_desktopBridgeRevision,
+      stationConnected: state.stationConnected,
+      stationName: state.stationName,
+      castOffloadedToDesktop: state.castOffloadedToDesktop,
+      visionOffloadedToDesktop: state.visionOffloadedToDesktop,
+      recommendedJoystickHz: state.recommendedJoystickHz,
+      deskClearanceMeters: state.deskClearanceMeters,
+      hapticAlert: state.hapticAlert,
+      activeDecisionSummary: state.activeDecisionSummary,
+      topologyMode: state.topologyMode,
+      substituteGyroWithPcVision: state.substituteGyroWithPcVision,
+    );
+    _desktopBridgeState = stamped;
+    _sendDesktopBridge(stamped);
+  }
+
+  void _sendDesktopBridge(VrDesktopBridgeState state) {
+    final client = _client;
+    if (client == null || _disposed) return;
+    final message = state.toJsonMessage();
+    if (utf8.encode(message).length > _maxCastPreviewMessageBytes) return;
     try {
       client.add(message);
     } catch (_) {
@@ -654,12 +1036,24 @@ class VrRemoteControllerService {
           _rateWindowStartUs = now;
           _rateWindowCount = 0;
         }
-        final bool isBinary =
-            data is List<int> && VrRemoteBinaryCodec.isBinaryPacket(data);
+        final bool isCompactFrame = data is VrCompactGamepadFrame;
+        final List<int>? binaryList = !isCompactFrame && data is List<int>
+            ? data
+            : null;
+        final int? binaryPacketType = binaryList != null
+            ? VrRemoteBinaryCodec.inspectPacketType(binaryList)
+            : null;
+        final bool isBinary = binaryPacketType != null;
+        final int maxAllowedBinaryLen =
+            binaryPacketType == VrRemoteBinaryCodec.packetTypeFullGamepad
+            ? VrRemoteBinaryCodec.fullGamepadPacketLength
+            : VrRemoteBinaryCodec.posePacketLength;
         if (++_rateWindowCount > _maxMessagesPerSecond ||
-            (isBinary
-                ? data.length > VrRemoteBinaryCodec.posePacketLength
-                : (data is! String || data.length > _maxMessageCharacters))) {
+            (!isCompactFrame &&
+                (isBinary
+                    ? binaryList!.length > maxAllowedBinaryLen
+                    : (data is! String ||
+                          data.length > _maxMessageCharacters)))) {
           _rejectedStates++;
           _disconnectClient(
             socket,
@@ -669,13 +1063,32 @@ class VrRemoteControllerService {
           );
           return;
         }
-        if (isBinary) {
+        if (isCompactFrame) {
+          _ingestCompactGamepadFrame(data, now);
+          return;
+        }
+        if (binaryPacketType == VrRemoteBinaryCodec.packetTypeFullGamepad &&
+            binaryList != null) {
+          final bytes = binaryList is Uint8List
+              ? binaryList
+              : Uint8List.fromList(binaryList);
+          final compact = const VrCompactGamepadCodec().tryDecode(bytes);
+          if (compact == null) {
+            _rejectedStates++;
+            return;
+          }
+          _ingestCompactGamepadFrame(compact, now);
+          return;
+        }
+        if (isBinary && binaryList != null) {
           if (_wireFormat == VrControllerWireFormat.json) {
             _rejectedStates++;
             return;
           }
           try {
-            final bytes = data is Uint8List ? data : Uint8List.fromList(data);
+            final bytes = binaryList is Uint8List
+                ? binaryList
+                : Uint8List.fromList(binaryList);
             final pose = const VrRemoteBinaryCodec().decodePose(bytes);
             if (_lastSequence != null) {
               // Serial-number arithmetic: duplicates, stale frames and the
@@ -732,7 +1145,7 @@ class VrRemoteControllerService {
 
             _lastAcceptedStateUs = now;
             _acceptedStates++;
-            _stateController.add(_latestState);
+            _publishState(_latestState);
           } catch (_) {
             _rejectedStates++;
           }
@@ -1033,7 +1446,7 @@ class VrRemoteControllerService {
 
           _lastAcceptedStateUs = now;
           _acceptedStates++;
-          _stateController.add(_latestState);
+          _publishState(_latestState);
         } catch (_) {
           _rejectedStates++;
         }
@@ -1047,6 +1460,10 @@ class VrRemoteControllerService {
     );
     _sendControllerMode();
     _sendEffectivePassthroughState();
+    final bridge = _desktopBridgeState;
+    if (bridge != null && bridge.stationConnected) {
+      _sendDesktopBridge(bridge);
+    }
     final preview = _castPreviewUri;
     if (preview != null) _sendCastPreview(_castPreviewMessage(preview));
   }
@@ -1189,7 +1606,159 @@ class VrRemoteControllerService {
       joystickMiniFrame: _latchedJoystickMiniFrame,
       mode: prev.mode,
     );
-    if (!_disposed) _stateController.add(_latestState);
+    _publishState(_latestState);
+  }
+
+  void _ingestCompactGamepadFrame(VrCompactGamepadFrame f, int now) {
+    if (_wireFormat == VrControllerWireFormat.binaryPose) {
+      _rejectedStates++;
+      return;
+    }
+    if (_lastSequence != null) {
+      final advance = (f.sequence - _lastSequence!) & 0xFFFFFFFF;
+      if (advance == 0 || advance >= 0x80000000) {
+        _rejectedStates++;
+        return;
+      }
+    }
+    final mode = switch (f.modeIndex) {
+      1 => RemoteControllerMode.laser,
+      2 => RemoteControllerMode.driving,
+      3 => RemoteControllerMode.nes,
+      _ => RemoteControllerMode.joystick,
+    };
+    if (!_acceptsCompactModeState(f, mode)) {
+      _rejectedStates++;
+      return;
+    }
+    final drivingActive =
+        mode == RemoteControllerMode.driving && !f.drivingPaused;
+    final range =
+        f.rangeMeters != null && f.rangeMeters!.isFinite && f.rangeMeters! > 0
+        ? f.rangeMeters
+        : null;
+    final pose = VrRemotePoseFrame(
+      sequence: f.sequence,
+      senderTimestampMicroseconds: f.senderTimestampMicroseconds,
+      orientation: f.orientation.clone(),
+      angularVelocity: f.angularVelocity.clone(),
+      rangeMeters: range,
+      rangeSource: range != null ? VrRangeSource.fixed : null,
+    );
+    _posePredictor.pushFrame(pose);
+    _posePredictor.predictTo(_predictedOrientation);
+    _lastSequence = f.sequence;
+    _wireFormat = VrControllerWireFormat.json;
+    _lastStateReceivedUs = now;
+    if (f.hostModeRevision != null) {
+      _modeControlSupported = true;
+      _acceptedModeRevision = f.hostModeRevision;
+    }
+    _latchedPassthroughMix = f.passthroughMix.clamp(0.0, 1.0);
+    _latchedPassthroughActive = f.passthroughActive;
+    _latchedSpatialHudVisible = f.spatialHudVisible;
+    if (range != null) {
+      _hasRangeTelemetry = true;
+      _latchedRangeMeters = range;
+    }
+
+    _latestState = RemoteControllerState(
+      passthroughCommandRevision: _passthroughCommandRevision,
+      orientation: _predictedOrientation.clone(),
+      angularVelocity: f.angularVelocity.clone(),
+      isTriggerPressed: f.trigger || f.btnR,
+      isActionPressed: f.action || f.btnB,
+      btnA: f.btnA,
+      btnB: f.btnB || f.action,
+      btnX: f.btnX,
+      btnY: f.btnY,
+      btnL: f.btnL,
+      btnR: f.btnR,
+      btnGrip: f.btnGrip,
+      stickClick: f.stickClick,
+      stickX: f.stickX.clamp(-1.0, 1.0),
+      stickY: f.stickY.clamp(-1.0, 1.0),
+      moveAtEdge: f.moveAtEdge,
+      touchX: f.stickX.clamp(-1.0, 1.0),
+      touchY: f.stickY.clamp(-1.0, 1.0),
+      turnRate: f.lookX.clamp(-1.0, 1.0),
+      pitchRate: f.lookY.clamp(-1.0, 1.0),
+      laserX: f.laserX.clamp(-1.0, 1.0),
+      laserY: f.laserY.clamp(-1.0, 1.0),
+      laserSlideActive: f.laserSlideActive,
+      recenter: f.recenter,
+      controllerVisible: f.controllerVisible,
+      steering: drivingActive ? f.steering.clamp(-1.0, 1.0) : 0.0,
+      drivingTilt: (drivingActive && f.motionAvailable)
+          ? f.drivingTilt.clamp(-1.0, 1.0)
+          : 0.0,
+      throttle: drivingActive ? f.throttle.clamp(0.0, 1.0) : 0.0,
+      brake: drivingActive ? f.brake.clamp(0.0, 1.0) : 0.0,
+      drivingPaused: f.drivingPaused,
+      motionAvailable: f.motionAvailable,
+      rangeMeters: _latchedRangeMeters,
+      passthroughMix: _latchedPassthroughMix,
+      passthroughActive: _latchedPassthroughActive,
+      spatialHudVisible: _latchedSpatialHudVisible,
+      leftFootU: _latchedLeftFootU,
+      leftFootV: _latchedLeftFootV,
+      rightFootU: _latchedRightFootU,
+      rightFootV: _latchedRightFootV,
+      feetConfidence: _latchedFeetConfidence,
+      handU: _latchedHandU,
+      handV: _latchedHandV,
+      handConfidence: _latchedHandConfidence,
+      visorU: _latchedVisorU,
+      visorV: _latchedVisorV,
+      visorWidth: _latchedVisorWidth,
+      joystickCameraRole: _latchedJoystickCameraRole,
+      joystickMiniFrame: _latchedJoystickMiniFrame,
+      mode: mode,
+    );
+    _lastAcceptedStateUs = now;
+    _acceptedStates++;
+    _publishState(_latestState);
+  }
+
+  bool _acceptsCompactModeState(
+    VrCompactGamepadFrame f,
+    RemoteControllerMode mode,
+  ) {
+    final revision = f.hostModeRevision;
+    if (revision == null) return !_modeControlSupported;
+    if (revision != _modeRequest.revision) return false;
+    if (_acceptedModeRevision == revision) return true;
+    final modeMatches =
+        mode == _modeRequest.mode ||
+        (mode == RemoteControllerMode.laser &&
+            _modeRequest.mode == RemoteControllerMode.joystick);
+    if (!modeMatches) return false;
+    if (_heldCaptionAckRevision == revision) return true;
+    if (f.trigger ||
+        f.action ||
+        f.btnA ||
+        f.btnB ||
+        f.btnX ||
+        f.btnY ||
+        f.btnL ||
+        f.btnR ||
+        f.btnGrip ||
+        f.stickClick ||
+        f.recenter) {
+      return false;
+    }
+    if (f.stickX != 0 ||
+        f.stickY != 0 ||
+        f.lookX != 0 ||
+        f.lookY != 0 ||
+        f.laserX != 0 ||
+        f.laserY != 0 ||
+        f.steering != 0 ||
+        f.throttle != 0 ||
+        f.brake != 0) {
+      return false;
+    }
+    return true;
   }
 
   bool _acceptsModeState(
@@ -1281,7 +1850,7 @@ class VrRemoteControllerService {
       joystickCameraRole: _latchedJoystickCameraRole,
       joystickMiniFrame: _latchedJoystickMiniFrame,
     );
-    if (!_disposed) _stateController.add(_latestState);
+    _publishState(_latestState);
   }
 
   /// Serves the interactive Web Controller interface to any browser on the 2nd phone.
@@ -1302,10 +1871,18 @@ class VrRemoteControllerService {
   }
 
   void stop() {
+    _voiceLocomotionTimer?.cancel();
+    _voiceLocomotionTimer = null;
+    _voiceLocomotionStopTimer?.cancel();
+    _voiceLocomotionStopTimer = null;
+    _voiceButtonReleaseTimer?.cancel();
+    _voiceButtonReleaseTimer = null;
+    _handsFreeVirtualActive = false;
     _effectivePassthroughTimer?.cancel();
     _effectivePassthroughTimer = null;
     _lifecycleGeneration++;
     _castPreviewUri = null;
+    _desktopBridgeState = null;
     _startOperation = null;
     _isRunning = false;
     _inputWatchdog?.cancel();

@@ -90,6 +90,8 @@ class VrControllerPairingPage extends StatefulWidget {
     super.key,
     this.cameraFactory,
     this.controllerBuilder,
+    this.customInviteBuilder,
+    this.headerBannerBuilder,
     this.supportedTransports = const {VrTransportType.localSocket},
   });
 
@@ -99,6 +101,19 @@ class VrControllerPairingPage extends StatefulWidget {
 
   /// Test/host customization after camera shutdown, retaining pushReplacement.
   final Widget Function(BuildContext, VrPairingPayload)? controllerBuilder;
+
+  /// Optional host hook for alternative QR schemes (e.g. `vrlizate://beacon?...`
+  /// `3D Set` PC coordinator invitations). When non-null widget is returned,
+  /// the camera is closed first and the route transitions cleanly to it.
+  final Widget? Function(BuildContext, String rawCode)? customInviteBuilder;
+
+  /// Optional host header (e.g. LAN `3D Set` coordinator discovery bar) with a
+  /// safe callback that closes the pairing camera before replacing the route.
+  final Widget Function(
+    BuildContext context,
+    Future<void> Function(Widget page) openCustomPage,
+  )?
+  headerBannerBuilder;
 
   /// Additional transports require a host-provided controller builder.
   final Set<VrTransportType> supportedTransports;
@@ -242,11 +257,38 @@ class _VrControllerPairingPageState extends State<VrControllerPairingPage>
     }
   }();
 
+  Future<void> _openCustomControllerPage(Widget page) async {
+    if (_disposed || !mounted || _busy || _navigated) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+      _lastRejectedCode = null;
+    });
+    _link.clear();
+    await WidgetsBinding.instance.endOfFrame;
+    try {
+      await _closeCamera();
+    } catch (_) {
+      _showError(VrJoystickTranslationConstants.pairingCameraCloseError);
+      return;
+    }
+    if (_disposed || !mounted || _navigated) return;
+    _navigated = true;
+    await Navigator.of(context).pushReplacement<void, void>(
+      MaterialPageRoute(builder: (_) => page),
+    );
+  }
+
   Future<void> _acceptCode(String raw, {bool fromCamera = false}) async {
     if (_disposed || !mounted || _busy || !_foreground || !_routeCurrent) {
       return;
     }
     if (fromCamera && raw == _lastRejectedCode) return;
+    final customPage = widget.customInviteBuilder?.call(context, raw.trim());
+    if (customPage != null) {
+      await _openCustomControllerPage(customPage);
+      return;
+    }
     final VrPairingPayload invitation;
     try {
       invitation = parseVrControllerPairingCode(
@@ -405,6 +447,13 @@ class _VrControllerPairingPageState extends State<VrControllerPairingPage>
                     ),
                     const SizedBox(height: 8),
                     Text(_connectionInstructions),
+                    if (widget.headerBannerBuilder != null && !_busy) ...[
+                      const SizedBox(height: 14),
+                      widget.headerBannerBuilder!(
+                        context,
+                        _openCustomControllerPage,
+                      ),
+                    ],
                     const SizedBox(height: 20),
                     if (_busy) ...[
                       const Center(child: CircularProgressIndicator()),

@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show ValueListenable, ValueNotifier;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -9,6 +10,11 @@ import '../domain/services/vr_remote_controller_service.dart';
 
 /// Application-owned video session. Controller links only advertise its URL;
 /// they never carry frames or start a second controller transport.
+///
+/// When a **VRlizate Desktop (Estación Faro)** computer connects, [VrAppCast]
+/// automatically activates [host] for the PC screen while clearing the offer
+/// sent to attached Joystick smartphones so the Joystick is freed from video
+/// decoding and dedicated 100% to low-latency input.
 class VrAppCast {
   VrAppCast({VrCastHost? host})
     : host = host ?? VrCastHost(realtime: VrCastRealtimeHost()) {
@@ -18,28 +24,64 @@ class VrAppCast {
   final VrCastHost host;
   final _controllers = <VrRemoteControllerService, int>{};
   final _connections = <VrRemoteControllerService, StreamSubscription<bool>>{};
+  final ValueNotifier<bool> _desktopOffload = ValueNotifier<bool>(false);
   bool _autoAllowed = true;
   bool _automatic = false;
+  bool _desktopSinkActive = false;
+  bool _keepJoystickCopy = false;
+  String? _desktopStationName;
   bool _disposed = false;
 
   bool get hasVideoSession => host.realtime?.hasVideoSession ?? false;
+  bool get isDesktopSinkActive => _desktopSinkActive;
+  bool get isOffloadedToDesktop => _desktopSinkActive && !_keepJoystickCopy;
+  String? get desktopStationName => _desktopStationName;
+  ValueListenable<bool> get desktopOffloadListenable => _desktopOffload;
+
+  Uri? get _controllerOfferUri =>
+      isOffloadedToDesktop ? null : host.preferredViewerUri;
+
+  /// Routes the live screen transmission to a detected/paired Desktop computer
+  /// (`Estación Faro`), automatically starting [host] if allowed and freeing
+  /// attached Joystick smartphones from rendering the video preview.
+  void setDesktopCastSink({
+    required bool active,
+    String? stationName,
+    bool keepJoystickCopy = false,
+  }) {
+    if (_disposed) return;
+    final nextName = active ? stationName : null;
+    if (_desktopSinkActive == active &&
+        _desktopStationName == nextName &&
+        _keepJoystickCopy == keepJoystickCopy) {
+      return;
+    }
+    _desktopSinkActive = active;
+    _desktopStationName = nextName;
+    _keepJoystickCopy = keepJoystickCopy;
+    _desktopOffload.value = isOffloadedToDesktop;
+    _connectionChanged();
+    _announce();
+  }
 
   Future<void> suspendVideoBeforeNavigation() async {
     await host.realtime?.suspendBeforeNavigation();
   }
 
+  bool get _hasAnyActiveSink =>
+      _desktopSinkActive ||
+      _controllers.keys.any((service) => service.isConnected);
+
   void _connectionChanged() {
     if (_disposed) return;
-    final connected = _controllers.keys.any((service) => service.isConnected);
+    final connected = _hasAnyActiveSink;
     if (connected && _autoAllowed && !host.isRunning) {
       _automatic = true;
       unawaited(
         host
             .start()
             .then((_) {
-              if (_disposed ||
-                  (_automatic &&
-                      !_controllers.keys.any((s) => s.isConnected))) {
+              if (_disposed || (_automatic && !_hasAnyActiveSink)) {
                 return host.stop();
               }
             })
@@ -70,7 +112,7 @@ class VrAppCast {
       );
     }
     _controllers.update(service, (count) => count + 1, ifAbsent: () => 1);
-    service.setCastPreviewUri(host.preferredViewerUri);
+    service.setCastPreviewUri(_controllerOfferUri);
     _connectionChanged();
   }
 
@@ -88,8 +130,9 @@ class VrAppCast {
   }
 
   void _announce() {
+    final offer = _controllerOfferUri;
     for (final service in _controllers.keys) {
-      service.setCastPreviewUri(host.preferredViewerUri);
+      service.setCastPreviewUri(offer);
     }
   }
 
@@ -104,6 +147,7 @@ class VrAppCast {
       service.setCastPreviewUri(null);
     }
     _controllers.clear();
+    _desktopOffload.dispose();
     host.dispose();
   }
 }

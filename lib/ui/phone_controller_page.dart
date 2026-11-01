@@ -17,6 +17,7 @@ import 'package:wordsphere/wordsphere.dart';
 import '../domain/models/vr_controller_connection_exception.dart';
 import '../domain/models/vr_controller_connection_target.dart';
 import '../domain/models/vr_controller_link_quality.dart';
+import '../domain/models/vr_desktop_bridge_state.dart';
 import '../domain/models/vr_joystick_geometry.dart';
 import '../domain/models/vr_steering_state.dart';
 import '../domain/models/vr_tracking_marker_configuration.dart';
@@ -241,6 +242,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   final ValueNotifier<Uri?> _castPreview = ValueNotifier(null);
   int _castGeneration = 0;
   bool _castDialogOpen = false;
+  VrDesktopBridgeState? _desktopBridge;
+  int _desktopBridgeRevision = -1;
   static const MethodChannel _deviceCapabilitiesChannel = MethodChannel(
     'vrlizate/device_capabilities',
   );
@@ -1033,9 +1036,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         }
       }
       _lastDrivingTickUs = now;
-      if (_visionService.enableHardwareCameraStream ||
-          _visionService.enableUltrasonicRanging ||
-          _visionService.bodyDetectionEnabled) {
+      if (!_visionService.isDesktopOffloadPaused &&
+          (_visionService.enableHardwareCameraStream ||
+              _visionService.enableUltrasonicRanging ||
+              _visionService.bodyDetectionEnabled)) {
         _visionService.tick();
         _sendVisionTelemetryMessageIfDue(now);
       }
@@ -1520,6 +1524,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _attachLinkQuality(socket);
       _hostModeSession.reset();
       _effectivePassthroughRevision = -1;
+      _desktopBridgeRevision = -1;
+      _desktopBridge = null;
+      unawaited(_visionService.setDesktopOffloadPaused(false));
       _hasEffectivePassthroughState = false;
       _pendingPassthroughMix = null;
       _lastHostMode = null;
@@ -1636,9 +1643,16 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   void _applyLinkQuality(VrControllerLinkQuality? quality) {
-    final targetMs = (quality != null && quality.recommendedHz >= 120) ? 8 : 16;
+    final bridgeHz = (_desktopBridge?.stationConnected ?? false)
+        ? _desktopBridge!.recommendedJoystickHz
+        : 60;
+    final effectiveHz = quality != null
+        ? math.max(quality.recommendedHz, !_showsBluetooth ? bridgeHz : 60)
+        : (!_showsBluetooth ? bridgeHz : 60);
+    final targetMs = effectiveHz >= 120 ? 8 : 16;
     _restartStreamTimer(targetMs);
-    if (quality != null && !quality.canCarryVideoCast) {
+    final offloadedToDesktop = _desktopBridge?.castOffloadedToDesktop ?? false;
+    if (offloadedToDesktop || (quality != null && !quality.canCarryVideoCast)) {
       if (_castPreview.value != null) _castPreview.value = null;
     } else if (_isForeground &&
         _castAutoEnabled &&
@@ -1681,7 +1695,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     if (uri != _castOffer) {
       _clearCast();
       _castOffer = uri;
-      if (_isForeground && _castAutoEnabled && _canDisplayCastUi) {
+      if (_isForeground &&
+          _castAutoEnabled &&
+          _canDisplayCastUi &&
+          !(_desktopBridge?.castOffloadedToDesktop ?? false)) {
         _castPreview.value = uri;
       }
       if (mounted) setState(() {});
@@ -1894,6 +1911,39 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
   }
 
+  bool _acceptDesktopBridgeState(Object? data) {
+    final bridge = VrDesktopBridgeState.tryParseMessage(data);
+    if (bridge == null) return false;
+    if (bridge.revision <= _desktopBridgeRevision) return true;
+    _desktopBridgeRevision = bridge.revision;
+    final activeBridge = bridge.stationConnected ? bridge : null;
+    if (activeBridge != null && activeBridge.castOffloadedToDesktop) {
+      _castPreview.value = null;
+    } else if (activeBridge == null &&
+        _isForeground &&
+        _castAutoEnabled &&
+        !_deviceIsLowRam &&
+        _canDisplayCastUi &&
+        _castOffer != null) {
+      _castPreview.value = _castOffer;
+    }
+    unawaited(
+      _visionService.setDesktopOffloadPaused(
+        activeBridge != null && activeBridge.visionOffloadedToDesktop,
+      ),
+    );
+    setState(() {
+      _desktopBridge = activeBridge;
+    });
+    _applyLinkQuality(_linkQuality);
+    if (activeBridge?.hapticAlert == 'desk_proximity_warning') {
+      _hapticDoublePulse();
+    } else if (activeBridge?.hapticAlert == 'hand_pinch_confirm') {
+      _hapticClick();
+    }
+    return true;
+  }
+
   void _onHostMessage(Object? data, VrControllerLink socket, int generation) {
     if (!mounted ||
         !_surfaceMounted ||
@@ -1901,7 +1951,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         !identical(_socket, socket)) {
       return;
     }
-    if (_acceptEffectivePassthroughState(data) || _acceptCastOffer(data)) {
+    if (_acceptEffectivePassthroughState(data) ||
+        _acceptDesktopBridgeState(data) ||
+        _acceptCastOffer(data)) {
       return;
     }
     final hadHostRequest = _hostModeSession.revision != null;
@@ -2048,6 +2100,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _hostModeSession.reset();
     _lastHostMode = null;
     _hostActions = const {};
+    _desktopBridge = null;
+    _desktopBridgeRevision = -1;
+    unawaited(_visionService.setDesktopOffloadPaused(false));
     _clearCast();
     _statePacer.reset();
     if (_activeMode == RemoteControllerMode.driving) {
@@ -2151,7 +2206,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       });
     } else {
       _lastGyroTime = null;
-      if (_castAutoEnabled && _canDisplayCastUi) {
+      if (_castAutoEnabled &&
+          _canDisplayCastUi &&
+          !(_desktopBridge?.castOffloadedToDesktop ?? false)) {
         _castPreview.value = _castOffer;
       }
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
@@ -2396,11 +2453,70 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       )) {
         return;
       }
+      final seq = _sequence++;
+      final tsUs = DateTime.now().microsecondsSinceEpoch;
+      if (ws is VrCompactGamepadCapableLink &&
+          (ws as VrCompactGamepadCapableLink).supportsCompactGamepadFrames &&
+          _activeSearchQuery == null &&
+          !_searchSubmittedPulse) {
+        final modeIdx = switch (wireModeName) {
+          VrJoystickConstants.modeLaser => 1,
+          VrJoystickConstants.modeDriving => 2,
+          VrJoystickConstants.modeNes => 3,
+          _ => 0,
+        };
+        final frame = VrCompactGamepadFrame(
+          sequence: seq,
+          senderTimestampMicroseconds: tsUs,
+          orientation: _orientation,
+          angularVelocity: _angularVelocity,
+          stickX: isDriving ? 0.0 : _stickX,
+          stickY: isDriving ? 0.0 : _stickY,
+          lookX: isDriving ? 0.0 : _lookX,
+          lookY: isDriving ? 0.0 : _lookY,
+          laserX: _laserStickX,
+          laserY: _laserStickY,
+          steering: isDriving ? driving.steering : 0.0,
+          drivingTilt: isDriving
+              ? _steering.drivingTiltAt(_controllerClock.elapsedMicroseconds)
+              : 0.0,
+          throttle: isDriving ? driving.throttle : 0.0,
+          brake: isDriving ? driving.brake : 0.0,
+          modeIndex: modeIdx,
+          hostModeRevision: _hostModeSession.revision,
+          trigger: _triggerActive || (!isDriving && _btnRActive),
+          action: _actionActive || _btnBActive,
+          btnA: _btnAActive,
+          btnB: _btnBActive,
+          btnX: _btnXActive,
+          btnY: _btnYActive,
+          btnL: _btnLActive,
+          btnR: _btnRActive,
+          btnGrip: _btnGripActive,
+          stickClick: _stickClickActive,
+          recenter: _recenterTriggered,
+          moveAtEdge: _activeMode == RemoteControllerMode.joystick && _moveAtEdge,
+          laserSlideActive: _isLaserSlideActive || isLaserOverBle,
+          controllerVisible: _controllerVisible,
+          drivingPaused: isDriving && driving.paused,
+          motionAvailable: _motionCapability == VrMotionCapability.available,
+          passthroughActive: _passthroughGesture.passthroughActive,
+          spatialHudVisible: _spatialHudVisible,
+          passthroughMix: _passthroughGesture.passthroughMix,
+          rangeMeters: liveRangeMeters,
+        );
+        try {
+          ws.add(frame);
+        } catch (_) {
+          _onDisconnected(ws);
+        }
+        return;
+      }
+
       final payload = jsonEncode({
         ...state,
-        VrJoystickConstants.fieldSequence: _sequence++,
-        VrJoystickConstants.fieldTimestampUs:
-            DateTime.now().microsecondsSinceEpoch,
+        VrJoystickConstants.fieldSequence: seq,
+        VrJoystickConstants.fieldTimestampUs: tsUs,
       });
 
       try {
@@ -5017,6 +5133,58 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     child: Column(
       mainAxisSize: MainAxisSize.min,
       children: [
+        if (_desktopBridge case final bridge? when bridge.stationConnected) ...[
+          Container(
+            key: const ValueKey('joystick_desktop_bridge_banner'),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: const Color(0xFF00E676).withValues(alpha: 0.14),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: const Color(0xFF00E676).withValues(alpha: 0.55),
+              ),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  bridge.castOffloadedToDesktop
+                      ? 'Vista en ${bridge.stationName ?? "PC Faro"} · Joystick liberado'
+                      : 'Puente activo · ${bridge.stationName ?? "PC Faro"}',
+                  style: const TextStyle(
+                    color: Color(0xFF69F0AE),
+                    fontSize: 10.5,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                if (bridge.activeDecisionSummary case final summary?)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                      summary,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 9.5,
+                      ),
+                    ),
+                  ),
+                if (bridge.substituteGyroWithPcVision)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 2),
+                    child: Text(
+                      'Orientación asistida por Webcam PC',
+                      style: TextStyle(
+                        color: Color(0xFF80D8FF),
+                        fontSize: 9.0,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 6),
+        ],
         Text(
           _horizontalLookEnabled
               ? VrJoystickTranslationConstants.centerGuideWalkOnly
