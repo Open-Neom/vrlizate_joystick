@@ -321,6 +321,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   // Dual Joystick state
   double _stickX = 0.0;
   double _stickY = 0.0;
+  double _dpadX = 0.0;
+  double _dpadY = 0.0;
   bool _moveAtEdge = false;
   bool _rightLaser = false;
   // Horizontal + vertical right-stick look enabled by default so the right
@@ -2258,6 +2260,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _rawLookY = 0;
     _stickX = 0;
     _stickY = 0;
+    _dpadX = 0;
+    _dpadY = 0;
     _moveAtEdge = false;
     _lookX = 0;
     _lookY = 0;
@@ -2533,6 +2537,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           recenter: _recenterTriggered,
           moveAtEdge:
               _activeMode == RemoteControllerMode.joystick && _moveAtEdge,
+          dpadUp: _dpadY > 0.5,
+          dpadDown: _dpadY < -0.5,
+          dpadLeft: _dpadX < -0.5,
+          dpadRight: _dpadX > 0.5,
           laserSlideActive: _isLaserSlideActive || isLaserOverBle,
           controllerVisible: _controllerVisible,
           pointerPoseReady: _pointerPoseReady,
@@ -2571,6 +2579,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         VrJoystickConstants.fieldWz: _angularVelocity.z,
         VrJoystickConstants.fieldStickX: isDriving ? 0.0 : _stickX,
         VrJoystickConstants.fieldStickY: isDriving ? 0.0 : _stickY,
+        VrJoystickConstants.fieldDpadX: isDriving ? 0.0 : _dpadX,
+        VrJoystickConstants.fieldDpadY: isDriving ? 0.0 : _dpadY,
         VrJoystickConstants.fieldMoveAtEdge:
             _activeMode == RemoteControllerMode.joystick && _moveAtEdge,
         VrJoystickConstants.fieldTx: isDriving ? 0.0 : _stickX,
@@ -4723,6 +4733,15 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 enableCardinalDetents: _cardinalDetentsEnabled,
                 isAutoWalkLocked:
                     movement && _leftAutoWalkController.isAutoWalkLocked,
+                enableRimDpad: movement && !driving,
+                onDpadChanged: movement
+                    ? (dx, dy) {
+                        if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                        _dpadX = dx;
+                        _dpadY = dy;
+                        _sendState(force: true);
+                      }
+                    : null,
                 onPressed: (pressed) {
                   if (!_acceptsSurfaceInput(surfaceEpoch)) return;
                   final nowUs = _nowUs;

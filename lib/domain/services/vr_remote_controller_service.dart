@@ -1495,6 +1495,14 @@ class VrRemoteControllerService {
             stickX: stickX.clamp(-1.0, 1.0),
             stickY: stickY.clamp(-1.0, 1.0),
             moveAtEdge: json[VrJoystickConstants.fieldMoveAtEdge] as bool?,
+            dpadX:
+                ((json[VrJoystickConstants.fieldDpadX] as num?)?.toDouble() ??
+                        0.0)
+                    .clamp(-1.0, 1.0),
+            dpadY:
+                ((json[VrJoystickConstants.fieldDpadY] as num?)?.toDouble() ??
+                        0.0)
+                    .clamp(-1.0, 1.0),
             touchX: tx.clamp(-1.0, 1.0),
             touchY: ty.clamp(-1.0, 1.0),
             turnRate: turnRate.clamp(-1.0, 1.0),
@@ -1803,6 +1811,8 @@ class VrRemoteControllerService {
       stickX: f.stickX.clamp(-1.0, 1.0),
       stickY: f.stickY.clamp(-1.0, 1.0),
       moveAtEdge: f.moveAtEdge,
+      dpadX: f.dpadX,
+      dpadY: f.dpadY,
       touchX: f.stickX.clamp(-1.0, 1.0),
       touchY: f.stickY.clamp(-1.0, 1.0),
       turnRate: f.lookX.clamp(-1.0, 1.0),

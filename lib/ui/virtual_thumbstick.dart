@@ -67,6 +67,15 @@ class VirtualThumbstick extends StatefulWidget {
   /// forward position.
   final bool isAutoWalkLocked;
 
+  /// Superimposes 4 cardinal D-pad segments ("la cruz") along the outer rim of
+  /// the thumbstick so 2D/3D controllers can navigate central menus without
+  /// adding a separate D-pad widget or moving the analog walking stick.
+  final bool enableRimDpad;
+
+  /// Invoked with `(-1|0|1, -1|0|1)` when a superimposed outer-rim D-pad
+  /// segment is pressed or released.
+  final void Function(double dpadX, double dpadY)? onDpadChanged;
+
   const VirtualThumbstick({
     super.key,
     this.size = 150.0,
@@ -80,6 +89,8 @@ class VirtualThumbstick extends StatefulWidget {
         VrJoystickConstants.defaultDynamicOriginMaxRatio,
     this.enableCardinalDetents = true,
     this.isAutoWalkLocked = false,
+    this.enableRimDpad = false,
+    this.onDpadChanged,
     required this.onChanged,
     this.onRelease,
     this.onPressed,
@@ -97,6 +108,9 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
   bool _hasHitBoundary = false;
   bool _disposed = false;
   int? _pointer;
+  bool _rimDpadGesture = false;
+  double _activeRimDpadX = 0.0;
+  double _activeRimDpadY = 0.0;
   final VrThumbstickHapticDetentController _detentController =
       VrThumbstickHapticDetentController();
 
@@ -131,9 +145,41 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
 
   double get _maxRadius => (widget.size / 2) - widget.knobRadius;
 
+  (double, double)? _hitTestRimDpad(Offset localPos) {
+    if (!widget.enableRimDpad || widget.onDpadChanged == null) return null;
+    final outerRadius = widget.size / 2;
+    if (outerRadius <= 0) return null;
+    final dx = localPos.dx - outerRadius;
+    final dy = localPos.dy - outerRadius;
+    final dist = Offset(dx, dy).distance;
+    // Outer 26% ring around the cardinal axes (within ~29° of N/S/E/W)
+    if (dist < outerRadius * 0.74 || dist > outerRadius * 1.06) return null;
+    if (dy.abs() >= dx.abs() * 1.75) {
+      return (0.0, dy < 0 ? 1.0 : -1.0);
+    }
+    if (widget.horizontalEnabled && dx.abs() >= dy.abs() * 1.75) {
+      return (dx < 0 ? -1.0 : 1.0, 0.0);
+    }
+    return null;
+  }
+
   void _onPointerDown(PointerDownEvent event) {
     if (_disposed || !mounted || _pointer != null) return;
     _pointer = event.pointer;
+    final rimHit = _hitTestRimDpad(event.localPosition);
+    if (rimHit != null) {
+      _rimDpadGesture = true;
+      setState(() {
+        _activeRimDpadX = rimHit.$1;
+        _activeRimDpadY = rimHit.$2;
+      });
+      if (widget.hapticsEnabled) {
+        HapticFeedback.selectionClick();
+      }
+      widget.onDpadChanged?.call(rimHit.$1, rimHit.$2);
+      return;
+    }
+    _rimDpadGesture = false;
     _recenterController.stop();
     _isDragging = true;
     _hasHitBoundary = false;
@@ -163,12 +209,22 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
 
   void _onPointerMove(PointerMoveEvent event) {
     if (_disposed || !mounted || event.pointer != _pointer) return;
+    if (_rimDpadGesture) return;
     _updateOffset(event.localPosition);
   }
 
   void _onPointerEnd(PointerEvent event) {
     if (_disposed || !mounted || event.pointer != _pointer) return;
     _pointer = null;
+    if (_rimDpadGesture) {
+      _rimDpadGesture = false;
+      setState(() {
+        _activeRimDpadX = 0.0;
+        _activeRimDpadY = 0.0;
+      });
+      widget.onDpadChanged?.call(0.0, 0.0);
+      return;
+    }
     _releaseStick();
   }
 
@@ -300,6 +356,9 @@ class _VirtualThumbstickState extends State<VirtualThumbstick>
                 horizontalEnabled: widget.horizontalEnabled,
                 originOffset: _originOffset,
                 isAutoWalkLocked: widget.isAutoWalkLocked,
+                enableRimDpad: widget.enableRimDpad,
+                activeRimDpadX: _activeRimDpadX,
+                activeRimDpadY: _activeRimDpadY,
               ),
             ),
 

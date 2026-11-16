@@ -104,6 +104,10 @@ class VrControllerStatePacer {
       a.stickClick != b.stickClick ||
       a.recenter != b.recenter ||
       a.moveAtEdge != b.moveAtEdge ||
+      a.dpadUp != b.dpadUp ||
+      a.dpadDown != b.dpadDown ||
+      a.dpadLeft != b.dpadLeft ||
+      a.dpadRight != b.dpadRight ||
       a.laserSlideActive != b.laserSlideActive ||
       a.pointerPoseReady != b.pointerPoseReady ||
       a.controllerVisible != b.controllerVisible ||

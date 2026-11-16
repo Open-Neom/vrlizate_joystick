@@ -150,6 +150,8 @@ abstract final class VrJoystickConstants {
   static const String fieldStickX = 'stickX';
   static const String fieldStickY = 'stickY';
   static const String fieldMoveAtEdge = 'moveAtEdge';
+  static const String fieldDpadX = 'dpadX';
+  static const String fieldDpadY = 'dpadY';
   static const String fieldTx = 'tx';
   static const String fieldTy = 'ty';
   static const String fieldTurn = 'turn';
@@ -310,6 +312,8 @@ abstract final class VrJoystickConstants {
     fieldWz,
     fieldStickX,
     fieldStickY,
+    fieldDpadX,
+    fieldDpadY,
     fieldTx,
     fieldTy,
     fieldTurn,
@@ -353,6 +357,8 @@ abstract final class VrJoystickConstants {
   static const List<String> neutralAxisKeys = [
     fieldStickX,
     fieldStickY,
+    fieldDpadX,
+    fieldDpadY,
     fieldTx,
     fieldTy,
     fieldTurn,
@@ -374,6 +380,8 @@ abstract final class VrJoystickConstants {
   static const Set<String> pacerReleaseAxes = {
     fieldStickX,
     fieldStickY,
+    fieldDpadX,
+    fieldDpadY,
     fieldLookX,
     fieldLookY,
     fieldLaserX,
