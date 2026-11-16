@@ -8,7 +8,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vrlizate/vrlizate.dart';
 import 'package:vrlizate_joystick/vrlizate_joystick.dart';
-import 'package:vrlizate_joystick/src/vr_controller_state_pacer.dart';
 
 class _Link implements VrControllerLink {
   final inbound = StreamController<Object?>();

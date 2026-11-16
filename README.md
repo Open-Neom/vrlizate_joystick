@@ -136,3 +136,36 @@ flutter test
 ## Licencia
 
 Apache License 2.0 — consulta [LICENSE](LICENSE).
+
+## Physical phone pointer posture
+
+`VrPhonePointerPolicy` is the shared Home/demo permission for a phone ray. It
+requires explicit pointer intent, visible controller feedback, a non-neutralized
+state and `RemoteControllerState.pointerPoseReady`. An old touch offset, an aim
+quaternion or sideways movement does not qualify the physical posture. Legacy
+and synthetic states default to false; walking/look/buttons keep their own rules.
+
+`PhoneControllerPage` observes natural phone accelerometer axes: upright landscape
+(±X gravity dominant), not portrait (±Y) or a flat display (±Z). Entry requires
+200 ms of continuous valid samples; readiness expires after 150 ms without a
+sample. Hysteresis permits modest natural pitch/roll. No extra camera is opened.
+The controller may be held beside the body, for example on the right, with the
+display facing inward and the rear camera outward. Keep its long edge horizontal
+and its display upright. Turning around the vertical axis does not disqualify
+this grip; holding the display face-up with the rear camera pointing down does.
+This is an inclination gate, **not** absolute heading, screen-facing-user proof,
+optical calibration or 6DoF tracking. The existing calibrated tracking path is
+required to establish the devices' real relative position and heading.
+
+Normal controls retain the user's Vista/Láser choice. The full-screen one-handed
+layout remains selectable in settings; its automatic layout shortcut is opt-in
+through `autoSwitchToOneHandedLaser`. Gravity does not identify how many hands
+hold a phone. Gyro laser rates project on observed gravity/up and screen/right,
+for both landscapes. Hidden/invalid feedback pauses automatic clicks; dwell uses
+real elapsed time at 8/16/33 ms update intervals.
+
+Update both endpoints. The core compact frame remains 46 bytes (byte42 bit3).
+Direct BLE/hybrid UDP use the separately negotiated `pointerPostureV1` capability
+and keep their existing packet lengths. An old Faro that decodes/re-encodes the
+core frame also needs updating. The gate does not remove transport delay; an
+existing Faro discrete backlog under ACK loss remains a separate freshness issue.

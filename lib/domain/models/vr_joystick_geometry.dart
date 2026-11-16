@@ -32,15 +32,19 @@ class VrJoystickGeometry {
     Size size, {
     double leftInset = 0,
     double rightInset = 0,
+    double topInset = 0,
+    double bottomInset = 0,
   }) {
     if (!size.width.isFinite ||
         !size.height.isFinite ||
         size.width <= 0 ||
         size.height <= 0 ||
-        !leftInset.isFinite ||
-        !rightInset.isFinite ||
-        leftInset < 0 ||
-        rightInset < 0) {
+        [
+          leftInset,
+          rightInset,
+          topInset,
+          bottomInset,
+        ].any((inset) => !inset.isFinite || inset < 0)) {
       throw ArgumentError.value(
         size,
         'size',
@@ -49,36 +53,105 @@ class VrJoystickGeometry {
     }
     final width = size.width;
     final height = size.height;
-    final previousCenterWidth = math.min(
+    const rightScale = .78;
+    final horizontalInset = math.max(leftInset, rightInset);
+    final safeHeight = height - topInset - bottomInset;
+    final comfortable =
+        width - leftInset - rightInset >= 760 && safeHeight >= 400;
+    final target = comfortable ? 56.0 : 48.0;
+    final clearance = comfortable ? 10.0 : 8.0;
+    final minimumOpening = (target / 2 + clearance) / rightScale;
+    final minimumSideWidth =
+        horizontalInset +
+        math.max(
+          target + 2 * minimumOpening,
+          2 * target + clearance + 2 * (1 - rightScale) * minimumOpening,
+        );
+    // Tiny or partially occluded surfaces still need all controls. Reserve
+    // full-size touch targets when all three bands and the preview fit.
+    final hasTargetSpace =
+        width >= 2 * minimumSideWidth + 96 &&
+        safeHeight >= 3 * target + 2 * clearance;
+    final preferredCenterWidth = math.min(
       width * .4,
       (width * .30).clamp(128.0, 360.0),
     );
-    final leftSideWidth = (width - previousCenterWidth) / 2;
-    // A camera cutout protects the letter without moving the physical edge:
-    // reserve more solid rail, reducing the circular opening when necessary.
+    final leftSideWidth = math.max(
+      (width - preferredCenterWidth) / 2,
+      hasTargetSpace ? minimumSideWidth : 0.0,
+    );
     final rail = math.min(
       leftSideWidth - 20,
-      math.max(48.0, math.max(leftInset, rightInset) + 32),
+      math.max(48.0, horizontalInset + (hasTargetSpace ? target : 32)),
     );
+    final cy = hasTargetSpace
+        ? (height * .53)
+              .clamp(
+                topInset + target + minimumOpening,
+                height - bottomInset - target - clearance,
+              )
+              .toDouble()
+        : height * .53;
+    // Put both shoulder pairs above their stick openings. Reserve enough
+    // width for the right pair when the smaller right stick widens the center.
+    final roomForOpening = hasTargetSpace
+        ? math.min(
+            cy - topInset - target,
+            math.min(
+              height - bottomInset - cy,
+              (leftSideWidth - horizontalInset - 2 * target - clearance) /
+                  (2 * (1 - rightScale)),
+            ),
+          )
+        : double.infinity;
     final radius = math.max(
       8.0,
-      math.min(height * .31, (leftSideWidth - rail) / 2),
+      math.min(
+        roomForOpening,
+        math.min(height * .31, (leftSideWidth - rail) / 2),
+      ),
     );
-    final stickRadius = math.max(4.0, radius - math.min(14.0, radius * .22));
-    final cy = height * .53;
-    // Keep the accepted movement control exactly where the left thumb expects
-    // it. The smaller right control releases its inner space to the preview,
-    // while preserving the solid outer rail used by B and the shoulder keys.
-    const rightScale = .78;
+    final preferredStickRadius = radius - math.min(14.0, radius * .22);
+    final stickRadius = math.max(
+      4.0,
+      hasTargetSpace
+          ? (preferredStickRadius.clamp(
+              target / (2 * rightScale),
+              math.max(
+                target / (2 * rightScale),
+                radius - clearance / rightScale,
+              ),
+            )).toDouble()
+          : preferredStickRadius,
+    );
     final rightRadius = radius * rightScale;
     final rightSideWidth = leftSideWidth - 2 * (radius - rightRadius);
     final centerWidth = width - leftSideWidth - rightSideWidth;
-    // Secondary shoulders keep a usable 48 px strip on phone-sized surfaces.
-    // Y/B retain the taller outer edges; the rarely touched upper-inner
-    // quadrants belong to L/R. Neither stick nor the lower X/A band moves.
-    final topEnd = height >= 240 ? math.max(51.0, height * .16) : height * .16;
-    final bottomStart = cy + radius * .55;
-    final gap = math.min(6.0, height * .02);
+    final gap = hasTargetSpace ? clearance : math.min(6.0, height * .02);
+    final preferredTopEnd =
+        (height >= 240 ? math.max(51.0, height * .16) : height * .16) - gap / 2;
+    final topEnd = hasTargetSpace
+        ? preferredTopEnd
+              .clamp(
+                topInset + target,
+                math.min(
+                  cy - radius,
+                  height - bottomInset - 2 * (target + gap),
+                ),
+              )
+              .toDouble()
+        : preferredTopEnd;
+    final sideStart = topEnd + gap;
+    final preferredSideEnd = cy + radius * .55 - gap / 2;
+    final sideEnd = hasTargetSpace
+        ? preferredSideEnd
+              .clamp(
+                math.max(cy, sideStart + target).toDouble(),
+                height - bottomInset - target - gap,
+              )
+              .toDouble()
+        : preferredSideEnd;
+    final bottomStart = sideEnd + gap;
     final shapes = <VrJoystickControl, Path>{};
     final labels = <VrJoystickControl, Offset>{};
     final panel = Rect.fromLTWH(leftSideWidth, 0, centerWidth, height);
@@ -93,6 +166,7 @@ class VrJoystickGeometry {
       final circle = Path()
         ..addOval(Rect.fromCircle(center: center, radius: openingRadius));
       final top = right ? VrJoystickControl.r : VrJoystickControl.l;
+      final trigger = right ? VrJoystickControl.zr : VrJoystickControl.zl;
       final side = right ? VrJoystickControl.b : VrJoystickControl.y;
       final bottom = right ? VrJoystickControl.a : VrJoystickControl.x;
       Path band(double y, double h) => Path.combine(
@@ -103,44 +177,92 @@ class VrJoystickGeometry {
       final outerX = right ? width : 0.0;
       final innerX = right ? x0 : sideWidth;
       final shoulderEdge = center.dx + (right ? -gap / 2 : gap / 2);
-      // One connected shoulder contour: top strip plus its inner circular
-      // surround. The exact same path also owns pointer hit testing.
-      shapes[top] = Path.combine(
+      final shoulder = Path.combine(
         PathOperation.difference,
         Path()
           ..moveTo(outerX, 0)
           ..lineTo(innerX, 0)
           ..lineTo(innerX, cy)
           ..lineTo(shoulderEdge, cy)
-          ..lineTo(shoulderEdge, topEnd - gap / 2)
-          ..lineTo(outerX, topEnd - gap / 2)
+          ..lineTo(shoulderEdge, topEnd)
+          ..lineTo(outerX, topEnd)
           ..close(),
         circle,
+      );
+      final systemInset = right ? rightInset : leftInset;
+      final safeInset = hasTargetSpace
+          ? systemInset
+          : math.min(systemInset, sideWidth * .5);
+      final outerShoulderWidth = (sideWidth + safeInset) / 2;
+      final splitX = right ? width - outerShoulderWidth : outerShoulderWidth;
+      final splitGap = hasTargetSpace
+          ? gap / 2
+          : math.min(gap / 2, sideWidth * .05);
+      final innerShoulderEdge = splitX + (right ? -splitGap : splitGap);
+      final outerShoulderEdge = splitX + (right ? splitGap : -splitGap);
+      // Keep two disjoint hit paths even when the shoulder's curved arm
+      // reaches further across the top band on a narrow surface.
+      shapes[top] = Path.combine(
+        PathOperation.intersect,
+        shoulder,
+        Path()..addRect(
+          Rect.fromLTRB(
+            right ? outerShoulderEdge : x0,
+            0,
+            right ? width : outerShoulderEdge,
+            cy,
+          ),
+        ),
+      );
+      shapes[trigger] = Path.combine(
+        PathOperation.intersect,
+        shoulder,
+        Path()..addRect(
+          Rect.fromLTRB(
+            right ? innerX : innerShoulderEdge,
+            0,
+            right ? innerShoulderEdge : innerX,
+            cy,
+          ),
+        ),
       );
       shapes[side] = Path.combine(
         PathOperation.difference,
         Path()..addRect(
           Rect.fromLTWH(
             right ? center.dx + gap / 2 : 0,
-            topEnd + gap / 2,
+            sideStart,
             cx - gap / 2,
-            bottomStart - topEnd - gap,
+            sideEnd - sideStart,
           ),
         ),
         circle,
       );
-      shapes[bottom] = band(
-        bottomStart + gap / 2,
-        height - bottomStart - gap / 2,
+      shapes[bottom] = band(bottomStart, height - bottomStart);
+      final insideRail = math.min(cx - openingRadius, cx - gap / 2);
+      final railLabelX = (safeInset + insideRail) / 2;
+      final sideLabelX = hasTargetSpace
+          ? railLabelX
+          : math.max(1.0, (cx - openingRadius) / 2);
+      final bottomLabelX = hasTargetSpace ? railLabelX : sideWidth * .30;
+      labels[top] = Offset(
+        (outerShoulderEdge + (right ? width - safeInset : safeInset)) / 2,
+        ((hasTargetSpace ? topInset : 0.0) + topEnd) / 2,
       );
-      final labelX = sideWidth * .30;
-      labels[top] = Offset(right ? width - labelX : labelX, topEnd * .44);
+      labels[trigger] = Offset(
+        (innerShoulderEdge + innerX) / 2,
+        labels[top]!.dy,
+      );
       labels[bottom] = Offset(
-        right ? width - labelX : labelX,
-        bottomStart + (height - bottomStart) * .58,
+        right ? width - bottomLabelX : bottomLabelX,
+        hasTargetSpace
+            ? (bottomStart + height - bottomInset) / 2
+            : bottomStart + (height - bottomStart) * .58,
       );
-      final sideLabelX = math.max(1.0, (cx - openingRadius) / 2);
-      labels[side] = Offset(right ? width - sideLabelX : sideLabelX, cy);
+      labels[side] = Offset(
+        right ? width - sideLabelX : sideLabelX,
+        hasTargetSpace ? (sideStart + sideEnd) / 2 : cy,
+      );
       final stick = right
           ? VrJoystickControl.lookStick
           : VrJoystickControl.moveStick;
@@ -149,10 +271,38 @@ class VrJoystickGeometry {
       labels[stick] = center;
     }
 
-    final header = math.min(height * .28, 82.0);
-    final recenterHeight = math.min(48.0, height * .17);
-    final footer = math.min(66.0, height * .24);
-    final inset = math.min(8.0, centerWidth * .06);
+    final previewGap = hasTargetSpace ? gap : 8.0;
+    const previewBottomMargin = 4.0;
+    final header = hasTargetSpace
+        ? math
+              .max(topInset, math.min(safeHeight * .28, 82.0))
+              .clamp(
+                topInset,
+                height -
+                    bottomInset -
+                    2 * target -
+                    previewGap -
+                    previewBottomMargin,
+              )
+              .toDouble()
+        : math.min(height * .28, 82.0);
+    final recenterHeight = hasTargetSpace
+        ? target
+        : math.min(48.0, height * .17);
+    final footer = hasTargetSpace
+        ? bottomInset +
+              math.min(
+                math.min(66.0, safeHeight * .24),
+                height -
+                    bottomInset -
+                    header -
+                    recenterHeight -
+                    target -
+                    previewGap -
+                    previewBottomMargin,
+              )
+        : math.min(66.0, height * .24);
+    final inset = hasTargetSpace ? gap : math.min(8.0, centerWidth * .06);
     final recenter = Rect.fromLTWH(
       panel.left + inset,
       header,
@@ -161,9 +311,12 @@ class VrJoystickGeometry {
     );
     final preview = Rect.fromLTWH(
       panel.left + inset,
-      recenter.bottom + 8,
+      recenter.bottom + previewGap,
       centerWidth - inset * 2,
-      math.max(8, height - footer - recenter.bottom - 12),
+      math.max(
+        8,
+        height - footer - recenter.bottom - previewGap - previewBottomMargin,
+      ),
     );
     shapes[VrJoystickControl.recenter] = Path()..addRect(recenter);
     shapes[VrJoystickControl.laserPad] = Path();

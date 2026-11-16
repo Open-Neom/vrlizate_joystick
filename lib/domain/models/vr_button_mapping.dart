@@ -6,11 +6,11 @@ import 'remote_controller_state.dart';
 /// Configurable logical button remapping and hold-center-for-home duration.
 ///
 /// Allows VR experiences or user accessibility settings to remap physical
-/// smartphone controller keys (`A`, `B`, `X`, `Y`, `L`, `R`, `GRIP`) and customize
+/// smartphone controller keys (`A`, `B`, `X`, `Y`, `L`, `R`, `ZL`, `ZR`, `GRIP`) and customize
 /// the long-press hold duration required to return to the VR Home environment.
 @immutable
 class VrButtonMapping {
-  /// Maps a physical button key (`A`, `B`, `X`, `Y`, `L`, `R`, `GRIP`) to its
+  /// Maps a physical button key (`A`, `B`, `X`, `Y`, `L`, `R`, `ZL`, `ZR`, `GRIP`) to its
   /// logical action button key. Unmapped keys resolve to themselves.
   final Map<String, String> buttonOverrides;
 
@@ -64,6 +64,8 @@ class VrButtonMapping {
       VrJoystickConstants.actionKeyY: state.btnY,
       VrJoystickConstants.actionKeyL: state.btnL,
       VrJoystickConstants.actionKeyR: state.btnR,
+      VrJoystickConstants.actionKeyZL: state.btnZL,
+      VrJoystickConstants.actionKeyZR: state.btnZR,
       VrJoystickConstants.actionKeyGrip: state.btnGrip,
     };
     for (final entry in physicalStates.entries) {
@@ -90,6 +92,8 @@ class VrButtonMapping {
       btnY: nextY,
       btnL: nextL,
       btnR: nextR,
+      btnZL: activeLogical.contains(VrJoystickConstants.actionKeyZL),
+      btnZR: activeLogical.contains(VrJoystickConstants.actionKeyZR),
       btnGrip: nextGrip,
       stickClick: state.stickClick,
       stickX: state.stickX,
@@ -102,6 +106,7 @@ class VrButtonMapping {
       laserX: state.laserX,
       laserY: state.laserY,
       laserSlideActive: state.laserSlideActive,
+      pointerPoseReady: state.pointerPoseReady,
       recenter: state.recenter,
       controllerVisible: state.controllerVisible,
       steering: state.steering,

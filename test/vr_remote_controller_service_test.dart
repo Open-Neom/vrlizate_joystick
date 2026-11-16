@@ -710,6 +710,40 @@ void main() {
   });
 
   test(
+    'shoulder packets remain independent across old snapshots and overlay capture',
+    () async {
+      final socket = await connect();
+      socket.add(jsonEncode({'sequence': 0, 'btnZL': true, 'btnZR': true}));
+      await waitUntil(
+        () => service.latestState.btnZL && service.latestState.btnZR,
+      );
+      expect(service.latestState.btnL, isFalse);
+      expect(service.latestState.btnR, isFalse);
+      expect(service.latestState.isTriggerPressed, isFalse);
+
+      service.setSystemOverlayCapture(true);
+      service.setSystemOverlayCapture(false);
+      socket.add(jsonEncode({'sequence': 1, 'btnZR': true}));
+      await waitUntil(
+        () => service.rawLatestState.btnZR && !service.rawLatestState.btnZL,
+      );
+      expect(service.latestState.btnZR, isFalse);
+
+      socket.add(jsonEncode({'sequence': 2, 'btnL': true}));
+      await waitUntil(() => service.rawLatestState.btnL);
+      socket.add(jsonEncode({'sequence': 3}));
+      await waitUntil(() => !service.rawLatestState.btnL);
+      expect(service.latestState.btnZL, isFalse);
+      expect(service.latestState.btnZR, isFalse);
+
+      socket.add(jsonEncode({'sequence': 4, 'btnZR': true}));
+      await waitUntil(() => service.latestState.btnZR);
+      await waitUntil(() => service.latestState.isNeutralized);
+      expect(service.latestState.btnZR, isFalse);
+    },
+  );
+
+  test(
     'watchdog releases the active center pad, buttons, and both sticks',
     () async {
       final socket = await connect();

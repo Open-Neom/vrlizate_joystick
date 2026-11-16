@@ -6,11 +6,13 @@ import 'package:vrlizate_joystick/src/vr_joystick_geometry.dart';
 
 const _leftButtons = [
   VrJoystickControl.l,
+  VrJoystickControl.zl,
   VrJoystickControl.y,
   VrJoystickControl.x,
 ];
 const _rightButtons = [
   VrJoystickControl.r,
+  VrJoystickControl.zr,
   VrJoystickControl.b,
   VrJoystickControl.a,
 ];
@@ -97,26 +99,10 @@ void main() {
         final layout = VrJoystickGeometry.fit(size);
         final left = layout[VrJoystickControl.moveStick];
         final right = layout[VrJoystickControl.lookStick];
-        final previous = _previousBottomAndStickShapes(
-          size,
-          leftInset: 0,
-          rightInset: 0,
-        );
-        final oldLeft = previous[VrJoystickControl.moveStick]!.getBounds();
-        final oldRight = previous[VrJoystickControl.lookStick]!.getBounds();
-        expect(left.left, closeTo(oldLeft.left, 1e-3));
-        expect(left.top, closeTo(oldLeft.top, 1e-3));
-        expect(left.width, closeTo(oldLeft.width, 1e-3));
-        expect(left.height, closeTo(oldLeft.height, 1e-3));
         expect(right.width / left.width, closeTo(.78, 1e-4));
         expect(right.height / left.height, closeTo(.78, 1e-4));
         expect(right.center.dy, closeTo(left.center.dy, 1e-3));
-        expect(right.center.dx, greaterThan(oldRight.center.dx));
-        final oldCenterWidth = math.min(
-          size.width * .4,
-          (size.width * .30).clamp(128.0, 360.0),
-        );
-        expect(layout.centerPanel.width, greaterThan(oldCenterWidth));
+        expect(right.center.dx, greaterThan(left.center.dx));
         expect(left.right, lessThanOrEqualTo(layout.centerPanel.left));
         expect(right.left, greaterThanOrEqualTo(layout.centerPanel.right));
         expect(layout.previewPanel.left, greaterThan(layout.centerPanel.left));
@@ -215,6 +201,8 @@ void main() {
           VrJoystickControl.a,
           VrJoystickControl.l,
           VrJoystickControl.r,
+          VrJoystickControl.zl,
+          VrJoystickControl.zr,
         ]) {
           final rect = layout[control];
           final y =
@@ -233,189 +221,140 @@ void main() {
     }
   }
 
-  for (final size in [
-    const Size(480, 280),
-    const Size(640, 320),
-    const Size(800, 360),
-    const Size(960, 420),
+  for (final (size, left, right, top, bottom, target, gap) in [
+    (const Size(480, 280), 0.0, 0.0, 0.0, 0.0, 48.0, 8.0),
+    (const Size(480, 280), 48.0, 48.0, 24.0, 24.0, 48.0, 8.0),
+    (const Size(640, 320), 48.0, 16.0, 12.0, 24.0, 48.0, 8.0),
+    (const Size(640, 320), 16.0, 48.0, 24.0, 12.0, 48.0, 8.0),
+    (const Size(700, 360), 32.0, 32.0, 0.0, 24.0, 48.0, 8.0),
+    (const Size(960, 540), 48.0, 16.0, 24.0, 28.0, 56.0, 10.0),
   ]) {
-    for (final (leftInset, rightInset) in [
-      (0.0, 0.0),
-      (32.0, 0.0),
-      (0.0, 32.0),
-    ]) {
-      test(
-        'Y/B retain primary outer edges at $size, insets $leftInset/$rightInset',
-        () {
-          final layout = VrJoystickGeometry.fit(
-            size,
-            leftInset: leftInset,
-            rightInset: rightInset,
+    test(
+      'safe pressable cores and neutral gaps at $size, $left/$right/$top/$bottom',
+      () {
+        final layout = VrJoystickGeometry.fit(
+          size,
+          leftInset: left,
+          rightInset: right,
+          topInset: top,
+          bottomInset: bottom,
+        );
+        final safe = Rect.fromLTRB(
+          left,
+          top,
+          size.width - right,
+          size.height - bottom,
+        );
+        for (final control in [
+          ..._leftButtons,
+          ..._rightButtons,
+          VrJoystickControl.recenter,
+        ]) {
+          final core = Rect.fromCenter(
+            center: layout.labels[control]!,
+            width: target - .02,
+            height: target - .02,
           );
-          final radius = _openingRadius(size, leftInset, rightInset);
-          final topEnd = math.max(51.0, size.height * .16);
-          final bottomStart = size.height * .53 + radius * .55;
-          final gap = math.min(6.0, size.height * .02);
-          for (final (side, top, x) in [
-            (VrJoystickControl.y, VrJoystickControl.l, 1.0),
-            (VrJoystickControl.b, VrJoystickControl.r, size.width - 1),
-          ]) {
-            final sideHeight = _sampledEdgeHeight(layout.shape(side), x, size);
-            final topHeight = _sampledEdgeHeight(layout.shape(top), x, size);
-            // Priority is the usable outer edge, where the player finds Y/B
-            // by touch. The less reachable upper INNER lobes belong to L/R,
-            // so ordering the buttons by total area is no longer appropriate.
-            expect(
-              sideHeight,
-              greaterThan(topHeight),
-              reason:
-                  '$side must keep a longer usable outer edge than $top: '
-                  '$sideHeight versus $topHeight logical px',
-            );
-            expect(
-              sideHeight,
-              closeTo(bottomStart - topEnd - gap, .75),
-              reason: 'Do not shrink the previously enlarged $side outer edge',
-            );
-            expect(
-              topHeight,
-              closeTo(topEnd - gap / 2, .75),
-              reason: 'The added $top arm is inner, not along the outer edge',
-            );
-          }
-
-          // Shoulder keys remain useful even after giving the side keys more
-          // room. Their physical outer edges keep a 48 px tall touch target.
-          for (final (top, x) in [
-            (VrJoystickControl.l, 1.0),
-            (VrJoystickControl.r, size.width - 1),
-          ]) {
-            for (var y = .5; y < 48; y += 1) {
-              expect(
-                layout.hitTest(Offset(x, y)),
-                top,
-                reason: '$top must retain 48 px along the top outer edge',
+          expect(
+            safe.contains(core.topLeft),
+            isTrue,
+            reason: '$control top left',
+          );
+          expect(
+            safe.contains(core.bottomRight),
+            isTrue,
+            reason: '$control bottom right',
+          );
+          for (var row = 0; row <= 8; row++) {
+            for (var column = 0; column <= 8; column++) {
+              final point = Offset(
+                core.left + core.width * column / 8,
+                core.top + core.height * row / 8,
               );
+              expect(_owners(layout, point), [
+                control,
+              ], reason: '$control at $point');
             }
           }
-
-          // The movement side is unchanged; right-side space is deliberately
-          // reassigned to the passive center and the smaller look/laser stick.
-          final previous = _previousBottomAndStickShapes(
-            size,
-            leftInset: leftInset,
-            rightInset: rightInset,
+        }
+        for (final (outer, inner, side, bottomKey, stick, direction) in [
+          (
+            VrJoystickControl.l,
+            VrJoystickControl.zl,
+            VrJoystickControl.y,
+            VrJoystickControl.x,
+            VrJoystickControl.moveStick,
+            1,
+          ),
+          (
+            VrJoystickControl.r,
+            VrJoystickControl.zr,
+            VrJoystickControl.b,
+            VrJoystickControl.a,
+            VrJoystickControl.lookStick,
+            -1,
+          ),
+        ]) {
+          final outerEdge = direction == 1
+              ? layout[outer].right
+              : layout[outer].left;
+          final innerEdge = direction == 1
+              ? layout[inner].left
+              : layout[inner].right;
+          expect((outerEdge - innerEdge).abs(), closeTo(gap, .01));
+          expect(
+            layout[bottomKey].top - layout[side].bottom,
+            closeTo(gap, .01),
           );
-          for (final entry in previous.entries.where(
-            (entry) =>
-                entry.key == VrJoystickControl.moveStick ||
-                entry.key == VrJoystickControl.x,
-          )) {
-            final actual = layout.shape(entry.key);
-            final expected = entry.value;
-            final bounds = expected.getBounds();
-            expect(actual.getBounds().left, closeTo(bounds.left, 1e-3));
-            expect(actual.getBounds().top, closeTo(bounds.top, 1e-3));
-            expect(actual.getBounds().width, closeTo(bounds.width, 1e-3));
-            expect(actual.getBounds().height, closeTo(bounds.height, 1e-3));
-            for (var row = 0; row < 29; row++) {
-              for (var column = 0; column < 29; column++) {
-                final point = Offset(
-                  bounds.left + bounds.width * (column + .31) / 29,
-                  bounds.top + bounds.height * (row + .47) / 29,
-                );
-                expect(
-                  actual.contains(point),
-                  expected.contains(point),
-                  reason: '${entry.key} footprint changed at $point',
-                );
-              }
-            }
-          }
-        },
-      );
-
-      test(
-        'upper inner lobes belong to L/R at $size, insets $leftInset/$rightInset',
-        () {
-          final layout = VrJoystickGeometry.fit(
-            size,
-            leftInset: leftInset,
-            rightInset: rightInset,
-          );
-          final radius = _openingRadius(size, leftInset, rightInset);
-          final topEnd = math.max(51.0, size.height * .16);
-          final gap = math.min(6.0, size.height * .02);
-
-          for (final (stick, side, shoulder, innerSign) in [
-            (
-              VrJoystickControl.moveStick,
-              VrJoystickControl.y,
-              VrJoystickControl.l,
-              1.0,
-            ),
-            (
-              VrJoystickControl.lookStick,
-              VrJoystickControl.b,
-              VrJoystickControl.r,
-              -1.0,
-            ),
-          ]) {
-            final center = layout[stick].center;
-            // Probe just outside each upper circle quadrant. The inner one
-            // was previously Y/B; only that lobe must transfer to L/R.
-            for (final angle in [math.pi / 3, math.pi / 4]) {
-              final delta =
-                  Offset(innerSign * math.cos(angle), -math.sin(angle)) *
-                  (radius * (stick == VrJoystickControl.lookStick ? .78 : 1) +
-                      4);
-              final inner = center + delta;
-              final outer = center + Offset(-delta.dx, delta.dy);
-              expect(layout.hitTest(inner), shoulder);
-              expect(_owners(layout, inner), [shoulder]);
-              expect(layout.hitTest(outer), side);
-              expect(_owners(layout, outer), [side]);
-            }
-            final besideCenterPanel = Offset(
-              innerSign > 0
-                  ? layout.centerPanel.left - 1
-                  : layout.centerPanel.right + 1,
-              topEnd + gap + 4,
-            );
-            expect(layout.hitTest(besideCenterPanel), shoulder);
-            expect(_owners(layout, besideCenterPanel), [shoulder]);
+          final x = layout.labels[side]!.dx;
+          final shoulderEnd = layout[side].top - gap;
+          for (var step = 1; step < 8; step++) {
+            final delta = gap * step / 8;
             expect(
               layout.hitTest(
-                Offset(innerSign > 0 ? 1 : size.width - 1, center.dy),
+                Offset(outerEdge + delta * direction, top + target / 2),
               ),
-              side,
+              isNull,
+            );
+            expect(layout.hitTest(Offset(x, shoulderEnd + delta)), isNull);
+            expect(
+              layout.hitTest(Offset(x, layout[side].bottom + delta)),
+              isNull,
             );
           }
-
-          // Include both notch orientations in ownership coverage: one press
-          // cannot reach both the new shoulder arm and the retained side band.
-          for (var row = 0; row < 37; row++) {
-            for (var column = 0; column < 79; column++) {
-              final point = Offset(
-                size.width * (column + .371) / 79,
-                size.height * (row + .613) / 37,
-              );
-              final owners = _owners(layout, point);
-              expect(
-                owners.length,
-                lessThanOrEqualTo(1),
-                reason:
-                    '$point has owners $owners with insets $leftInset/$rightInset',
-              );
-              expect(
-                layout.hitTest(point),
-                owners.isEmpty ? null : owners.single,
-              );
-            }
+          final stickRect = layout[stick];
+          expect(stickRect.width, greaterThanOrEqualTo(target - .01));
+          expect(
+            safe.contains(stickRect.topLeft + const Offset(.01, .01)),
+            isTrue,
+          );
+          expect(
+            safe.contains(stickRect.bottomRight - const Offset(.01, .01)),
+            isTrue,
+          );
+          for (var angleStep = 0; angleStep < 48; angleStep++) {
+            final angle = angleStep * math.pi / 24;
+            final nearStick =
+                stickRect.center +
+                Offset(math.cos(angle), math.sin(angle)) *
+                    (stickRect.width / 2 + gap - .02);
+            expect(
+              layout.hitTest(nearStick),
+              isNull,
+              reason: '$stick at $nearStick',
+            );
           }
-        },
-      );
-    }
+          final edgeX = direction == 1 ? 1.0 : size.width - 1;
+          expect(layout.hitTest(Offset(edgeX, 1)), outer);
+          expect(layout.hitTest(Offset(edgeX, layout.labels[side]!.dy)), side);
+          expect(layout.hitTest(Offset(edgeX, size.height - 1)), bottomKey);
+          final innerX = direction == 1
+              ? layout.centerPanel.left - 1
+              : layout.centerPanel.right + 1;
+          expect(layout.hitTest(Offset(innerX, layout[side].top + 1)), inner);
+        }
+      },
+    );
   }
 
   test('invalid constraints cannot create NaN or negative hit regions', () {
@@ -436,80 +375,3 @@ List<VrJoystickControl> _owners(VrJoystickGeometry layout, Offset point) => [
   for (final control in VrJoystickControl.values)
     if (layout.shape(control).contains(point)) control,
 ];
-
-double _sampledEdgeHeight(Path path, double x, Size size) {
-  const step = .5;
-  var samplesInside = 0;
-  for (var y = step / 2; y < size.height; y += step) {
-    if (path.contains(Offset(x, y))) samplesInside++;
-  }
-  return samplesInside * step;
-}
-
-double _openingRadius(Size size, double leftInset, double rightInset) {
-  final centerWidth = math.min(
-    size.width * .4,
-    (size.width * .30).clamp(128.0, 360.0),
-  );
-  final sideWidth = (size.width - centerWidth) / 2;
-  final rail = math.min(
-    sideWidth - 20,
-    math.max(48.0, math.max(leftInset, rightInset) + 32),
-  );
-  return math.max(8.0, math.min(size.height * .31, (sideWidth - rail) / 2));
-}
-
-/// Accepted edge-layout geometry before promoting Y/B over L/R. Reconstruct
-/// only the parts that must not move, rather than comparing a rendered image.
-Map<VrJoystickControl, Path> _previousBottomAndStickShapes(
-  Size size, {
-  required double leftInset,
-  required double rightInset,
-}) {
-  final centerWidth = math.min(
-    size.width * .4,
-    (size.width * .30).clamp(128.0, 360.0),
-  );
-  final sideWidth = (size.width - centerWidth) / 2;
-  final rail = math.min(
-    sideWidth - 20,
-    math.max(48.0, math.max(leftInset, rightInset) + 32),
-  );
-  final radius = math.max(
-    8.0,
-    math.min(size.height * .31, (sideWidth - rail) / 2),
-  );
-  final stickRadius = math.max(4.0, radius - math.min(14.0, radius * .22));
-  final cy = size.height * .53;
-  final cx = sideWidth - radius + math.min(6.0, radius * .1);
-  final bottomStart = cy + radius * .55;
-  final gap = math.min(6.0, size.height * .02);
-  return {
-    for (final right in [false, true]) ...{
-      right ? VrJoystickControl.a : VrJoystickControl.x: Path.combine(
-        PathOperation.difference,
-        Path()..addRect(
-          Rect.fromLTWH(
-            right ? size.width - sideWidth : 0,
-            bottomStart + gap / 2,
-            sideWidth,
-            size.height - bottomStart - gap / 2,
-          ),
-        ),
-        Path()..addOval(
-          Rect.fromCircle(
-            center: Offset(right ? size.width - cx : cx, cy),
-            radius: radius,
-          ),
-        ),
-      ),
-      right ? VrJoystickControl.lookStick : VrJoystickControl.moveStick: Path()
-        ..addOval(
-          Rect.fromCircle(
-            center: Offset(right ? size.width - cx : cx, cy),
-            radius: stickRadius,
-          ),
-        ),
-    },
-  };
-}

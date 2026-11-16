@@ -101,6 +101,8 @@ abstract final class VrJoystickConstants {
   static const String actionKeyY = 'Y';
   static const String actionKeyL = 'L';
   static const String actionKeyR = 'R';
+  static const String actionKeyZL = 'ZL';
+  static const String actionKeyZR = 'ZR';
   static const String actionKeyGrip = 'GRIP';
   static const String nesKeyStart = 'start';
   static const String nesKeySelect = 'select';
@@ -116,6 +118,8 @@ abstract final class VrJoystickConstants {
     actionKeyY,
     actionKeyL,
     actionKeyR,
+    actionKeyZL,
+    actionKeyZR,
     actionKeyGrip,
   };
 
@@ -159,6 +163,7 @@ abstract final class VrJoystickConstants {
   static const String fieldAimX = 'aimX';
   static const String fieldAimY = 'aimY';
   static const String fieldLaserSlideActive = 'laserSlideActive';
+  static const String fieldPointerPoseReady = 'pointerPoseReady';
   static const String fieldRecenter = 'recenter';
   static const String fieldControllerVisible = 'controllerVisible';
   static const String fieldRangeMeters = 'rangeMeters';
@@ -171,6 +176,8 @@ abstract final class VrJoystickConstants {
   static const String fieldBtnY = 'btnY';
   static const String fieldBtnL = 'btnL';
   static const String fieldBtnR = 'btnR';
+  static const String fieldBtnZL = 'btnZL';
+  static const String fieldBtnZR = 'btnZR';
   static const String fieldBtnGrip = 'btnGrip';
   static const String fieldStickClick = 'stickClick';
   static const String fieldSteering = 'steering';
@@ -280,7 +287,10 @@ abstract final class VrJoystickConstants {
   static const String modeNes = 'nes';
 
   static const List<String> booleanStateKeys = [
+    fieldBtnZL,
+    fieldBtnZR,
     fieldLaserSlideActive,
+    fieldPointerPoseReady,
     fieldDrivingPaused,
     fieldMotionAvailable,
     fieldControllerVisible,
@@ -330,6 +340,8 @@ abstract final class VrJoystickConstants {
     fieldBtnY,
     fieldBtnL,
     fieldBtnR,
+    fieldBtnZL,
+    fieldBtnZR,
     fieldBtnGrip,
     fieldStickClick,
     fieldLaserSlideActive,
@@ -476,6 +488,7 @@ abstract final class VrJoystickConstants {
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>VRlizate Mando & Joystick VR</title>
   <style>
+    :root { --touch-size: 48px; --touch-gap: 8px; }
     * { box-sizing: border-box; touch-action: none; user-select: none; -webkit-user-select: none; }
     body {
       background: #080816;
@@ -486,10 +499,12 @@ abstract final class VrJoystickConstants {
       display: flex;
       flex-direction: column;
       height: 100vh;
+      height: 100dvh;
       overflow: hidden;
     }
     .header {
       display: flex;
+      gap: var(--touch-gap);
       justify-content: space-between;
       align-items: center;
       padding-bottom: 8px;
@@ -497,7 +512,7 @@ abstract final class VrJoystickConstants {
     }
     .title { font-size: 16px; font-weight: bold; color: #00E5FF; letter-spacing: 1px; }
     .status { font-size: 11px; color: #10B981; font-weight: bold; }
-    .tabs { display: flex; gap: 8px; margin: 10px 0; }
+    .tabs { display: flex; gap: var(--touch-gap); margin: var(--touch-gap) 0; }
     .tab {
       flex: 1;
       padding: 8px;
@@ -505,10 +520,15 @@ abstract final class VrJoystickConstants {
       border: 1px solid #00E5FF;
       background: #101528;
       color: #00E5FF;
+      color: #00E5FF;
       font-size: 12px;
       font-weight: bold;
       text-align: center;
       cursor: pointer;
+    }
+    button.tab {
+      min-width: var(--touch-size);
+      min-height: var(--touch-size);
     }
     .tab.active {
       background: #00E5FF;
@@ -549,11 +569,14 @@ abstract final class VrJoystickConstants {
     .btn-cluster {
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: var(--touch-gap);
       width: 140px;
     }
+    #driveControls { gap: var(--touch-gap); }
     .game-btn {
-      height: 52px;
+      min-width: var(--touch-size);
+      min-height: var(--touch-size);
+      padding: 4px 6px;
       border-radius: 14px;
       border: none;
       font-size: 15px;
@@ -567,13 +590,61 @@ abstract final class VrJoystickConstants {
     }
     .btn-a { background: linear-gradient(135deg, #00E5FF, #7C4DFF); }
     .btn-b { background: linear-gradient(135deg, #FF007F, #FF9100); }
+    .shoulder-controls {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 176px));
+      gap: var(--touch-gap);
+      width: 100%;
+      justify-content: space-between;
+    }
+    .shoulder-pair {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(var(--touch-size), 1fr));
+      gap: var(--touch-gap);
+    }
+    .shoulder-controls .game-btn {
+      background: #253557;
+      font-size: 12px;
+      touch-action: none;
+    }
     .btn-grip { background: #1F293D; border: 1px solid #00E5FF; color: #00E5FF; }
-    .game-btn:active { transform: scale(0.94); filter: brightness(1.3); }
+    .game-btn:active { filter: brightness(1.3); }
     .telemetry {
       font-size: 11px;
       color: rgba(0, 229, 255, 0.6);
       text-align: center;
       padding: 6px;
+    }
+    @media (max-height: 360px) {
+      body { padding: 6px; }
+      .header { padding-bottom: 4px; }
+      .tab { padding: 4px; }
+      .game-btn { font-size: 12px; }
+      .stick-container { width: 130px; height: 130px; }
+      .stick-knob { width: 48px; height: 48px; }
+      .telemetry { padding: 3px; }
+    }
+    @media (max-height: 320px) {
+      .stick-container { width: 96px; height: 96px; }
+    }
+    @media (max-height: 300px) {
+      .stick-container { width: 72px; height: 72px; }
+      .stick-knob { width: 36px; height: 36px; }
+      .main-area { margin-top: var(--touch-gap); }
+    }
+    @media (max-height: 420px) and (min-width: 480px) {
+      .btn-cluster {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(var(--touch-size), 1fr));
+        width: min(57vw, 360px);
+      }
+      #driveControls {
+        grid-column: 1 / -1;
+        grid-template-columns: repeat(3, minmax(var(--touch-size), 1fr));
+      }
+    }
+    @media (min-width: 760px) and (min-height: 400px) {
+      :root { --touch-size: 56px; --touch-gap: 10px; }
     }
   </style>
 </head>
@@ -585,10 +656,20 @@ abstract final class VrJoystickConstants {
   </div>
 
   <div class="tabs">
-    <div id="tabJoy" class="tab active" onclick="setMode('joystick')">🕹️ JOYSTICK ANALÓGICO</div>
+    <button id="tabJoy" class="tab active" onclick="setMode('joystick')">🕹️ JOYSTICK ANALÓGICO</button>
     <div id="modeHint" class="tab">La app activa el volante</div>
   </div>
 
+  <div class="shoulder-controls" id="shoulderControls">
+    <div class="shoulder-pair">
+      <button id="btnZL" class="game-btn">ZL</button>
+      <button id="btnL" class="game-btn">L</button>
+    </div>
+    <div class="shoulder-pair">
+      <button id="btnR" class="game-btn">R</button>
+      <button id="btnZR" class="game-btn">ZR</button>
+    </div>
+  </div>
   <div class="main-area">
     <!-- Joystick left side -->
     <div class="stick-container" id="stickBase">
@@ -615,6 +696,7 @@ abstract final class VrJoystickConstants {
     let mode = 'joystick';
     let stickX = 0, stickY = 0;
     let btnA = false, btnB = false, btnGrip = false;
+    const shoulders = { L: false, R: false, ZL: false, ZR: false };
     const qx = 0, qy = 0, qz = 0, qw = 1;
     let controllerVisible = true;
     let sequence = 0;
@@ -623,13 +705,13 @@ abstract final class VrJoystickConstants {
     let drivePulse = null;
     const buttonPointers = new Map();
 
-    // Host captions for the buttons this layout has (A, B, grip). Text only
+    // Host captions for the buttons this layout has. Text only
     // via innerText, known keys only, capped like the native client.
     const defaultCaptions = { A: 'ELEGIR / OK', B: 'ATRÁS / CANCELAR', GRIP: 'AGARRE / MENÚ' };
     function applyActions(actions) {
       const clean = {};
       if (actions && typeof actions === 'object') {
-        for (const key of ['A', 'B', 'L', 'R', 'GRIP']) {
+        for (const key of ['A', 'B', 'L', 'R', 'ZL', 'ZR', 'GRIP']) {
           const value = actions[key];
           if (typeof value === 'string' && value.trim()) clean[key] = value.trim().slice(0, 24);
         }
@@ -639,6 +721,10 @@ abstract final class VrJoystickConstants {
       document.getElementById('btnGrip').innerText = (clean.GRIP || defaultCaptions.GRIP).toUpperCase();
       document.getElementById('btnThrottle').innerText = 'R · ' + (clean.R || 'SIGUIENTE VISTA').toUpperCase();
       document.getElementById('btnBrake').innerText = 'L · ' + (clean.L || 'VISTA ANTERIOR').toUpperCase();
+      for (const key of Object.keys(shoulders)) {
+        const button = document.getElementById('btn' + key);
+        button.innerText = clean[key] ? key + ' · ' + clean[key] : key;
+      }
     }
     function setMode(newMode) {
       if (newMode !== 'joystick' && newMode !== 'driving' && newMode !== 'nes') return;
@@ -655,7 +741,8 @@ abstract final class VrJoystickConstants {
       const driving = mode === 'driving';
       document.getElementById('tabJoy').className = !driving ? 'tab active' : 'tab';
       document.getElementById('modeHint').innerText = driving ? 'Stick ↑ acelera · ↓ frena/reversa · ↔ gira · L/R vista' : mode === 'nes' ? 'NES · A acción · GRIP Start · B Home' : 'La app activa el volante';
-      document.getElementById('driveControls').style.display = driving ? 'block' : 'none';
+      document.getElementById('driveControls').style.display = driving ? 'grid' : 'none';
+      document.getElementById('shoulderControls').style.display = mode === 'joystick' ? 'grid' : 'none';
       document.getElementById('btnA').style.display = 'flex';
       document.getElementById('btnGrip').style.display = driving ? 'none' : 'flex';
       document.getElementById('driveToggle').innerText = drivingPaused ? 'CONTINUAR (A)' : 'PAUSA';
@@ -711,18 +798,26 @@ abstract final class VrJoystickConstants {
     // Virtual Touch Joystick Handling
     const base = document.getElementById('stickBase');
     const knob = document.getElementById('stickKnob');
-    const maxRadius = 55;
     let isTouching = false;
+    let activeStickTouchId = null;
+    let moveAtEdge = false;
 
-    function handleTouch(e) {
-      e.preventDefault();
+    function findActiveStickTouch(touchList) {
+      if (!touchList) return null;
+      for (let i = 0; i < touchList.length; i++) {
+        if (touchList[i].identifier === activeStickTouchId) return touchList[i];
+      }
+      return null;
+    }
+
+    function handleTouchPoint(touch) {
       const rect = base.getBoundingClientRect();
       const centerX = rect.left + rect.width / 2;
       const centerY = rect.top + rect.height / 2;
-      const touch = e.touches ? e.touches[0] : e;
       const dx = touch.clientX - centerX;
       const dy = touch.clientY - centerY;
       const dist = Math.hypot(dx, dy);
+      const maxRadius = Math.min(55, rect.width * 0.32);
 
       let clampedDx = dx, clampedDy = dy;
       if (dist > maxRadius) {
@@ -733,22 +828,49 @@ abstract final class VrJoystickConstants {
       knob.style.transform = `translate(\${clampedDx}px, \${clampedDy}px)`;
       stickX = parseFloat((clampedDx / maxRadius).toFixed(2));
       stickY = parseFloat((-clampedDy / maxRadius).toFixed(2)); // Up is positive
+      moveAtEdge = dist >= maxRadius * 0.88;
 
       updateTelemetry();
       sendState();
     }
 
     function resetStick(send = true) {
+      activeStickTouchId = null;
       knob.style.transform = 'translate(0px, 0px)';
-      stickX = 0; stickY = 0;
+      stickX = 0; stickY = 0; moveAtEdge = false;
       updateTelemetry();
       if (send) sendState();
     }
 
-    base.addEventListener('touchstart', (e) => { isTouching = true; handleTouch(e); if (navigator.vibrate) navigator.vibrate(15); });
-    base.addEventListener('touchmove', (e) => { if (isTouching) handleTouch(e); });
-    base.addEventListener('touchend', () => { isTouching = false; resetStick(); });
-    base.addEventListener('touchcancel', () => { isTouching = false; resetStick(); });
+    base.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      if (activeStickTouchId !== null) return;
+      const t = (e.changedTouches && e.changedTouches[0]) ||
+                (e.targetTouches && e.targetTouches[0]) ||
+                (e.touches && e.touches[0]);
+      if (!t) return;
+      activeStickTouchId = t.identifier;
+      isTouching = true;
+      handleTouchPoint(t);
+      if (navigator.vibrate) navigator.vibrate(15);
+    });
+    base.addEventListener('touchmove', (e) => {
+      if (!isTouching) return;
+      e.preventDefault();
+      const t = findActiveStickTouch(e.touches) ||
+                findActiveStickTouch(e.changedTouches);
+      if (t) handleTouchPoint(t);
+    });
+    function onStickTouchEnd(e) {
+      if (!isTouching) return;
+      if (activeStickTouchId !== null && e.changedTouches) {
+        if (!findActiveStickTouch(e.changedTouches)) return;
+      }
+      isTouching = false;
+      resetStick();
+    }
+    base.addEventListener('touchend', onStickTouchEnd);
+    base.addEventListener('touchcancel', onStickTouchEnd);
 
     // Buttons
     function bindBtn(id, setVar) {
@@ -776,6 +898,9 @@ abstract final class VrJoystickConstants {
     });
     bindBtn('btnB', (v) => btnB = v);
     bindBtn('btnGrip', (v) => btnGrip = v);
+    for (const key of Object.keys(shoulders)) {
+      bindBtn('btn' + key, (v) => shoulders[key] = v && mode === 'joystick');
+    }
     bindBtn('btnThrottle', (v) => throttleHeld = v && mode === 'driving' && !drivingPaused);
     bindBtn('btnBrake', (v) => brakeHeld = v && mode === 'driving' && !drivingPaused);
     document.getElementById('driveToggle').addEventListener('click', () => {
@@ -808,11 +933,14 @@ abstract final class VrJoystickConstants {
           hostModeRevision,
           stickX: mode === 'driving' && drivingPaused ? 0 : stickX,
           stickY: mode === 'driving' && drivingPaused ? 0 : stickY,
+          moveAtEdge: mode === 'joystick' && moveAtEdge,
           btnA,
           btnB,
           btnGrip,
-          btnR: throttleHeld,
-          btnL: brakeHeld,
+          btnR: throttleHeld || shoulders.R,
+          btnL: brakeHeld || shoulders.L,
+          btnZL: shoulders.ZL,
+          btnZR: shoulders.ZR,
           controllerVisible,
           trigger: throttleHeld,
           action: btnB,
@@ -830,6 +958,7 @@ abstract final class VrJoystickConstants {
 
     function releaseInputs(send = true) {
       btnA = false; btnB = false; btnGrip = false;
+      for (const key of Object.keys(shoulders)) shoulders[key] = false;
       throttleHeld = false; brakeHeld = false; drivingPaused = true;
       if (drivePulse !== null) clearTimeout(drivePulse);
       drivePulse = null; buttonPointers.clear();

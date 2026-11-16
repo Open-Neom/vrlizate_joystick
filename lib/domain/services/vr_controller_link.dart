@@ -17,3 +17,11 @@ abstract class VrControllerLink {
 abstract interface class VrCompactGamepadCapableLink {
   bool get supportsCompactGamepadFrames;
 }
+
+/// Optional sink implemented by duplex UDP controller links (such as
+/// `VrBeaconVisorControllerLink` in a `3D Set`) to emit end-to-end cumulative
+/// sequence acknowledgments when the Visor's `VrRemoteControllerService`
+/// accepts (or deduplicates an already-accepted) `VrCompactGamepadFrame`.
+abstract interface class VrCompactGamepadAckSink {
+  void acknowledgeCompactGamepadSequence(int sequence);
+}

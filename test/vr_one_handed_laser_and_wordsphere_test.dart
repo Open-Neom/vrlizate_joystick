@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -8,6 +10,7 @@ Future<void> _pumpUntil(
   WidgetTester tester,
   bool Function() condition, {
   String reason = 'condition',
+  String Function()? diagnostics,
 }) async {
   final elapsed = Stopwatch()..start();
   while (elapsed.elapsed < const Duration(seconds: 5)) {
@@ -17,7 +20,7 @@ Future<void> _pumpUntil(
     );
     await tester.pump(const Duration(milliseconds: 16));
   }
-  fail('Timed out waiting for $reason.');
+  fail('Timed out waiting for $reason. ${diagnostics?.call() ?? ''}');
 }
 
 void main() {
@@ -45,124 +48,122 @@ void main() {
   });
 
   group('VrOneHandedLaserDetector', () {
-    test('detects transition from 2-hand flat grip to 1-hand laser pointing grip', () {
+    test('requires upright landscape; lateral roll never switches', () {
       final detector = VrOneHandedLaserDetector();
-
-      // Flat landscape 2-handed grip (gx ~ 9.81, gy ~ 0) never switches
+      for (var t = 0; t <= 500000; t += 20000) {
+        expect(
+          detector.shouldSwitchToLaser(
+            gx: 4,
+            gy: 7.5,
+            gz: 5,
+            omegaMagnitude: .6,
+            dualTouchActive: false,
+            timestampUs: t,
+          ),
+          isFalse,
+        );
+      }
+      var switches = 0;
+      for (var t = 520000; t <= 900000; t += 20000) {
+        if (detector.shouldSwitchToLaser(
+          gx: 9.81,
+          gy: .1,
+          gz: .1,
+          omegaMagnitude: 0,
+          dualTouchActive: false,
+          timestampUs: t,
+        )) {
+          switches++;
+        }
+      }
+      expect(switches, 1);
+      expect(detector.isOneHandedLaserActive, isTrue);
+      detector.setModeActive(false);
       expect(
         detector.shouldSwitchToLaser(
           gx: 9.81,
-          gy: 0.2,
-          gz: 0.1,
-          omegaMagnitude: 0.5,
+          gy: .1,
+          gz: .1,
+          omegaMagnitude: 0,
           dualTouchActive: false,
-          timestampUs: 0,
+          timestampUs: 920000,
         ),
         isFalse,
+        reason: 'Manual gamepad selection wins until posture exits',
       );
+    });
 
-      // Dual touch active blocks switching even when tilted
+    test('touch or fast motion cannot cause automatic layout changes', () {
+      final detector = VrOneHandedLaserDetector();
+      for (var t = 0; t <= 400000; t += 20000) {
+        expect(
+          detector.shouldSwitchToLaser(
+            gx: 9.81,
+            gy: .1,
+            gz: .1,
+            omegaMagnitude: .1,
+            dualTouchActive: true,
+            timestampUs: t,
+          ),
+          isFalse,
+        );
+      }
       expect(
         detector.shouldSwitchToLaser(
-          gx: 4.0,
-          gy: 7.5,
-          gz: 5.0,
-          omegaMagnitude: 0.6,
-          dualTouchActive: true,
-          timestampUs: 100000,
-        ),
-        isFalse,
-      );
-
-      // One-handed lateral pointing grip starts candidate timer
-      expect(
-        detector.shouldSwitchToLaser(
-          gx: 4.0,
-          gy: 7.5,
-          gz: 5.0,
-          omegaMagnitude: 0.6,
+          gx: 9.81,
+          gy: .1,
+          gz: .1,
+          omegaMagnitude: 3,
           dualTouchActive: false,
-          timestampUs: 200000,
+          timestampUs: 420000,
         ),
         isFalse,
       );
-
-      // Holding one-handed pointing grip past switchHoldUs (200ms) activates laser mode
-      expect(
-        detector.shouldSwitchToLaser(
-          gx: 4.0,
-          gy: 7.5,
-          gz: 5.0,
-          omegaMagnitude: 0.4,
-          dualTouchActive: false,
-          timestampUs: 450000,
-        ),
-        isTrue,
-      );
-      expect(detector.isOneHandedLaserActive, isTrue);
-
-      // Returning to level 2-hand landscape posture for returnHoldUs (350ms) returns to joystick
-      expect(
-        detector.shouldReturnToJoystick(
-          gx: 9.6,
-          gy: 0.3,
-          gz: 1.5,
-          timestampUs: 500000,
-        ),
-        isFalse,
-      );
-      expect(
-        detector.shouldReturnToJoystick(
-          gx: 9.6,
-          gy: 0.3,
-          gz: 1.5,
-          timestampUs: 900000,
-        ),
-        isTrue,
-      );
-      expect(detector.isOneHandedLaserActive, isFalse);
     });
   });
 
   group('VrLaserSteadyDwellController', () {
-    test('triggers auto-click after 5.0 seconds of steady aiming and resets on movement', () {
-      final dwell = VrLaserSteadyDwellController();
-      expect(dwell.dwellDurationSeconds, closeTo(5.0, 1e-6));
-      expect(dwell.progress, 0.0);
+    test(
+      'triggers auto-click after 5.0 seconds of steady aiming and resets on movement',
+      () {
+        final dwell = VrLaserSteadyDwellController();
+        expect(dwell.dwellDurationSeconds, closeTo(5.0, 1e-6));
+        expect(dwell.progress, 0.0);
 
-      // Accumulate 2.5 seconds steady (10 steps of 0.25s)
-      for (var i = 0; i < 10; i++) {
+        // Accumulate 2.5 seconds steady (10 steps of 0.25s)
+        for (var i = 0; i < 10; i++) {
+          expect(
+            dwell.update(angularSpeedRadiansPerSec: 0.1, dtSeconds: 0.25),
+            isFalse,
+          );
+        }
+        expect(dwell.progress, closeTo(0.5, 1e-5));
+        expect(dwell.remainingSeconds, closeTo(2.5, 1e-5));
+
+        // Fast phone movement resets progress to 0
         expect(
-          dwell.update(angularSpeedRadiansPerSec: 0.1, dtSeconds: 0.25),
+          dwell.update(angularSpeedRadiansPerSec: 1.2, dtSeconds: 0.1),
           isFalse,
         );
-      }
-      expect(dwell.progress, closeTo(0.5, 1e-5));
-      expect(dwell.remainingSeconds, closeTo(2.5, 1e-5));
+        expect(dwell.progress, 0.0);
 
-      // Fast phone movement resets progress to 0
-      expect(
-        dwell.update(angularSpeedRadiansPerSec: 1.2, dtSeconds: 0.1),
-        isFalse,
-      );
-      expect(dwell.progress, 0.0);
-
-      // Hold steady for a full 5.0 seconds (20 steps of 0.25s)
-      var triggeredCount = 0;
-      for (var i = 0; i < 20; i++) {
-        if (dwell.update(angularSpeedRadiansPerSec: 0.08, dtSeconds: 0.25)) {
-          triggeredCount++;
+        // Hold steady for a full 5.0 seconds (20 steps of 0.25s)
+        var triggeredCount = 0;
+        for (var i = 0; i < 20; i++) {
+          if (dwell.update(angularSpeedRadiansPerSec: 0.08, dtSeconds: 0.25)) {
+            triggeredCount++;
+          }
         }
-      }
-      expect(triggeredCount, 1);
-      expect(dwell.progress, closeTo(1.0, 1e-5));
+        expect(triggeredCount, 1);
+        expect(dwell.progress, closeTo(1.0, 1e-5));
 
-      // Subsequent steady frames do not spam repeated clicks until re-armed
-      expect(
-        dwell.update(angularSpeedRadiansPerSec: 0.05, dtSeconds: 0.25),
-        isFalse,
-      );
-    });
+        // Subsequent steady frames do not spam repeated clicks until re-armed
+        expect(
+          dwell.update(angularSpeedRadiansPerSec: 0.05, dtSeconds: 0.25),
+          isFalse,
+        );
+      },
+    );
   });
 
   group('PhoneControllerPage One-Handed Laser, Tap/5s Click & Wordsphere Search', () {
@@ -176,12 +177,43 @@ void main() {
           inputTimeout: const Duration(seconds: 15),
         );
         addTearDown(service.dispose);
-        expect(await tester.runAsync(() => service.startServer(port: 0)), isTrue);
+        service.requestControllerMode(
+          RemoteControllerMode.joystick,
+          actions: const {VrJoystickConstants.actionKeyA: 'QA READY'},
+        );
+        expect(
+          await tester.runAsync(() => service.startServer(port: 0)),
+          isTrue,
+        );
 
+        var testClockUs = 0;
+        final diagnosticStates = <Map<String, Object?>>[];
+        final diagnosticSub = service.onState.listen((state) {
+          if (diagnosticStates.length == 24) diagnosticStates.removeAt(0);
+          diagnosticStates.add({
+            'clockUs': testClockUs,
+            'mode': state.mode.name,
+            'pose': state.pointerPoseReady,
+            'visible': state.controllerVisible,
+            'laserX': state.laserX,
+            'laserY': state.laserY,
+            'motion': state.motionAvailable,
+            'neutral': state.isNeutralized,
+            'orientation': [
+              state.orientation.x,
+              state.orientation.y,
+              state.orientation.z,
+              state.orientation.w,
+            ],
+          });
+        });
+        addTearDown(diagnosticSub.cancel);
         await tester.pumpWidget(
           MaterialApp(
             home: PhoneControllerPage(
               initialMode: RemoteControllerMode.joystick,
+              autoSwitchToOneHandedLaser: true,
+              monotonicMicroseconds: () => testClockUs,
               targetHost: '127.0.0.1',
               targetPort: service.serverPort!,
               sessionToken: service.sessionToken,
@@ -189,7 +221,19 @@ void main() {
             ),
           ),
         );
-        await _pumpUntil(tester, () => service.isConnected, reason: 'connected');
+        await _pumpUntil(
+          tester,
+          () => service.isConnected,
+          reason: 'connected',
+        );
+        // Server attachment precedes delivery of its initial profile. Wait for
+        // a caption from that exact request so its neutral mode reset cannot
+        // race the synthetic posture/gyro stream in this fake-time test.
+        await _pumpUntil(
+          tester,
+          () => find.textContaining('QA READY').evaluate().isNotEmpty,
+          reason: 'initial host profile applied on controller',
+        );
         expect(find.byType(VirtualThumbstick), findsNWidgets(2));
 
         // 1. Simulate moving the phone into a one-handed pointing grip
@@ -219,12 +263,31 @@ void main() {
           );
         }
 
-        pushGyro(0.2, 0.3, -0.4, 100000);
-        await tester.pump(const Duration(milliseconds: 20));
-        pushAccel(4.0, 7.6, 4.8, 120000);
-        await tester.pump(const Duration(milliseconds: 250));
-        pushAccel(4.0, 7.6, 4.8, 400000);
-        await tester.pump(const Duration(milliseconds: 30));
+        var sensorUs = 100000.0;
+        Future<void> pointingFor(
+          int milliseconds, {
+          double gyroX = 0,
+          double gyroY = 0,
+        }) async {
+          for (var i = 0; i < milliseconds; i += 20) {
+            sensorUs += 20000;
+            testClockUs += 20000;
+            pushGyro(gyroX, gyroY, 0, sensorUs);
+            pushAccel(9.81, .1, .1, sensorUs);
+            await tester.pump(const Duration(milliseconds: 20));
+          }
+        }
+
+        // Sideways/portrait tilt no longer opens the laser layout.
+        for (var i = 0; i < 20; i++) {
+          sensorUs += 20000;
+          testClockUs += 20000;
+          pushGyro(.2, .3, -.4, sensorUs);
+          pushAccel(4, 7.6, 4.8, sensorUs);
+          await tester.pump(const Duration(milliseconds: 20));
+        }
+        expect(find.byType(VirtualThumbstick), findsNWidgets(2));
+        await pointingFor(280);
 
         // Screen stops showing the dual joystick and shows VrLaserPointingView
         expect(find.byType(VirtualThumbstick), findsNothing);
@@ -242,17 +305,33 @@ void main() {
           reason: 'laser mode on host',
         );
 
-        // 2. Moving the phone updates the 3D laser aim via gyroscope
-        pushGyro(0.8, 0.0, -1.0, 500000);
-        await tester.pump(const Duration(milliseconds: 20));
-        pushGyro(0.8, 0.0, -1.0, 600000);
-        await tester.pump(const Duration(milliseconds: 20));
+        // 2. Feed a continuous native-rate rotation with fresh posture samples.
+        // A startup/mode handoff can reset one gyro delta; a real movement is
+        // a stream, rather than two isolated packets followed by stale gravity.
+        await pointingFor(300, gyroX: -1, gyroY: -.8);
         await _pumpUntil(
           tester,
           () =>
               service.latestState.laserX > 0.02 &&
               service.latestState.laserY > 0.02,
           reason: 'gyro laser aim movement',
+          diagnostics: () {
+            final views = find.byType(VrLaserPointingView).evaluate();
+            final view = views.isEmpty
+                ? null
+                : views.single.widget as VrLaserPointingView;
+            return jsonEncode({
+              'clockUs': testClockUs,
+              'sensorUs': sensorUs,
+              'localAim': view == null ? null : [view.aimX, view.aimY],
+              'localAngles': view == null
+                  ? null
+                  : [view.yawDegrees, view.pitchDegrees],
+              'localReady': view?.pointingReady,
+              'receiver': service.latestState.toString(),
+              'packets': diagnosticStates,
+            });
+          },
         );
 
         // 3. Single Tap with the other hand immediately generates a Click
@@ -269,27 +348,49 @@ void main() {
           () => recordedStates.any((s) => s.isTriggerPressed && s.btnA),
           reason: 'free-hand tap click',
         );
-        // Wait for pulse release
-        await tester.pump(const Duration(milliseconds: 200));
+        // Wait for pulse release with a fresh observed posture.
+        await pointingFor(200);
         await _pumpUntil(
           tester,
-          () => !service.latestState.isTriggerPressed && !service.latestState.btnA,
+          () =>
+              !service.latestState.isTriggerPressed &&
+              !service.latestState.btnA,
           reason: 'tap click release',
         );
 
         // 4. Waiting 5 seconds aiming steadily triggers an automatic Click
         recordedStates.clear();
-        pushGyro(0.0, 0.0, 0.0, 700000);
-        await tester.pump(const Duration(milliseconds: 20));
-        for (var i = 0; i < 25; i++) {
-          await tester.pump(const Duration(milliseconds: 220));
-        }
+        await pointingFor(5500);
         await _pumpUntil(
           tester,
           () => recordedStates.any((s) => s.isTriggerPressed && s.btnA),
           reason: '5-second steady dwell auto-click',
         );
         await tester.pump(const Duration(milliseconds: 200));
+
+        // A flat phone suppresses local reticle and both tap/dwell clicks.
+        recordedStates.clear();
+        sensorUs += 20000;
+        testClockUs += 20000;
+        pushAccel(.1, .1, 9.81, sensorUs);
+        await tester.pump(const Duration(milliseconds: 40));
+        expect(
+          find.byKey(const Key(VrJoystickConstants.keyLaserPointingReticle)),
+          findsNothing,
+        );
+        await tester.tap(
+          find.byKey(const Key(VrJoystickConstants.keyLaserPointingSurface)),
+        );
+        await tester.pump(const Duration(milliseconds: 200));
+        expect(
+          recordedStates.where((s) => s.isTriggerPressed || s.btnA),
+          isEmpty,
+        );
+        await _pumpUntil(
+          tester,
+          () => !service.latestState.pointerPoseReady,
+          reason: 'flat posture revoked on receiver',
+        );
 
         // 5. Long Press with the other hand opens Wordsphere Search Sheet
         await tester.longPress(

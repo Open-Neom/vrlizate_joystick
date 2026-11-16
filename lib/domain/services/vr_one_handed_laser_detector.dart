@@ -1,9 +1,10 @@
-import 'dart:math' as math;
-
 import '../../utils/constants/vr_joystick_constants.dart';
+import 'vr_phone_pointer_posture.dart';
 
-/// Detects when the user transitions from a two-handed horizontal gamepad grip
-/// into a one-handed laser pointing posture (wand grip), and vice versa.
+/// Selects one-handed laser mode only after an upright landscape pointing
+/// posture is observed. Sideways motion/portrait roll never activates it.
+/// Legacy angle constructor fields remain source compatible; the physical
+/// geometry and freshness contract is defined by [posture].
 class VrOneHandedLaserDetector {
   VrOneHandedLaserDetector({
     this.autoSwitchEnabled = true,
@@ -14,8 +15,9 @@ class VrOneHandedLaserDetector {
     this.returnFlatGyMaxRatio =
         VrJoystickConstants.oneHandedReturnFlatGyMaxRatio,
     this.returnHoldUs = VrJoystickConstants.oneHandedReturnHoldUs,
-  });
+  }) : posture = VrPhonePointerPosture(holdUs: switchHoldUs);
 
+  final VrPhonePointerPosture posture;
   bool autoSwitchEnabled;
   final double lateralTiltMinRatio;
   final double pointingMinOmega;
@@ -24,7 +26,7 @@ class VrOneHandedLaserDetector {
   final double returnFlatGyMaxRatio;
   final int returnHoldUs;
 
-  int? _oneHandedCandidateSinceUs;
+  bool _waitForPostureExit = false;
   int? _twoHandedFlatCandidateSinceUs;
   bool _isOneHandedLaserActive = false;
 
@@ -35,15 +37,16 @@ class VrOneHandedLaserDetector {
   /// Synchronizes internal state when the user manually switches modes.
   void setModeActive(bool laserActive) {
     _isOneHandedLaserActive = laserActive;
-    _oneHandedCandidateSinceUs = null;
+    _waitForPostureExit = !laserActive;
     _twoHandedFlatCandidateSinceUs = null;
   }
 
   /// Resets all candidate timers and active state.
   void reset() {
     _isOneHandedLaserActive = false;
-    _oneHandedCandidateSinceUs = null;
+    _waitForPostureExit = false;
     _twoHandedFlatCandidateSinceUs = null;
+    posture.reset();
   }
 
   /// Evaluates gravity `(gx, gy, gz)` in $\text{m/s}^2$, gyroscope angular
@@ -60,56 +63,30 @@ class VrOneHandedLaserDetector {
     required bool dualTouchActive,
     required int timestampUs,
   }) {
-    if (!autoSwitchEnabled || dualTouchActive) {
-      _oneHandedCandidateSinceUs = null;
+    posture.updateGravity(gx, gy, gz, timestampUs);
+    if (!posture.isReadyAt(timestampUs)) {
+      _waitForPostureExit = false;
       return false;
     }
-
-    final gMag = math.sqrt(gx * gx + gy * gy + gz * gz);
-    if (!gMag.isFinite ||
-        gMag < VrJoystickConstants.oneHandedMinGravityMagnitude ||
-        gMag > VrJoystickConstants.oneHandedMaxGravityMagnitude) {
-      _oneHandedCandidateSinceUs = null;
+    // Rotation speed is not an activation gesture. Do not change layouts in
+    // the middle of a fast rotation, while playing, or after an explicit exit
+    // until the user has left and re-entered the pointing posture.
+    if (!autoSwitchEnabled ||
+        dualTouchActive ||
+        _isOneHandedLaserActive ||
+        _waitForPostureExit ||
+        !omegaMagnitude.isFinite ||
+        omegaMagnitude < 0 ||
+        omegaMagnitude > 2) {
       return false;
     }
-
-    // In landscape phone controller posture, holding with two hands keeps the
-    // long axis horizontal (`|gy| / gMag` near 0). Rotating the phone into a
-    // one-handed pointing grip (on its side or upright wand posture) raises
-    // `|gy| / gMag >= lateralTiltMinRatio` (~25°-35°+) while moving/aiming.
-    final lateralRatio = gy.abs() / gMag;
-    final forwardPitchRatio = gz.abs() / gMag;
-    final isOneHandedPosture =
-        lateralRatio >= lateralTiltMinRatio ||
-        (lateralRatio >= lateralTiltMinRatio * 0.75 &&
-            forwardPitchRatio >= lateralTiltMinRatio &&
-            omegaMagnitude >= pointingMinOmega);
-
-    if (!isOneHandedPosture) {
-      _oneHandedCandidateSinceUs = null;
-      return false;
-    }
-
-    if (_oneHandedCandidateSinceUs == null) {
-      if (omegaMagnitude < pointingMinOmega &&
-          lateralRatio < lateralTiltMinRatio * 1.25) {
-        return false;
-      }
-      _oneHandedCandidateSinceUs = timestampUs;
-      return false;
-    }
-
-    if (timestampUs - _oneHandedCandidateSinceUs! >= switchHoldUs) {
-      _isOneHandedLaserActive = true;
-      _oneHandedCandidateSinceUs = null;
-      _twoHandedFlatCandidateSinceUs = null;
-      return true;
-    }
-    return false;
+    _isOneHandedLaserActive = true;
+    _twoHandedFlatCandidateSinceUs = null;
+    return true;
   }
 
-  /// Returns `true` when a phone in one-handed laser mode is returned to a
-  /// stable, level two-handed landscape gamepad posture for [returnHoldUs].
+  /// Returns `true` after the phone leaves its pointing posture for
+  /// [returnHoldUs]. This does not infer how many hands hold the phone.
   bool shouldReturnToJoystick({
     required double gx,
     required double gy,
@@ -121,20 +98,8 @@ class VrOneHandedLaserDetector {
       return false;
     }
 
-    final gMag = math.sqrt(gx * gx + gy * gy + gz * gz);
-    if (!gMag.isFinite ||
-        gMag < VrJoystickConstants.oneHandedMinGravityMagnitude ||
-        gMag > VrJoystickConstants.oneHandedMaxGravityMagnitude) {
-      _twoHandedFlatCandidateSinceUs = null;
-      return false;
-    }
-
-    final gxRatio = gx.abs() / gMag;
-    final gyRatio = gy.abs() / gMag;
-    final isLevelLandscape =
-        gxRatio >= returnFlatGxRatio && gyRatio <= returnFlatGyMaxRatio;
-
-    if (!isLevelLandscape) {
+    posture.updateGravity(gx, gy, gz, timestampUs);
+    if (posture.isReadyAt(timestampUs)) {
       _twoHandedFlatCandidateSinceUs = null;
       return false;
     }
@@ -143,7 +108,7 @@ class VrOneHandedLaserDetector {
     if (timestampUs - _twoHandedFlatCandidateSinceUs! >= returnHoldUs) {
       _isOneHandedLaserActive = false;
       _twoHandedFlatCandidateSinceUs = null;
-      _oneHandedCandidateSinceUs = null;
+      _waitForPostureExit = false;
       return true;
     }
     return false;

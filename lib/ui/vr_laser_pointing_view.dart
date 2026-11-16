@@ -29,6 +29,7 @@ class VrLaserPointingView extends StatelessWidget {
     required this.onPanAimEnd,
     required this.onRecenter,
     required this.onReturnToJoystick,
+    this.pointingReady = false,
     this.activeSearchQuery,
     this.previewWidget,
   });
@@ -40,6 +41,7 @@ class VrLaserPointingView extends StatelessWidget {
   final double dwellProgress;
   final double dwellRemainingSeconds;
   final bool clickActive;
+  final bool pointingReady;
   final VoidCallback onTapClick;
   final VoidCallback onLongPressSearch;
   final ValueChanged<Offset> onPanAimDelta;
@@ -58,7 +60,9 @@ class VrLaserPointingView extends StatelessWidget {
         '${pitchDegrees.toStringAsFixed(1)}'
         '${VrJoystickTranslationConstants.laserDegreeSuffix}';
 
-    final dwellBadgeText = clickActive
+    final dwellBadgeText = !pointingReady
+        ? VrJoystickTranslationConstants.laserPostureInstruction
+        : clickActive
         ? VrJoystickTranslationConstants.laserClickTriggeredBadge
         : '${VrJoystickTranslationConstants.laserDwellCountdownPrefix}'
               '${dwellRemainingSeconds.toStringAsFixed(1)}'
@@ -67,7 +71,7 @@ class VrLaserPointingView extends StatelessWidget {
     return GestureDetector(
       key: const Key(VrJoystickConstants.keyLaserPointingSurface),
       behavior: HitTestBehavior.opaque,
-      onTap: onTapClick,
+      onTap: pointingReady ? onTapClick : null,
       onLongPress: onLongPressSearch,
       onPanUpdate: (details) => onPanAimDelta(details.delta),
       onPanEnd: (_) => onPanAimEnd(),
@@ -77,30 +81,25 @@ class VrLaserPointingView extends StatelessWidget {
           gradient: RadialGradient(
             center: Alignment.center,
             radius: 0.95,
-            colors: [
-              Color(0xFF0D2137),
-              Color(0xFF060B14),
-            ],
+            colors: [Color(0xFF0D2137), Color(0xFF060B14)],
           ),
         ),
         child: Stack(
           fit: StackFit.expand,
           children: [
             if (previewWidget != null)
-              Opacity(
-                opacity: 0.58,
-                child: previewWidget!,
+              Opacity(opacity: 0.58, child: previewWidget!),
+            if (pointingReady)
+              CustomPaint(
+                key: const Key(VrJoystickConstants.keyLaserPointingReticle),
+                painter: VrLaserAimReticlePainter(
+                  aimX: aimX,
+                  aimY: aimY,
+                  dwellProgress: dwellProgress,
+                  clickActive: clickActive,
+                ),
+                child: const SizedBox.expand(),
               ),
-            CustomPaint(
-              key: const Key(VrJoystickConstants.keyLaserPointingReticle),
-              painter: VrLaserAimReticlePainter(
-                aimX: aimX,
-                aimY: aimY,
-                dwellProgress: dwellProgress,
-                clickActive: clickActive,
-              ),
-              child: const SizedBox.expand(),
-            ),
             // Top bar: One-Handed Laser badge, angles, and quick controls
             Positioned(
               top: 8,
@@ -125,18 +124,22 @@ class VrLaserPointingView extends StatelessWidget {
                           borderRadius: BorderRadius.circular(999),
                           border: Border.all(color: const Color(0x8800E5FF)),
                         ),
-                        child: const Row(
+                        child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            Icon(
+                            const Icon(
                               Icons.bolt_rounded,
                               size: 14,
                               color: Color(0xFF00E5FF),
                             ),
-                            SizedBox(width: 5),
+                            const SizedBox(width: 5),
                             Text(
-                              VrJoystickTranslationConstants.laserOneHandBadge,
-                              style: TextStyle(
+                              pointingReady
+                                  ? VrJoystickTranslationConstants
+                                        .laserOneHandBadge
+                                  : VrJoystickTranslationConstants
+                                        .laserPosturePausedBadge,
+                              style: const TextStyle(
                                 color: Color(0xFF80D8FF),
                                 fontSize: 10.5,
                                 fontWeight: FontWeight.w800,
@@ -248,7 +251,7 @@ class VrLaserPointingView extends StatelessWidget {
                 children: [
                   if (activeSearchQuery != null &&
                       activeSearchQuery!.trim().isNotEmpty)
-                     Padding(
+                    Padding(
                       padding: const EdgeInsets.only(bottom: 6),
                       child: Container(
                         padding: const EdgeInsets.symmetric(
@@ -292,6 +295,7 @@ class VrLaserPointingView extends StatelessWidget {
                       children: [
                         Text(
                           dwellBadgeText,
+                          textAlign: TextAlign.center,
                           style: TextStyle(
                             color: clickActive
                                 ? const Color(0xFF69F0AE)

@@ -14,6 +14,8 @@ class RemoteControllerState {
   final bool btnY;
   final bool btnL;
   final bool btnR;
+  final bool btnZL;
+  final bool btnZR;
   final bool btnGrip;
   final bool stickClick;
   final double stickX;
@@ -32,6 +34,11 @@ class RemoteControllerState {
 
   /// True only while a finger owns the head-relative touch aiming pad.
   final bool laserSlideActive;
+
+  /// The sender qualified an upright landscape phone posture for this snapshot.
+  /// Missing, legacy, synthetic and neutralized states do not qualify. This
+  /// reports inclination only; it does not prove screen-facing or world heading.
+  final bool pointerPoseReady;
   final bool recenter;
 
   /// Desired visibility of the viewer's controller feedback, not a toggle edge.
@@ -94,6 +101,8 @@ class RemoteControllerState {
     this.btnY = false,
     this.btnL = false,
     this.btnR = false,
+    this.btnZL = false,
+    this.btnZR = false,
     this.btnGrip = false,
     this.stickClick = false,
     this.stickX = 0.0,
@@ -108,6 +117,7 @@ class RemoteControllerState {
     this.laserX = 0.0,
     this.laserY = 0.0,
     this.laserSlideActive = false,
+    this.pointerPoseReady = false,
     this.recenter = false,
     this.controllerVisible = true,
     this.steering = 0,
@@ -151,7 +161,7 @@ class RemoteControllerState {
   @override
   String toString() =>
       'RemoteControllerState(mode: ${mode.name}, stick: ($stickX, $stickY), '
-      'turn: $turnRate, pitch: $pitchRate, laser: ($laserX, $laserY), slide: $laserSlideActive, recenter: $recenter, range: $rangeMeters, '
-      'btnA: $btnA, btnB: $btnB, btnX: $btnX, btnY: $btnY, btnL: $btnL, btnR: $btnR, trigger: $isTriggerPressed, grip: $btnGrip, '
+      'turn: $turnRate, pitch: $pitchRate, laser: ($laserX, $laserY), slide: $laserSlideActive, poseReady: $pointerPoseReady, recenter: $recenter, range: $rangeMeters, '
+      'btnA: $btnA, btnB: $btnB, btnX: $btnX, btnY: $btnY, btnL: $btnL, btnR: $btnR, btnZL: $btnZL, btnZR: $btnZR, trigger: $isTriggerPressed, grip: $btnGrip, '
       'searchQuery: $searchQuery, searchSubmitted: $searchSubmitted, passthroughMix: $passthroughMix, passthroughActive: $passthroughActive, spatialHudVisible: $spatialHudVisible)';
 }

@@ -21,6 +21,7 @@ import '../../utils/enums/remote_controller_mode.dart';
 import '../../utils/enums/vr_controller_disconnect_reason.dart';
 import '../../utils/enums/vr_controller_wire_format.dart';
 import '../models/remote_controller_state.dart';
+import '../models/vr_controller_link_quality.dart';
 import '../models/vr_controller_mode_request.dart';
 import '../models/vr_controller_telemetry.dart';
 import '../models/vr_desktop_bridge_state.dart';
@@ -89,6 +90,7 @@ class VrRemoteControllerService {
   // held controls into its ACK. This permission belongs to the current link.
   int? _heldCaptionAckRevision;
   bool _modeControlSupported = false;
+  int? _lastModeSentUs;
   Uri? _castPreviewUri;
   VrDesktopBridgeState? _desktopBridgeState;
   int _desktopBridgeRevision = 0;
@@ -208,6 +210,8 @@ class VrRemoteControllerService {
       s.btnB ||
       s.btnL ||
       s.btnR ||
+      s.btnZL ||
+      s.btnZR ||
       s.isTriggerPressed ||
       s.isActionPressed;
 
@@ -260,37 +264,71 @@ class VrRemoteControllerService {
     }
 
     _ensureHandsFreeVirtualConnected();
+    _awaitReleaseAfterOverlay = false;
+    _voiceLocomotionTimer?.cancel();
+    _voiceLocomotionTimer = null;
+    _voiceLocomotionStopTimer?.cancel();
+    _voiceLocomotionStopTimer = null;
+    _voiceStickX = 0.0;
+    _voiceStickY = 0.0;
+    _voiceTurnRate = 0.0;
+
+    // Emit an explicit non-neutralized zero frame first so any consumer waiting
+    // for neutral stick after connection/menu close unlatches immediately.
+    if (!_systemOverlayCaptured) {
+      final zeroBase = _rawLatestState;
+      _publishState(
+        RemoteControllerState(
+          passthroughCommandRevision: zeroBase.passthroughCommandRevision,
+          orientation: zeroBase.orientation.clone(),
+          angularVelocity: zeroBase.angularVelocity.clone(),
+          mode: zeroBase.mode,
+          stickX: 0.0,
+          stickY: 0.0,
+          moveAtEdge: false,
+          turnRate: 0.0,
+          isNeutralized: false,
+          controllerVisible: zeroBase.controllerVisible,
+          rangeMeters: zeroBase.rangeMeters,
+          passthroughMix: zeroBase.passthroughMix,
+          passthroughActive: zeroBase.passthroughActive,
+          spatialHudVisible: zeroBase.spatialHudVisible,
+        ),
+        notifyRaw: false,
+      );
+    }
+
     _voiceStickX = sx;
     _voiceStickY = sy;
     _voiceTurnRate = tr;
-    _voiceLocomotionTimer?.cancel();
-    _voiceLocomotionStopTimer?.cancel();
 
     void emitStep() {
       if (_disposed) {
         stopVoiceLocomotion();
         return;
       }
-      if (_client == null) {
-        final base = _rawLatestState;
-        _publishState(
-          RemoteControllerState(
-            passthroughCommandRevision: base.passthroughCommandRevision,
-            orientation: base.orientation.clone(),
-            angularVelocity: base.angularVelocity.clone(),
-            mode: base.mode,
-            stickX: _voiceStickX,
-            stickY: _voiceStickY,
-            moveAtEdge: false,
-            turnRate: _voiceTurnRate,
-            controllerVisible: _localHandheldActive,
-            rangeMeters: base.rangeMeters,
-            passthroughMix: base.passthroughMix,
-            passthroughActive: base.passthroughActive,
-            spatialHudVisible: base.spatialHudVisible,
-          ),
-        );
-      }
+      final base = _rawLatestState;
+      _publishState(
+        RemoteControllerState(
+          passthroughCommandRevision: base.passthroughCommandRevision,
+          orientation: base.orientation.clone(),
+          angularVelocity: base.angularVelocity.clone(),
+          mode: base.mode,
+          stickX: _voiceStickX,
+          stickY: _voiceStickY,
+          moveAtEdge: false,
+          turnRate: _voiceTurnRate,
+          isNeutralized: false,
+          controllerVisible: _client != null
+              ? base.controllerVisible
+              : _localHandheldActive,
+          rangeMeters: base.rangeMeters,
+          passthroughMix: base.passthroughMix,
+          passthroughActive: base.passthroughActive,
+          spatialHudVisible: base.spatialHudVisible,
+        ),
+        notifyRaw: _client == null,
+      );
     }
 
     _voiceLocomotionStopTimer = Timer(duration, stopVoiceLocomotion);
@@ -301,9 +339,10 @@ class VrRemoteControllerService {
     );
   }
 
-  /// Immediately halts any active voice-driven locomotion and neutralizes sticks.
+  /// Immediately halts any active voice-driven locomotion and zeroes sticks.
   void stopVoiceLocomotion() {
-    final wasActive = _voiceLocomotionTimer != null ||
+    final wasActive =
+        _voiceLocomotionTimer != null ||
         _voiceLocomotionStopTimer != null ||
         _voiceStickX != 0.0 ||
         _voiceStickY != 0.0 ||
@@ -315,8 +354,29 @@ class VrRemoteControllerService {
     _voiceStickX = 0.0;
     _voiceStickY = 0.0;
     _voiceTurnRate = 0.0;
-    if (wasActive && !_disposed && _client == null) {
-      _publishState(_neutralizedSnapshotFrom(_rawLatestState));
+    if (wasActive && !_disposed) {
+      final base = _rawLatestState;
+      _publishState(
+        RemoteControllerState(
+          passthroughCommandRevision: base.passthroughCommandRevision,
+          orientation: base.orientation.clone(),
+          angularVelocity: base.angularVelocity.clone(),
+          mode: base.mode,
+          stickX: 0.0,
+          stickY: 0.0,
+          moveAtEdge: false,
+          turnRate: 0.0,
+          isNeutralized: false,
+          controllerVisible: _client != null
+              ? base.controllerVisible
+              : _localHandheldActive,
+          rangeMeters: base.rangeMeters,
+          passthroughMix: base.passthroughMix,
+          passthroughActive: base.passthroughActive,
+          spatialHudVisible: base.spatialHudVisible,
+        ),
+        notifyRaw: _client == null,
+      );
     }
   }
 
@@ -381,6 +441,7 @@ class VrRemoteControllerService {
         mode: src.mode,
         drivingPaused: src.mode == RemoteControllerMode.driving,
         isNeutralized: true,
+        pointerPoseReady: false,
         controllerVisible: src.controllerVisible,
         rangeMeters: src.rangeMeters,
         passthroughMix: src.passthroughMix,
@@ -419,6 +480,8 @@ class VrRemoteControllerService {
             next.turnRate.abs() > 0.14 ||
             next.btnA ||
             next.btnB ||
+            next.btnZL ||
+            next.btnZR ||
             next.isTriggerPressed ||
             next.isActionPressed;
         if (manualIntent) {
@@ -474,6 +537,7 @@ class VrRemoteControllerService {
       _stateController.add(_latestState);
     }
   }
+
   bool get isRunning => _isRunning;
   int? get serverPort => _server?.port;
   String? get serverUrl => _isRunning && _localIp != null
@@ -772,6 +836,7 @@ class VrRemoteControllerService {
   void _sendControllerMode() {
     final client = _client;
     if (client == null || _disposed) return;
+    _lastModeSentUs = _nowUs;
     try {
       client.add(jsonEncode(_modeRequest.toJson()));
     } catch (_) {
@@ -780,6 +845,13 @@ class VrRemoteControllerService {
         reason: VrControllerDisconnectReason.transportError,
       );
     }
+  }
+
+  void _maybeResendControllerMode(int nowUs) {
+    if (_acceptedModeRevision == _modeRequest.revision) return;
+    final last = _lastModeSentUs;
+    if (last != null && nowUs - last < 120000) return;
+    _sendControllerMode();
   }
 
   /// Writes the latest latency-compensated controller pose into [out].
@@ -1014,6 +1086,7 @@ class VrRemoteControllerService {
     _acceptedModeRevision = null;
     _heldCaptionAckRevision = null;
     _modeControlSupported = false;
+    _lastModeSentUs = null;
     _releaseInputs(controllerVisible: true);
     if (previous == null) _connectionController.add(true);
     if (previous != null) {
@@ -1116,6 +1189,7 @@ class VrRemoteControllerService {
             if (stickX.abs() < 0.001) stickX = 0.0;
             if (stickY.abs() < 0.001) stickY = 0.0;
 
+            _syncPredictorLatencyFromLink();
             _posePredictor.pushFrame(pose);
             _posePredictor.predictTo(_predictedOrientation);
             _lastSequence = pose.sequence;
@@ -1202,10 +1276,21 @@ class VrRemoteControllerService {
             json,
             VrJoystickConstants.fieldSequence,
           );
-          if (_lastSequence != null &&
-              (sequence == null || sequence <= _lastSequence!)) {
-            _rejectedStates++;
-            return;
+          if (_lastSequence != null) {
+            if (sequence == null) {
+              _rejectedStates++;
+              return;
+            }
+            if (sequence <= 0xFFFFFFFF && _lastSequence! <= 0xFFFFFFFF) {
+              final advance = (sequence - _lastSequence!) & 0xFFFFFFFF;
+              if (advance == 0 || advance >= 0x80000000) {
+                _rejectedStates++;
+                return;
+              }
+            } else if (sequence <= _lastSequence!) {
+              _rejectedStates++;
+              return;
+            }
           }
           final timestampUs = _optionalCounter(
             json,
@@ -1259,6 +1344,8 @@ class VrRemoteControllerService {
           final bool btnY = json[VrJoystickConstants.fieldBtnY] == true;
           final bool btnL = json[VrJoystickConstants.fieldBtnL] == true;
           final bool btnR = json[VrJoystickConstants.fieldBtnR] == true;
+          final bool btnZL = json[VrJoystickConstants.fieldBtnZL] == true;
+          final bool btnZR = json[VrJoystickConstants.fieldBtnZR] == true;
           final bool btnGrip = json[VrJoystickConstants.fieldBtnGrip] == true;
           final bool stickClick =
               json[VrJoystickConstants.fieldStickClick] == true;
@@ -1317,6 +1404,10 @@ class VrRemoteControllerService {
             VrJoystickConstants.fieldHostModeRevision,
           );
           if (!_acceptsModeState(json, hostModeRevision, mode)) {
+            if (hostModeRevision != null &&
+                hostModeRevision < _modeRequest.revision) {
+              _maybeResendControllerMode(now);
+            }
             _rejectedStates++;
             return;
           }
@@ -1335,6 +1426,7 @@ class VrRemoteControllerService {
             rangeMeters: rangeMeters,
             rangeSource: rangeMeters != null ? VrRangeSource.fixed : null,
           );
+          _syncPredictorLatencyFromLink();
           _posePredictor.pushFrame(pose);
           _posePredictor.predictTo(_predictedOrientation);
           _lastSequence = sequence ?? _lastSequence;
@@ -1396,6 +1488,8 @@ class VrRemoteControllerService {
             btnY: btnY,
             btnL: btnL,
             btnR: btnR,
+            btnZL: btnZL,
+            btnZR: btnZR,
             btnGrip: btnGrip,
             stickClick: stickClick,
             stickX: stickX.clamp(-1.0, 1.0),
@@ -1409,6 +1503,8 @@ class VrRemoteControllerService {
             laserY: laserY.clamp(-1.0, 1.0),
             laserSlideActive:
                 json[VrJoystickConstants.fieldLaserSlideActive] == true,
+            pointerPoseReady:
+                json[VrJoystickConstants.fieldPointerPoseReady] == true,
             recenter: recenter,
             controllerVisible:
                 json[VrJoystickConstants.fieldControllerVisible] as bool? ??
@@ -1564,6 +1660,8 @@ class VrRemoteControllerService {
       btnY: prev.btnY,
       btnL: prev.btnL,
       btnR: prev.btnR,
+      btnZL: prev.btnZL,
+      btnZR: prev.btnZR,
       btnGrip: prev.btnGrip,
       stickClick: prev.stickClick,
       stickX: prev.stickX,
@@ -1576,6 +1674,7 @@ class VrRemoteControllerService {
       laserX: prev.laserX,
       laserY: prev.laserY,
       laserSlideActive: prev.laserSlideActive,
+      pointerPoseReady: prev.pointerPoseReady,
       recenter: prev.recenter,
       controllerVisible: prev.controllerVisible,
       steering: prev.steering,
@@ -1609,15 +1708,31 @@ class VrRemoteControllerService {
     _publishState(_latestState);
   }
 
+  void _syncPredictorLatencyFromLink() {
+    final link = _client;
+    if (link is VrObservableControllerLink) {
+      final oneWayMs = link.linkQualityListenable.value.oneWayEstimateMs;
+      if (oneWayMs != null && oneWayMs.isFinite && oneWayMs > 0) {
+        _posePredictor.updateLatency(
+          Duration(microseconds: (oneWayMs * 1000.0).round().clamp(2000, 45000)),
+        );
+      }
+    }
+  }
+
   void _ingestCompactGamepadFrame(VrCompactGamepadFrame f, int now) {
     if (_wireFormat == VrControllerWireFormat.binaryPose) {
       _rejectedStates++;
       return;
     }
+    final ackSink = _client is VrCompactGamepadAckSink
+        ? _client! as VrCompactGamepadAckSink
+        : null;
     if (_lastSequence != null) {
       final advance = (f.sequence - _lastSequence!) & 0xFFFFFFFF;
       if (advance == 0 || advance >= 0x80000000) {
         _rejectedStates++;
+        ackSink?.acknowledgeCompactGamepadSequence(_lastSequence!);
         return;
       }
     }
@@ -1628,6 +1743,10 @@ class VrRemoteControllerService {
       _ => RemoteControllerMode.joystick,
     };
     if (!_acceptsCompactModeState(f, mode)) {
+      if (f.hostModeRevision != null &&
+          f.hostModeRevision! < _modeRequest.revision) {
+        _maybeResendControllerMode(now);
+      }
       _rejectedStates++;
       return;
     }
@@ -1645,6 +1764,7 @@ class VrRemoteControllerService {
       rangeMeters: range,
       rangeSource: range != null ? VrRangeSource.fixed : null,
     );
+    _syncPredictorLatencyFromLink();
     _posePredictor.pushFrame(pose);
     _posePredictor.predictTo(_predictedOrientation);
     _lastSequence = f.sequence;
@@ -1674,6 +1794,8 @@ class VrRemoteControllerService {
       btnY: f.btnY,
       btnL: f.btnL,
       btnR: f.btnR,
+      btnZL: f.btnZL,
+      btnZR: f.btnZR,
       btnGrip: f.btnGrip,
       stickClick: f.stickClick,
       stickX: f.stickX.clamp(-1.0, 1.0),
@@ -1686,6 +1808,7 @@ class VrRemoteControllerService {
       laserX: f.laserX.clamp(-1.0, 1.0),
       laserY: f.laserY.clamp(-1.0, 1.0),
       laserSlideActive: f.laserSlideActive,
+      pointerPoseReady: f.pointerPoseReady,
       recenter: f.recenter,
       controllerVisible: f.controllerVisible,
       steering: drivingActive ? f.steering.clamp(-1.0, 1.0) : 0.0,
@@ -1717,6 +1840,7 @@ class VrRemoteControllerService {
     );
     _lastAcceptedStateUs = now;
     _acceptedStates++;
+    ackSink?.acknowledgeCompactGamepadSequence(f.sequence);
     _publishState(_latestState);
   }
 
@@ -1742,6 +1866,8 @@ class VrRemoteControllerService {
         f.btnY ||
         f.btnL ||
         f.btnR ||
+        f.btnZL ||
+        f.btnZR ||
         f.btnGrip ||
         f.stickClick ||
         f.recenter) {
@@ -1829,6 +1955,7 @@ class VrRemoteControllerService {
       mode: _latestState.mode,
       drivingPaused: _latestState.mode == RemoteControllerMode.driving,
       isNeutralized: true,
+      pointerPoseReady: false,
       controllerVisible: controllerVisible ?? _latestState.controllerVisible,
       rangeMeters: _hasRangeTelemetry
           ? _latchedRangeMeters

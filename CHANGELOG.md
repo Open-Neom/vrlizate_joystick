@@ -1,6 +1,9 @@
 # Changelog
 
-## 1.0.0 - 2026-10-20
+## 1.0.0 - 2026-11-06
+
+- Require `vrlizate ^1.13.0` for the `edgeTurnEnabled` gamepad input API used by
+  digital controller adapters, and isolate optional radial gesture keyboard adapters so `vrlizate_joystick` builds standalone without private packages.
 
 - Add 5 open-source-inspired VR thumbstick & look enhancements:
   1. **Dynamic / Floating Touch Origin (`VirtualThumbstick.dynamicTouchOrigin`)**: inspired by `nipplejs` and `AirConsole`, anchors `(0, 0)` where the thumb lands on the stick when wearing a VR visor so off-center blind contact does not cause unintended movement or camera jumps.

@@ -36,11 +36,17 @@ class NesControllerLayout extends StatelessWidget {
     key: const ValueKey(VrJoystickConstants.keyNesSurface),
     color: const Color(0xFFC6C4BC),
     child: SafeArea(
+      minimum: MediaQuery.systemGestureInsetsOf(context),
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: LayoutBuilder(
           builder: (context, constraints) {
             final small = constraints.maxWidth < 650;
+            final spacious =
+                constraints.maxWidth >= 736 && constraints.maxHeight >= 376;
+            final target = spacious ? 56.0 : 48.0;
+            final gap = spacious ? 10.0 : 8.0;
+            final pairWidth = 2 * target + gap;
             Widget button(String id, String label, {bool red = false}) =>
                 VrNesButton(
                   key: ValueKey('${VrJoystickConstants.keyNesButtonPrefix}$id'),
@@ -53,7 +59,7 @@ class NesControllerLayout extends StatelessWidget {
             return Column(
               children: [
                 SizedBox(
-                  height: 40,
+                  height: target,
                   child: Row(
                     children: [
                       const Expanded(
@@ -71,7 +77,7 @@ class NesControllerLayout extends StatelessWidget {
                           ),
                         ),
                       ),
-                      const SizedBox(width: 8),
+                      SizedBox(width: gap),
                       TextButton.icon(
                         onPressed: onConnect,
                         icon: Icon(
@@ -92,19 +98,22 @@ class NesControllerLayout extends StatelessWidget {
                           ),
                         ),
                         style: TextButton.styleFrom(
+                          minimumSize: Size.square(target),
                           padding: const EdgeInsets.symmetric(horizontal: 4),
                         ),
                       ),
-                      const SizedBox(width: 6),
+                      SizedBox(width: gap),
                       SizedBox(
                         width: small ? 94 : 148,
+                        height: target,
                         child: button(
                           VrJoystickConstants.nesKeyHome,
                           VrJoystickConstants.nesLabelHome,
                         ),
                       ),
-                      SizedBox(
-                        width: 34,
+                      SizedBox(width: gap),
+                      SizedBox.square(
+                        dimension: target,
                         child: IconButton(
                           tooltip: VrJoystickTranslationConstants
                               .tooltipSettingsAndMode,
@@ -120,7 +129,7 @@ class NesControllerLayout extends StatelessWidget {
                     ],
                   ),
                 ),
-                const SizedBox(height: 10),
+                SizedBox(height: gap),
                 Expanded(
                   child: DecoratedBox(
                     decoration: BoxDecoration(
@@ -135,27 +144,29 @@ class NesControllerLayout extends StatelessWidget {
                       padding: EdgeInsets.all(small ? 10 : 16),
                       child: LayoutBuilder(
                         builder: (context, body) {
-                          final pad = math.min(
-                            body.maxHeight - 16,
-                            body.maxWidth * .33,
-                          );
-                          final actionSize = math.min(
-                            body.maxHeight * .52,
-                            body.maxWidth * .155,
+                          final middleWidth = math.min(
+                            math.max(pairWidth, body.maxWidth * .27),
+                            body.maxWidth * .44,
                           );
                           return Row(
                             children: [
                               Expanded(
                                 flex: 36,
-                                child: Center(
-                                  child: SizedBox.square(
-                                    dimension: math.max(48, pad),
-                                    child: VrNesDpad(onChanged: onDirection),
+                                child: LayoutBuilder(
+                                  builder: (context, pad) => Center(
+                                    child: SizedBox.square(
+                                      dimension: math.min(
+                                        pad.maxWidth,
+                                        math.max(target, pad.maxHeight - 16),
+                                      ),
+                                      child: VrNesDpad(onChanged: onDirection),
+                                    ),
                                   ),
                                 ),
                               ),
-                              Expanded(
-                                flex: 27,
+                              SizedBox(width: gap),
+                              SizedBox(
+                                width: middleWidth,
                                 child: Column(
                                   mainAxisAlignment: MainAxisAlignment.center,
                                   children: [
@@ -187,7 +198,7 @@ class NesControllerLayout extends StatelessWidget {
                                             ],
                                           ),
                                     ),
-                                    const SizedBox(height: 8),
+                                    SizedBox(height: gap),
                                     SizedBox(
                                       height: small ? 62 : 72,
                                       child: Row(
@@ -199,7 +210,7 @@ class NesControllerLayout extends StatelessWidget {
                                                   .nesLabelSelect,
                                             ),
                                           ),
-                                          const SizedBox(width: 7),
+                                          SizedBox(width: gap),
                                           Expanded(
                                             child: button(
                                               VrJoystickConstants.nesKeyStart,
@@ -224,33 +235,41 @@ class NesControllerLayout extends StatelessWidget {
                                   ],
                                 ),
                               ),
+                              SizedBox(width: gap),
                               Expanded(
                                 flex: 37,
-                                child: Center(
-                                  child: Row(
-                                    mainAxisAlignment:
-                                        MainAxisAlignment.spaceEvenly,
-                                    children: [
-                                      SizedBox(
-                                        width: actionSize,
-                                        height: actionSize + 30,
-                                        child: button(
-                                          VrJoystickConstants.actionKeyB,
-                                          VrJoystickConstants.actionKeyB,
-                                          red: true,
-                                        ),
+                                child: LayoutBuilder(
+                                  builder: (context, actions) {
+                                    final actionWidth = math.min(
+                                      math.max(
+                                        0.0,
+                                        (actions.maxWidth - gap) / 2,
                                       ),
-                                      SizedBox(
-                                        width: actionSize,
-                                        height: actionSize + 30,
-                                        child: button(
-                                          VrJoystickConstants.actionKeyA,
-                                          VrJoystickConstants.actionKeyA,
-                                          red: true,
-                                        ),
+                                      math.max(target, actions.maxHeight * .52),
+                                    );
+                                    Widget action(String id) => SizedBox(
+                                      width: actionWidth,
+                                      height: math.max(
+                                        target,
+                                        actionWidth + 30,
                                       ),
-                                    ],
-                                  ),
+                                      child: button(id, id, red: true),
+                                    );
+                                    return Center(
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          action(
+                                            VrJoystickConstants.actionKeyB,
+                                          ),
+                                          SizedBox(width: gap),
+                                          action(
+                                            VrJoystickConstants.actionKeyA,
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                  },
                                 ),
                               ),
                             ],

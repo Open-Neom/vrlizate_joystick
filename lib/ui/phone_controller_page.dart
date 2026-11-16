@@ -12,7 +12,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vector_math/vector_math.dart' as vm;
 import 'package:vrlizate/vrlizate.dart';
 import 'package:vrlizate_cast/vrlizate_cast.dart';
-import 'package:wordsphere/wordsphere.dart';
 
 import '../domain/models/vr_controller_connection_exception.dart';
 import '../domain/models/vr_controller_connection_target.dart';
@@ -74,12 +73,22 @@ class PhoneControllerPage extends StatefulWidget {
   final String? sessionToken;
   final VrTransportType transportType;
   final bool autoConnect;
+
+  /// Optional layout shortcut. Posture still gates the pointer when false.
+  /// Gravity cannot distinguish one hand from two, so normal gamepad users
+  /// keep their chosen Vista/Laser controls unless a host opts into this.
+  final bool autoSwitchToOneHandedLaser;
   final bool isChildRole;
 
   /// Enables the built-in LAN discovery, socket connection and manual Wi-Fi
   /// override. Set false for a controller supplied exclusively by an external
   /// transport such as Bluetooth LE through [linkConnector].
   final bool allowWifiConnection;
+
+  /// Marks an external [linkConnector] as a Wi-Fi LAN link (such as Estación
+  /// Faro UDP coordination) rather than Bluetooth LE, so transport icons,
+  /// status labels, and 120 Hz pacing never masquerade as BLE.
+  final bool externalLinkOverWifi;
 
   /// Optional provider-owned connection/authentication (for example BLE).
   /// On completion this page owns the link and closes it on disposal/retry.
@@ -101,6 +110,9 @@ class PhoneControllerPage extends StatefulWidget {
   /// expired token. Null identifies the external provider, as in [onConnected].
   final ValueChanged<VrControllerConnectionTarget?>? onSessionExpired;
 
+  /// Optional monotonic microsecond clock override for deterministic pacing tests.
+  final int Function()? monotonicMicroseconds;
+
   const PhoneControllerPage({
     super.key,
     this.initialMode = RemoteControllerMode.joystick,
@@ -109,13 +121,16 @@ class PhoneControllerPage extends StatefulWidget {
     this.sessionToken,
     this.transportType = VrTransportType.localSocket,
     this.autoConnect = false,
+    this.autoSwitchToOneHandedLaser = false,
     this.isChildRole = false,
     this.allowWifiConnection = true,
+    this.externalLinkOverWifi = false,
     this.linkConnector,
     this.connectionLabel,
     this.connectionTimeout = const Duration(seconds: 4),
     this.onConnected,
     this.onSessionExpired,
+    this.monotonicMicroseconds,
   });
 
   @override
@@ -290,7 +305,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   late RemoteControllerMode _activeMode;
   final VrSteeringController _steering = VrSteeringController();
-  final Stopwatch _controllerClock = Stopwatch()..start();
+  final Stopwatch _rawStopwatch = Stopwatch()..start();
+  int get _nowUs =>
+      widget.monotonicMicroseconds?.call() ?? _rawStopwatch.elapsedMicroseconds;
   VrMotionCapability _motionCapability = VrMotionCapability.checking;
   int? _lastMotionUs;
   int _lastDrivingTickUs = 0;
@@ -360,7 +377,16 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   bool _controllerVisible = true;
   final _shakeDetector = VrControllerShakeDetector();
   final _oneHandedLaserDetector = VrOneHandedLaserDetector();
+  bool _lastPaintedPointerPoseReady = false;
+  bool get _pointerPoseReady =>
+      _isForeground &&
+      !_settingsOpen &&
+      !_castDialogOpen &&
+      !_wordsphereSearchSheetVisible &&
+      _oneHandedLaserDetector.posture.isReadyAt(_nowUs);
+  bool get _laserInteractionReady => _pointerPoseReady && _controllerVisible;
   final _laserSteadyDwell = VrLaserSteadyDwellController();
+  final ValueNotifier<int> _laserAimViewRevision = ValueNotifier<int>(0);
   final _passthroughGesture = VrPassthroughSplitGestureController();
   final _visionService = VrJoystickCameraVisionService();
   VrTrackingMarkerConfiguration? _trackingMarkerConfiguration;
@@ -373,9 +399,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   bool _lastSentSpatialHudVisible = false;
   final TextEditingController _wordsphereTextController =
       TextEditingController();
-  late final WordsphereController _wordsphereController = WordsphereController(
-    textController: _wordsphereTextController,
-  );
+  late final VrSearchPadController _wordsphereController =
+      VrSearchPadController.create(textController: _wordsphereTextController);
   bool _wordsphereSearchSheetVisible = false;
   String? _activeSearchQuery;
   bool _searchSubmittedPulse = false;
@@ -393,6 +418,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   bool _btnYActive = false;
   bool _btnLActive = false;
   bool _btnRActive = false;
+  bool _btnZLActive = false;
+  bool _btnZRActive = false;
   bool _btnGripActive = false;
   bool _stickClickActive = false;
   Timer? _gripHoldTimer;
@@ -535,6 +562,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _btnYActive ||
       _btnLActive ||
       _btnRActive ||
+      _btnZLActive ||
+      _btnZRActive ||
       _btnGripActive;
 
   void _startShakeDetection() {
@@ -545,7 +574,13 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           ).listen(
             (AccelerometerEvent event) {
               if (!mounted || !_isForeground) return;
-              final nowUs = _controllerClock.elapsedMicroseconds;
+              final nowUs = _nowUs;
+              _oneHandedLaserDetector.posture.updateGravity(
+                event.x,
+                event.y,
+                event.z,
+                nowUs,
+              );
               // Driving tilt remains available when shake-to-hide is disabled.
               _steering.updateGravity(event.x, event.y, event.z, nowUs);
               _motionLook.updateGravity(event.x, event.y, event.z, nowUs);
@@ -555,16 +590,15 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 _visionService.updateImuGravity(event.x, event.y, event.z);
               }
               if (!_settingsOpen && !_castDialogOpen) {
-                final sensorTimeUs = event.timestamp.microsecondsSinceEpoch;
-                final effectiveUs = sensorTimeUs > 0 ? sensorTimeUs : nowUs;
-                if (_activeMode == RemoteControllerMode.joystick &&
+                if (widget.autoSwitchToOneHandedLaser &&
+                    _activeMode == RemoteControllerMode.joystick &&
                     _oneHandedLaserDetector.shouldSwitchToLaser(
                       gx: event.x,
                       gy: event.y,
                       gz: event.z,
                       omegaMagnitude: _lastGyroOmegaMag,
                       dualTouchActive: _hasDualHandTouchActive,
-                      timestampUs: effectiveUs,
+                      timestampUs: nowUs,
                     )) {
                   setState(() {
                     _releaseInputs();
@@ -573,6 +607,26 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                     _laserSteadyDwell.reset();
                     _status =
                         VrJoystickTranslationConstants.statusLaserOneHandReady;
+                  });
+                  _hapticMedium();
+                  _sendState(force: true);
+                  return;
+                }
+                if (widget.autoSwitchToOneHandedLaser &&
+                    _activeMode == RemoteControllerMode.laser &&
+                    !_wordsphereSearchSheetVisible &&
+                    _oneHandedLaserDetector.isOneHandedLaserActive &&
+                    _oneHandedLaserDetector.shouldReturnToJoystick(
+                      gx: event.x,
+                      gy: event.y,
+                      gz: event.z,
+                      timestampUs: nowUs,
+                    )) {
+                  setState(() {
+                    _releaseInputs();
+                    _surfaceEpoch++;
+                    _activeMode = RemoteControllerMode.joystick;
+                    _laserSteadyDwell.reset();
                   });
                   _hapticMedium();
                   _sendState(force: true);
@@ -589,6 +643,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               }
             },
             onError: (_) {
+              _oneHandedLaserDetector.posture.reset();
               _steering.clearGravity();
               _motionLook.reset();
             },
@@ -651,7 +706,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           }
           // Preference loading must never activate a gesture already held.
           if (!_motionLookEnabled) {
-            _motionLook.setActive(false, _controllerClock.elapsedMicroseconds);
+            _motionLook.setActive(false, _nowUs);
           }
         });
       }
@@ -808,7 +863,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 }
                 return;
               }
-              _lastMotionUs = _controllerClock.elapsedMicroseconds;
+              _lastMotionUs = _nowUs;
               _lastGyroOmegaMag = math.sqrt(
                 event.x * event.x + event.y * event.y + event.z * event.z,
               );
@@ -826,46 +881,48 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 );
               }
               if (_activeMode == RemoteControllerMode.laser) {
+                if (!_laserInteractionReady) {
+                  _lastGyroTime = event.timestamp;
+                  _angularVelocity.setZero();
+                  return;
+                }
                 final now = event.timestamp;
                 if (_lastGyroTime != null) {
                   final dt =
                       (now.difference(_lastGyroTime!).inMicroseconds) / 1e6;
                   if (dt > 0 && dt < 0.25) {
                     _angularVelocity.setValues(event.x, event.y, event.z);
+                    final posture = _oneHandedLaserDetector.posture;
                     final deltaYaw =
-                        (-event.z -
-                            event.y *
-                                VrJoystickConstants.laserGyroYawRollCoupling) *
-                        dt;
-                    final deltaPitch = event.x * dt;
-                    setState(() {
-                      _laserYaw = (_laserYaw + deltaYaw).clamp(
-                        -VrJoystickConstants.laserMaxYawRadians,
-                        VrJoystickConstants.laserMaxYawRadians,
-                      );
-                      _laserPitch = (_laserPitch + deltaPitch).clamp(
-                        -VrJoystickConstants.laserMaxPitchRadians,
-                        VrJoystickConstants.laserMaxPitchRadians,
-                      );
-                      _laserStickX =
-                          (_laserYaw / VrJoystickConstants.laserMaxYawRadians)
-                              .clamp(-1.0, 1.0);
-                      _laserStickY =
-                          (_laserPitch /
-                                  VrJoystickConstants.laserMaxPitchRadians)
-                              .clamp(-1.0, 1.0);
-                      _laserSlideNormX = _laserStickX;
-                      _laserSlideNormY = -_laserStickY;
-                      final qYaw = vm.Quaternion.axisAngle(
-                        vm.Vector3(0, 1, 0),
-                        -_laserYaw,
-                      );
-                      final qPitch = vm.Quaternion.axisAngle(
-                        vm.Vector3(1, 0, 0),
-                        _laserPitch,
-                      );
-                      _orientation = (qYaw * qPitch).normalized();
-                    });
+                        posture.yawRate(event.x, event.y, event.z) * dt;
+                    final deltaPitch = posture.pitchRate(event.x, event.y) * dt;
+                    _laserYaw = (_laserYaw + deltaYaw).clamp(
+                      -VrJoystickConstants.laserMaxYawRadians,
+                      VrJoystickConstants.laserMaxYawRadians,
+                    );
+                    _laserPitch = (_laserPitch + deltaPitch).clamp(
+                      -VrJoystickConstants.laserMaxPitchRadians,
+                      VrJoystickConstants.laserMaxPitchRadians,
+                    );
+                    _laserStickX =
+                        (_laserYaw / VrJoystickConstants.laserMaxYawRadians)
+                            .clamp(-1.0, 1.0);
+                    _laserStickY =
+                        (_laserPitch /
+                                VrJoystickConstants.laserMaxPitchRadians)
+                            .clamp(-1.0, 1.0);
+                    _laserSlideNormX = _laserStickX;
+                    _laserSlideNormY = -_laserStickY;
+                    final qYaw = vm.Quaternion.axisAngle(
+                      vm.Vector3(0, 1, 0),
+                      -_laserYaw,
+                    );
+                    final qPitch = vm.Quaternion.axisAngle(
+                      vm.Vector3(1, 0, 0),
+                      _laserPitch,
+                    );
+                    _orientation = (qYaw * qPitch).normalized();
+                    _laserAimViewRevision.value++;
                     _sendState();
                   }
                 }
@@ -936,7 +993,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         }
         if (_deviceHasHardwareGyroscope == false) {
           _motionLookEnabled = false;
-          _motionLook.setActive(false, _controllerClock.elapsedMicroseconds);
+          _motionLook.setActive(false, _nowUs);
         }
       });
       if (_deviceHasHardwareGyroscope == false) {
@@ -989,8 +1046,23 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _streamTimer?.cancel();
     _streamTimer = Timer.periodic(Duration(milliseconds: clamped), (_) {
       if (!mounted || !_isForeground) return;
-      final now = _controllerClock.elapsedMicroseconds;
+      final now = _nowUs;
       final dtSeconds = (now - _lastDrivingTickUs) / 1e6;
+      final pointerReady = _laserInteractionReady;
+      if (pointerReady != _lastPaintedPointerPoseReady) {
+        _lastPaintedPointerPoseReady = pointerReady;
+        setState(() {
+          if (!pointerReady) {
+            _laserSteadyDwell.reset();
+            if (_laserClickPulseTimer != null) {
+              _laserClickPulseTimer!.cancel();
+              _laserClickPulseTimer = null;
+              _triggerActive = false;
+              _btnAActive = false;
+            }
+          }
+        });
+      }
       if (_activeMode == RemoteControllerMode.joystick) {
         _updateJoystick(elapsed: dtSeconds, nowUs: now);
       }
@@ -1001,8 +1073,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       if (_activeMode == RemoteControllerMode.laser) {
         final triggered = _laserSteadyDwell.update(
           angularSpeedRadiansPerSec: _lastGyroOmegaMag,
-          dtSeconds: math.max(dtSeconds, 0.016),
-          paused: _wordsphereSearchSheetVisible || _settingsOpen,
+          dtSeconds: dtSeconds,
+          paused:
+              !pointerReady ||
+              _motionCapability != VrMotionCapability.available,
         );
         if (triggered) {
           _lastPaintedLaserDwellProgress = _laserSteadyDwell.progress;
@@ -1055,9 +1129,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _lookResponse.advance(elapsed);
     final move = _moveResponse.output;
     final look = _lookResponse.output;
-    final motion = _motionLook.sample(
-      nowUs ?? _controllerClock.elapsedMicroseconds,
-    );
+    final motion = _motionLook.sample(nowUs ?? _nowUs);
     if (_leftAutoWalkController.isAutoWalkLocked) {
       _stickX = 0.0;
       _stickY = math.max(move.y, 1.0);
@@ -1163,7 +1235,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       }
       _steering.setPaused(false);
       _steering.calibrate(_wheelOrientation);
-      _lastDrivingTickUs = _controllerClock.elapsedMicroseconds;
+      _lastDrivingTickUs = _nowUs;
     });
     _syncImuSubscriptions();
     _hapticClick();
@@ -1244,6 +1316,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   }
 
   void _pulseLaserClick() {
+    if (!_laserInteractionReady) return;
     _laserClickPulseTimer?.cancel();
     _laserSteadyDwell.reset();
     setState(() {
@@ -1365,6 +1438,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   String get _externalConnectionLabel =>
       widget.connectionLabel?.trim().isNotEmpty == true
       ? widget.connectionLabel!.trim()
+      : _isFaroWifiExternalLink
+      ? VrJoystickTranslationConstants.transportFaroWifi
       : widget.transportType == VrTransportType.bluetoothLe ||
             !widget.allowWifiConnection
       ? VrJoystickTranslationConstants.transportBluetoothLe
@@ -1377,12 +1452,28 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       widget.linkConnector != null &&
       (!widget.allowWifiConnection || !_useWifiOverride);
 
-  bool get _showsBluetooth => !widget.allowWifiConnection || _usesExternalLink;
+  bool get _isFaroWifiExternalLink =>
+      _usesExternalLink && widget.externalLinkOverWifi;
+
+  bool get _showsBluetooth =>
+      (!widget.allowWifiConnection || _usesExternalLink) &&
+      !_isFaroWifiExternalLink;
+
+  String get _primaryConnectButtonLabel {
+    if (_isFaroWifiExternalLink) {
+      return _isConnected
+          ? VrJoystickTranslationConstants.statusFaroWifiConnectedShort
+          : VrJoystickTranslationConstants.buttonConnectFaro;
+    }
+    return _isConnected
+        ? VrJoystickTranslationConstants.buttonReconnect
+        : VrJoystickTranslationConstants.buttonConnect;
+  }
 
   bool get _hasConnectionTarget =>
       _usesExternalLink || widget.allowWifiConnection;
 
-  String get _targetDescription => _showsBluetooth
+  String get _targetDescription => (_showsBluetooth || _isFaroWifiExternalLink)
       ? _externalConnectionLabel
       : '${_lastTarget?.host ?? widget.targetHost ?? _discoveredHost ?? VrJoystickTranslationConstants.statusUnpairedLabel}${VrJoystickConstants.colonSeparator}$_targetPort${VrJoystickConstants.spaceOpenParen}$_transportLabel${VrJoystickConstants.closeParen}';
 
@@ -1584,6 +1675,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           // Exceptions can contain the authenticated URL; don't echo secrets.
           _status = expired
               ? VrJoystickTranslationConstants.statusLinkExpired
+              : _isFaroWifiExternalLink
+              ? '${VrJoystickTranslationConstants.statusExternalConnectFailedPrefix}$_externalConnectionLabel${VrJoystickTranslationConstants.statusFaroConnectFailedSuffix}'
               : _usesExternalLink
               ? '${VrJoystickTranslationConstants.statusExternalConnectFailedPrefix}$_externalConnectionLabel${VrJoystickTranslationConstants.statusExternalConnectFailedSuffix}'
               : VrJoystickTranslationConstants.statusWifiConnectFailed;
@@ -1986,7 +2079,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         request.mode == RemoteControllerMode.driving &&
             (!_isForeground || preservePause),
       );
-      _lastDrivingTickUs = _controllerClock.elapsedMicroseconds;
+      _lastDrivingTickUs = _nowUs;
       _status = request.mode == RemoteControllerMode.driving
           ? VrJoystickTranslationConstants.statusDrivingReady
           : request.mode == RemoteControllerMode.nes
@@ -2133,7 +2226,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _lookResponse.reset();
     _motionLook.reset();
     _lookStickHeld = false;
-    _lastDrivingTickUs = _controllerClock.elapsedMicroseconds;
+    _lastDrivingTickUs = _nowUs;
     _drivingActionTimer?.cancel();
     _drivingActionTimer = null;
     _laserClickPulseTimer?.cancel();
@@ -2170,6 +2263,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _btnYActive = false;
     _btnLActive = false;
     _btnRActive = false;
+    _btnZLActive = false;
+    _btnZRActive = false;
     _btnGripActive = false;
     _stickClickActive = false;
     _searchSubmittedPulse = false;
@@ -2188,6 +2283,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _shakeDetector.reset();
+    _oneHandedLaserDetector.posture.reset();
     _isForeground = state == AppLifecycleState.resumed;
     _syncImuSubscriptions();
     if (!_isForeground) {
@@ -2328,7 +2424,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   void _onVisionServiceUpdated() {
     if (!mounted || !_isForeground || !_isConnected) return;
-    _sendVisionTelemetryMessageIfDue(_controllerClock.elapsedMicroseconds);
+    _sendVisionTelemetryMessageIfDue(_nowUs);
   }
 
   void _sendVisionTelemetryMessageIfDue(int nowUs) {
@@ -2363,6 +2459,94 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       final liveRangeMeters = measuredRangeMeters == null
           ? null
           : (measuredRangeMeters * 100.0).round() / 100.0;
+      final quality = _linkQuality;
+      final bridgeHz =
+          !_showsBluetooth && (_desktopBridge?.stationConnected ?? false)
+          ? _desktopBridge!.recommendedJoystickHz
+          : 60;
+      final customInterval = quality == null
+          ? (bridgeHz >= 120 ? const Duration(microseconds: 8000) : null)
+          : (quality.recommendedHz >= 120 || bridgeHz >= 120
+                ? const Duration(microseconds: 8000)
+                : (quality.isUdpUpgraded ||
+                          quality.transport ==
+                              VrControllerFastTransport.bleSinglePacket
+                      ? VrControllerStatePacer.socketAnalogInterval
+                      : VrControllerStatePacer.bleAnalogInterval));
+      final isBluetoothPacing =
+          (widget.transportType == VrTransportType.bluetoothLe &&
+              !_useWifiOverride &&
+              !_isFaroWifiExternalLink) &&
+          !(quality?.isUdpUpgraded ?? false);
+      if (ws is VrCompactGamepadCapableLink &&
+          (ws as VrCompactGamepadCapableLink).supportsCompactGamepadFrames &&
+          _activeSearchQuery == null &&
+          !_searchSubmittedPulse) {
+        final modeIdx = switch (wireModeName) {
+          VrJoystickConstants.modeLaser => 1,
+          VrJoystickConstants.modeDriving => 2,
+          VrJoystickConstants.modeNes => 3,
+          _ => 0,
+        };
+        final frame = VrCompactGamepadFrame(
+          sequence: _sequence,
+          senderTimestampMicroseconds: DateTime.now().microsecondsSinceEpoch,
+          orientation: _orientation.clone(),
+          angularVelocity: _angularVelocity.clone(),
+          stickX: isDriving ? 0.0 : _stickX,
+          stickY: isDriving ? 0.0 : _stickY,
+          lookX: isDriving ? 0.0 : _lookX,
+          lookY: isDriving ? 0.0 : _lookY,
+          laserX: _laserStickX,
+          laserY: _laserStickY,
+          steering: isDriving ? driving.steering : 0.0,
+          drivingTilt: isDriving ? _steering.drivingTiltAt(_nowUs) : 0.0,
+          throttle: isDriving ? driving.throttle : 0.0,
+          brake: isDriving ? driving.brake : 0.0,
+          modeIndex: modeIdx,
+          hostModeRevision: _hostModeSession.revision,
+          trigger: _triggerActive || (!isDriving && _btnRActive),
+          action: _actionActive || _btnBActive,
+          btnA: _btnAActive,
+          btnB: _btnBActive,
+          btnX: _btnXActive,
+          btnY: _btnYActive,
+          btnL: _btnLActive,
+          btnR: _btnRActive,
+          btnZL: _btnZLActive,
+          btnZR: _btnZRActive,
+          btnGrip: _btnGripActive,
+          stickClick: _stickClickActive,
+          recenter: _recenterTriggered,
+          moveAtEdge:
+              _activeMode == RemoteControllerMode.joystick && _moveAtEdge,
+          laserSlideActive: _isLaserSlideActive || isLaserOverBle,
+          controllerVisible: _controllerVisible,
+          pointerPoseReady: _pointerPoseReady,
+          drivingPaused: isDriving && driving.paused,
+          motionAvailable: _motionCapability == VrMotionCapability.available,
+          passthroughActive: _passthroughGesture.passthroughActive,
+          spatialHudVisible: _spatialHudVisible,
+          passthroughMix: _passthroughGesture.passthroughMix,
+          rangeMeters: liveRangeMeters,
+        );
+        if (!_statePacer.shouldSendCompact(
+          frame,
+          nowUs: _nowUs,
+          bluetooth: isBluetoothPacing,
+          force: force,
+          customAnalogInterval: customInterval,
+        )) {
+          return;
+        }
+        _sequence = (_sequence + 1) & 0xFFFFFFFF;
+        try {
+          ws.add(frame);
+        } catch (_) {
+          _onDisconnected(ws);
+        }
+        return;
+      }
       final state = <String, Object?>{
         VrJoystickConstants.fieldHostModeRevision: _hostModeSession.revision,
         VrJoystickConstants.fieldQx: _orientation.x,
@@ -2392,6 +2576,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         VrJoystickConstants.fieldAimY: _laserStickY,
         VrJoystickConstants.fieldRecenter: _recenterTriggered,
         VrJoystickConstants.fieldControllerVisible: _controllerVisible,
+        VrJoystickConstants.fieldPointerPoseReady: _pointerPoseReady,
         VrJoystickConstants.fieldRangeMeters: liveRangeMeters,
         VrJoystickConstants.fieldTrigger:
             _triggerActive || (!isDriving && _btnRActive),
@@ -2402,6 +2587,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         VrJoystickConstants.fieldBtnY: _btnYActive,
         VrJoystickConstants.fieldBtnL: _btnLActive,
         VrJoystickConstants.fieldBtnR: _btnRActive,
+        VrJoystickConstants.fieldBtnZL: _btnZLActive,
+        VrJoystickConstants.fieldBtnZR: _btnZRActive,
         VrJoystickConstants.fieldBtnGrip: _btnGripActive,
         VrJoystickConstants.fieldStickClick: _stickClickActive,
         VrJoystickConstants.fieldMode: wireModeName,
@@ -2411,7 +2598,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             : 0.0,
         VrJoystickConstants.fieldDrivingTilt:
             _activeMode == RemoteControllerMode.driving
-            ? _steering.drivingTiltAt(_controllerClock.elapsedMicroseconds)
+            ? _steering.drivingTiltAt(_nowUs)
             : 0.0,
         VrJoystickConstants.fieldThrottle:
             _activeMode == RemoteControllerMode.driving
@@ -2431,87 +2618,18 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             _passthroughGesture.passthroughActive,
         VrJoystickConstants.fieldSpatialHudVisible: _spatialHudVisible,
       };
-      final quality = _linkQuality;
-      final customInterval = quality == null
-          ? null
-          : (quality.recommendedHz >= 120
-                ? const Duration(microseconds: 8000)
-                : (quality.isUdpUpgraded ||
-                          quality.transport ==
-                              VrControllerFastTransport.bleSinglePacket
-                      ? VrControllerStatePacer.socketAnalogInterval
-                      : VrControllerStatePacer.bleAnalogInterval));
       if (!_statePacer.shouldSend(
         state,
-        nowUs: _controllerClock.elapsedMicroseconds,
-        bluetooth:
-            widget.transportType == VrTransportType.bluetoothLe &&
-            !_useWifiOverride &&
-            !(quality?.isUdpUpgraded ?? false),
+        nowUs: _nowUs,
+        bluetooth: isBluetoothPacing,
         force: force,
         customAnalogInterval: customInterval,
       )) {
         return;
       }
-      final seq = _sequence++;
+      final seq = _sequence;
+      _sequence = (_sequence + 1) & 0xFFFFFFFF;
       final tsUs = DateTime.now().microsecondsSinceEpoch;
-      if (ws is VrCompactGamepadCapableLink &&
-          (ws as VrCompactGamepadCapableLink).supportsCompactGamepadFrames &&
-          _activeSearchQuery == null &&
-          !_searchSubmittedPulse) {
-        final modeIdx = switch (wireModeName) {
-          VrJoystickConstants.modeLaser => 1,
-          VrJoystickConstants.modeDriving => 2,
-          VrJoystickConstants.modeNes => 3,
-          _ => 0,
-        };
-        final frame = VrCompactGamepadFrame(
-          sequence: seq,
-          senderTimestampMicroseconds: tsUs,
-          orientation: _orientation,
-          angularVelocity: _angularVelocity,
-          stickX: isDriving ? 0.0 : _stickX,
-          stickY: isDriving ? 0.0 : _stickY,
-          lookX: isDriving ? 0.0 : _lookX,
-          lookY: isDriving ? 0.0 : _lookY,
-          laserX: _laserStickX,
-          laserY: _laserStickY,
-          steering: isDriving ? driving.steering : 0.0,
-          drivingTilt: isDriving
-              ? _steering.drivingTiltAt(_controllerClock.elapsedMicroseconds)
-              : 0.0,
-          throttle: isDriving ? driving.throttle : 0.0,
-          brake: isDriving ? driving.brake : 0.0,
-          modeIndex: modeIdx,
-          hostModeRevision: _hostModeSession.revision,
-          trigger: _triggerActive || (!isDriving && _btnRActive),
-          action: _actionActive || _btnBActive,
-          btnA: _btnAActive,
-          btnB: _btnBActive,
-          btnX: _btnXActive,
-          btnY: _btnYActive,
-          btnL: _btnLActive,
-          btnR: _btnRActive,
-          btnGrip: _btnGripActive,
-          stickClick: _stickClickActive,
-          recenter: _recenterTriggered,
-          moveAtEdge: _activeMode == RemoteControllerMode.joystick && _moveAtEdge,
-          laserSlideActive: _isLaserSlideActive || isLaserOverBle,
-          controllerVisible: _controllerVisible,
-          drivingPaused: isDriving && driving.paused,
-          motionAvailable: _motionCapability == VrMotionCapability.available,
-          passthroughActive: _passthroughGesture.passthroughActive,
-          spatialHudVisible: _spatialHudVisible,
-          passthroughMix: _passthroughGesture.passthroughMix,
-          rangeMeters: liveRangeMeters,
-        );
-        try {
-          ws.add(frame);
-        } catch (_) {
-          _onDisconnected(ws);
-        }
-        return;
-      }
 
       final payload = jsonEncode({
         ...state,
@@ -2613,6 +2731,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
     _wordsphereController.dispose();
     _wordsphereTextController.dispose();
+    _laserAimViewRevision.dispose();
     _ipController.dispose();
     // The next/current route owns orientation. During replacement this dispose
     // runs after that route mounted and must not overwrite its portrait lock.
@@ -2835,7 +2954,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                             Row(
                               children: [
                                 Expanded(
-                                  child: _showsBluetooth
+                                  child:
+                                      (_showsBluetooth ||
+                                          _isFaroWifiExternalLink)
                                       ? Column(
                                           crossAxisAlignment:
                                               CrossAxisAlignment.start,
@@ -2850,7 +2971,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                                             ),
                                             const SizedBox(height: 2),
                                             Text(
-                                              _usesExternalLink
+                                              _isFaroWifiExternalLink
+                                                  ? VrJoystickTranslationConstants
+                                                        .settingsFaroWifiSubtitle
+                                                  : _usesExternalLink
                                                   ? VrJoystickTranslationConstants
                                                         .settingsDirectBleSubtitle
                                                   : _bluetoothPairingNotice,
@@ -2914,11 +3038,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                                     ),
                                   ),
                                   child: Text(
-                                    _isConnected
-                                        ? VrJoystickTranslationConstants
-                                              .buttonReconnect
-                                        : VrJoystickTranslationConstants
-                                              .buttonConnect,
+                                    _primaryConnectButtonLabel,
                                     style: const TextStyle(
                                       fontWeight: FontWeight.bold,
                                       fontSize: 11,
@@ -3834,11 +3954,22 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     );
   }
 
+  EdgeInsets _joystickSafeInsets(BuildContext context) {
+    final padding = MediaQuery.viewPaddingOf(context);
+    final gestures = MediaQuery.systemGestureInsetsOf(context);
+    return EdgeInsets.fromLTRB(
+      math.max(padding.left, gestures.left),
+      math.max(padding.top, gestures.top),
+      math.max(padding.right, gestures.right),
+      math.max(padding.bottom, gestures.bottom),
+    );
+  }
+
   @override
   Widget build(BuildContext context) => LayoutBuilder(
     builder: (context, constraints) {
       if (_activeMode == RemoteControllerMode.nes) {
-        final insets = MediaQuery.viewPaddingOf(context);
+        final insets = _joystickSafeInsets(context);
         if (_nesSize != null &&
             (_nesSize != constraints.biggest || _nesInsets != insets)) {
           _releaseInputs(send: true);
@@ -3847,7 +3978,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         _nesSize = constraints.biggest;
         _nesInsets = insets;
       } else if (_activeMode == RemoteControllerMode.joystick) {
-        final insets = MediaQuery.viewPaddingOf(context);
+        final insets = _joystickSafeInsets(context);
         if (_joystickSize != null &&
             (_joystickSize != constraints.biggest ||
                 _joystickInsets != insets)) {
@@ -4055,6 +4186,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 Icon(
                   _showsBluetooth
                       ? Icons.bluetooth_rounded
+                      : _isFaroWifiExternalLink
+                      ? (_isConnected
+                            ? Icons.wifi_tethering_rounded
+                            : Icons.portable_wifi_off_rounded)
                       : (_isConnected
                             ? Icons.wifi_rounded
                             : Icons.wifi_off_rounded),
@@ -4067,7 +4202,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 110),
                   child: Text(
-                    _showsBluetooth
+                    (_showsBluetooth || _isFaroWifiExternalLink)
                         ? _externalConnectionLabel
                         : (_lastTarget?.host ??
                               (_ipController.text.isNotEmpty
@@ -4100,9 +4235,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             ),
           ),
           child: Text(
-            _isConnected
-                ? VrJoystickTranslationConstants.buttonReconnect
-                : VrJoystickTranslationConstants.buttonConnect,
+            _primaryConnectButtonLabel,
             style: const TextStyle(
               fontWeight: FontWeight.bold,
               fontSize: 10.5,
@@ -4187,6 +4320,13 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   );
 
   Widget _buildDrivingLayout() {
+    final safeSize = MediaQuery.paddingOf(
+      context,
+    ).deflateSize(MediaQuery.sizeOf(context));
+    final spacious = safeSize.width >= 760 && safeSize.height >= 400;
+    final target = spacious ? 56.0 : 48.0;
+    final gap = spacious ? 10.0 : 8.0;
+
     Widget control(
       String letter,
       String caption,
@@ -4211,44 +4351,66 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         child: Column(
           children: [
             SizedBox(
-              height: 32,
+              height: target,
               child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   IconButton(
                     tooltip:
                         VrJoystickTranslationConstants.tooltipExitController,
                     padding: EdgeInsets.zero,
+                    constraints: BoxConstraints.tightFor(width: target),
                     icon: const Icon(Icons.arrow_back, color: Colors.white70),
                     onPressed: () => Navigator.of(context).maybePop(),
                   ),
-                  const Expanded(
+                  Expanded(
                     child: FittedBox(
                       fit: BoxFit.scaleDown,
                       alignment: Alignment.centerLeft,
-                      child: Text(
-                        VrJoystickTranslationConstants.drivingHeaderTitle,
-                        style: TextStyle(
-                          color: Color(0xFF00E5FF),
-                          fontWeight: FontWeight.bold,
-                          fontSize: 16,
-                        ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            VrJoystickTranslationConstants.drivingHeaderTitle,
+                            style: TextStyle(
+                              color: Color(0xFF00E5FF),
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                            ),
+                          ),
+                          _buildDrivingStatus(),
+                        ],
                       ),
                     ),
                   ),
+                  SizedBox(width: gap),
+                  TextButton(
+                    onPressed: _toggleDrivingPause,
+                    style: TextButton.styleFrom(
+                      minimumSize: Size.square(target),
+                    ),
+                    child: Text(
+                      _steering.state.paused
+                          ? VrJoystickTranslationConstants.drivingButtonContinue
+                          : VrJoystickTranslationConstants.drivingButtonPause,
+                    ),
+                  ),
+                  SizedBox(width: gap),
                   TextButton(
                     onPressed: _isConnecting || !_hasConnectionTarget
                         ? null
                         : _connect,
-                    child: Text(
-                      _isConnected
-                          ? VrJoystickTranslationConstants.buttonReconnect
-                          : VrJoystickTranslationConstants.buttonConnect,
+                    style: TextButton.styleFrom(
+                      minimumSize: Size.square(target),
                     ),
+                    child: Text(_primaryConnectButtonLabel),
                   ),
+                  SizedBox(width: gap),
                   IconButton(
                     tooltip:
                         VrJoystickTranslationConstants.tooltipSettingsAndMode,
                     padding: EdgeInsets.zero,
+                    constraints: BoxConstraints.tightFor(width: target),
                     icon: const Icon(
                       Icons.settings_rounded,
                       color: Color(0xFF00E5FF),
@@ -4258,7 +4420,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 ],
               ),
             ),
-            const SizedBox(height: 6),
+            SizedBox(height: gap),
             Expanded(
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -4282,13 +4444,13 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       onUp: () => setState(() => _brakePedalHeld = false),
                     ),
                   ),
-                  const SizedBox(width: 8),
+                  SizedBox(width: gap),
                   Expanded(
                     flex: 4,
                     child: Column(
                       children: [
                         SizedBox(
-                          height: 36,
+                          height: target,
                           child: Row(
                             children: [
                               Expanded(
@@ -4301,7 +4463,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                                   () => setState(() => _btnLActive = false),
                                 ),
                               ),
-                              const SizedBox(width: 6),
+                              SizedBox(width: gap),
                               Expanded(
                                 child: control(
                                   VrJoystickConstants.actionKeyR,
@@ -4341,7 +4503,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                           ),
                         ),
                         SizedBox(
-                          height: 34,
+                          height: target,
                           width: double.infinity,
                           child: _buildButton(
                             key: const ValueKey(
@@ -4364,7 +4526,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       ],
                     ),
                   ),
-                  const SizedBox(width: 8),
+                  SizedBox(width: gap),
                   Expanded(
                     flex: 3,
                     child: _buildButton(
@@ -4388,9 +4550,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 ],
               ),
             ),
-            const SizedBox(height: 6),
+            SizedBox(height: gap),
             SizedBox(
-              height: 36,
+              height: target,
               child: Row(
                 children: [
                   Expanded(
@@ -4409,7 +4571,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       () => setState(() => _btnXActive = false),
                     ),
                   ),
-                  const SizedBox(width: 6),
+                  SizedBox(width: gap),
                   Expanded(
                     child: control(
                       VrJoystickConstants.actionKeyY,
@@ -4419,7 +4581,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       () => setState(() => _btnYActive = false),
                     ),
                   ),
-                  const SizedBox(width: 6),
+                  SizedBox(width: gap),
                   Expanded(
                     child: control(
                       VrJoystickConstants.actionKeyA,
@@ -4429,7 +4591,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       () {},
                     ),
                   ),
-                  const SizedBox(width: 6),
+                  SizedBox(width: gap),
                   Expanded(
                     child: control(
                       VrJoystickConstants.actionKeyB,
@@ -4446,7 +4608,6 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 ],
               ),
             ),
-            SizedBox(height: 38, child: _buildDrivingStatus()),
           ],
         ),
       ),
@@ -4463,7 +4624,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         if (constraints.maxWidth <= 0 || constraints.maxHeight <= 0) {
           return const SizedBox.shrink();
         }
-        final insets = MediaQuery.viewPaddingOf(context);
+        final insets = _joystickSafeInsets(context);
         if (_joystickSize != constraints.biggest || _joystickInsets != insets) {
           _joystickSize = constraints.biggest;
           _joystickInsets = insets;
@@ -4471,6 +4632,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             constraints.biggest,
             leftInset: insets.left,
             rightInset: insets.right,
+            topInset: insets.top,
+            bottomInset: insets.bottom,
           );
           _joystickLocalPaths.clear();
           for (final control in VrJoystickControl.values) {
@@ -4492,33 +4655,6 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           Color textColor = Colors.white,
         }) {
           final rect = geometry[control];
-          var label = geometry.labels[control]!;
-          // A notch can cover an outer edge. Keep the full touch/paint band,
-          // but move its letter into the solid area that remains visible.
-          if (control == VrJoystickControl.y) {
-            label = Offset(
-              math.min(rect.right - 14, math.max(label.dx, insets.left + 16)),
-              label.dy,
-            );
-          } else if (control == VrJoystickControl.b) {
-            label = Offset(
-              math.max(
-                rect.left + 14,
-                math.min(label.dx, constraints.maxWidth - insets.right - 16),
-              ),
-              label.dy,
-            );
-          }
-          label = Offset(
-            label.dx,
-            label.dy.clamp(
-              insets.top + 20,
-              math.max(
-                insets.top + 20,
-                constraints.maxHeight - insets.bottom - 20,
-              ),
-            ),
-          );
           return Positioned.fromRect(
             rect: rect,
             child: _exclusivePassthroughControl(
@@ -4527,8 +4663,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   '${VrJoystickConstants.keyJoystickButtonPrefix}$title',
                 ),
                 path: _joystickLocalPaths[control]!,
-                labelPosition: label - rect.topLeft,
+                labelPosition: geometry.labels[control]! - rect.topLeft,
                 label: title,
+                actionLabel: subtitle,
                 active: active,
                 colors: colors,
                 textColor: textColor,
@@ -4575,7 +4712,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                     movement && _leftAutoWalkController.isAutoWalkLocked,
                 onPressed: (pressed) {
                   if (!_acceptsSurfaceInput(surfaceEpoch)) return;
-                  final nowUs = _controllerClock.elapsedMicroseconds;
+                  final nowUs = _nowUs;
                   if (movement) {
                     if (pressed) {
                       final doubleTapped = _leftAutoWalkController
@@ -4608,7 +4745,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 },
                 onChanged: (x, y) {
                   if (!_acceptsSurfaceInput(surfaceEpoch)) return;
-                  final nowUs = _controllerClock.elapsedMicroseconds;
+                  final nowUs = _nowUs;
                   if (movement) {
                     final justLocked = _leftAutoWalkController.onStickChanged(
                       x,
@@ -4652,7 +4789,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 },
                 onRelease: () {
                   if (!_acceptsSurfaceInput(surfaceEpoch)) return;
-                  final nowUs = _controllerClock.elapsedMicroseconds;
+                  final nowUs = _nowUs;
                   if (movement) {
                     final locked = _leftAutoWalkController.onPointerUp(
                       nowUs,
@@ -4704,7 +4841,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               pointerId: event.pointer,
               normX: normX,
               normY: normY,
-              timestampUs: _controllerClock.elapsedMicroseconds,
+              timestampUs: _nowUs,
             );
             if (changed) {
               _sendGesturePassthroughChange(previousMix);
@@ -4725,7 +4862,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               pointerId: event.pointer,
               normX: normX,
               normY: normY,
-              timestampUs: _controllerClock.elapsedMicroseconds,
+              timestampUs: _nowUs,
             );
             if (changed) {
               _sendGesturePassthroughChange(previousMix);
@@ -4743,7 +4880,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             final previousMix = _passthroughGesture.passthroughMix;
             final changed = _passthroughGesture.onPointerUpOrCancel(
               pointerId: event.pointer,
-              timestampUs: _controllerClock.elapsedMicroseconds,
+              timestampUs: _nowUs,
             );
             if (changed && mounted) {
               _sendGesturePassthroughChange(previousMix);
@@ -4757,7 +4894,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             final previousMix = _passthroughGesture.passthroughMix;
             final changed = _passthroughGesture.onPointerUpOrCancel(
               pointerId: event.pointer,
-              timestampUs: _controllerClock.elapsedMicroseconds,
+              timestampUs: _nowUs,
             );
             if (changed && mounted) {
               _sendGesturePassthroughChange(previousMix);
@@ -4807,6 +4944,24 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   () => _btnRActive = !driving || !_steering.state.paused,
                 ),
                 onUp: () => setState(() => _btnRActive = false),
+              ),
+              button(
+                VrJoystickControl.zl,
+                title: VrJoystickConstants.actionKeyZL,
+                subtitle: _actionLabel(VrJoystickConstants.actionKeyZL),
+                active: _btnZLActive,
+                colors: const [Color(0xFF18687E), Color(0xFF294D94)],
+                onDown: () => setState(() => _btnZLActive = true),
+                onUp: () => setState(() => _btnZLActive = false),
+              ),
+              button(
+                VrJoystickControl.zr,
+                title: VrJoystickConstants.actionKeyZR,
+                subtitle: _actionLabel(VrJoystickConstants.actionKeyZR),
+                active: _btnZRActive,
+                colors: const [Color(0xFFE06A23), Color(0xFFAF3A32)],
+                onDown: () => setState(() => _btnZRActive = true),
+                onUp: () => setState(() => _btnZRActive = false),
               ),
               button(
                 VrJoystickControl.y,
@@ -4899,7 +5054,15 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               ),
               Positioned.fromRect(
                 rect: geometry.previewPanel,
-                child: _buildJoystickCenter(),
+                child: _buildJoystickCenter(
+                  buttonHeight: math.max(
+                    44,
+                    geometry[VrJoystickControl.recenter].height,
+                  ),
+                  buttonGap:
+                      geometry.previewPanel.top -
+                      geometry[VrJoystickControl.recenter].bottom,
+                ),
               ),
               Positioned(
                 left: geometry.centerPanel.left + 6,
@@ -4973,7 +5136,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     ],
   );
 
-  Widget _buildJoystickCenter() => LayoutBuilder(
+  Widget _buildJoystickCenter({
+    required double buttonHeight,
+    required double buttonGap,
+  }) => LayoutBuilder(
     key: const ValueKey(VrJoystickConstants.keyControllerCenterPanel),
     builder: (context, constraints) => ValueListenableBuilder<Uri?>(
       valueListenable: _castPreview,
@@ -5021,7 +5187,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       ),
                     ),
             ),
-          if (constraints.maxHeight >= 76 && _canDisplayCastUi)
+          if (constraints.maxHeight >= buttonHeight + 30 + buttonGap &&
+              _canDisplayCastUi)
             SizedBox(
               height: 30,
               child: TextButton.icon(
@@ -5053,7 +5220,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 ),
               ),
             ),
-          if (constraints.maxHeight >= 112) ...[
+          if (constraints.maxHeight >= buttonHeight + 64 + buttonGap)
             _exclusivePassthroughControl(
               VrBreakthroughCurtainBar(
                 passthroughMix: _reportedPassthroughMix,
@@ -5069,57 +5236,55 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 onToggleSpatialHud: () => _toggleSpatialHud(),
               ),
             ),
-            const SizedBox(height: 4),
-          ],
+          if (constraints.maxHeight >= buttonHeight + 30 + buttonGap)
+            SizedBox(height: buttonGap),
           SizedBox(
-            height: math.min(44, constraints.maxHeight),
+            height: math.min(buttonHeight, constraints.maxHeight),
             child: Row(
               children: [
-                for (final laser in [false, true])
+                for (final laser in [false, true]) ...[
+                  if (laser) SizedBox(width: buttonGap),
                   Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 2),
-                      child: Semantics(
-                        selected: _rightLaser == laser,
-                        child: TextButton.icon(
-                          key: ValueKey(
+                    child: Semantics(
+                      selected: _rightLaser == laser,
+                      child: TextButton.icon(
+                        key: ValueKey(
+                          laser
+                              ? VrJoystickConstants.keyRightModeLaser
+                              : VrJoystickConstants.keyRightModeView,
+                        ),
+                        onPressed: () => _selectRightControl(laser),
+                        icon: Icon(
+                          laser
+                              ? Icons.near_me_outlined
+                              : Icons.swap_vert_rounded,
+                          size: 17,
+                        ),
+                        label: FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text(
                             laser
-                                ? VrJoystickConstants.keyRightModeLaser
-                                : VrJoystickConstants.keyRightModeView,
+                                ? VrJoystickTranslationConstants.rightModeLaser
+                                : VrJoystickTranslationConstants.rightModeView,
                           ),
-                          onPressed: () => _selectRightControl(laser),
-                          icon: Icon(
-                            laser
-                                ? Icons.near_me_outlined
-                                : Icons.swap_vert_rounded,
-                            size: 17,
-                          ),
-                          label: FittedBox(
-                            fit: BoxFit.scaleDown,
-                            child: Text(
-                              laser
-                                  ? VrJoystickTranslationConstants
-                                        .rightModeLaser
-                                  : VrJoystickTranslationConstants
-                                        .rightModeView,
-                            ),
-                          ),
-                          style: TextButton.styleFrom(
-                            minimumSize: const Size(0, 44),
-                            padding: const EdgeInsets.symmetric(horizontal: 6),
-                            foregroundColor: _rightLaser == laser
-                                ? const Color(0xFF080D1A)
-                                : Colors.white70,
-                            backgroundColor: _rightLaser == laser
-                                ? (laser
-                                      ? const Color(0xFF10B981)
-                                      : const Color(0xFFFF9100))
-                                : const Color(0xFF202A3B),
-                          ),
+                        ),
+                        style: TextButton.styleFrom(
+                          minimumSize: Size(0, buttonHeight),
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          padding: const EdgeInsets.symmetric(horizontal: 6),
+                          foregroundColor: _rightLaser == laser
+                              ? const Color(0xFF080D1A)
+                              : Colors.white70,
+                          backgroundColor: _rightLaser == laser
+                              ? (laser
+                                    ? const Color(0xFF10B981)
+                                    : const Color(0xFFFF9100))
+                              : const Color(0xFF202A3B),
                         ),
                       ),
                     ),
                   ),
+                ],
               ],
             ),
           ),
@@ -5212,6 +5377,21 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           '${VrJoystickConstants.actionKeyX}${VrJoystickConstants.centerGuideBullet}${_actionLabel(VrJoystickConstants.actionKeyX)}${VrJoystickConstants.centerGuideSpacer}${VrJoystickConstants.actionKeyY}${VrJoystickConstants.centerGuideBullet}${_actionLabel(VrJoystickConstants.actionKeyY)}',
           style: const TextStyle(color: Colors.white70, fontSize: 10),
         ),
+        if (_hostActions.containsKey(VrJoystickConstants.actionKeyZL) ||
+            _hostActions.containsKey(VrJoystickConstants.actionKeyZR)) ...[
+          const SizedBox(height: 4),
+          Text(
+            [
+              for (final key in const [
+                VrJoystickConstants.actionKeyZL,
+                VrJoystickConstants.actionKeyZR,
+              ])
+                if (_hostActions.containsKey(key))
+                  '$key · ${_actionLabel(key)}',
+            ].join(VrJoystickConstants.centerGuideSpacer),
+            style: const TextStyle(color: Colors.white70, fontSize: 10),
+          ),
+        ],
       ],
     ),
   );
@@ -5285,6 +5465,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   icon: Icon(
                     _showsBluetooth
                         ? Icons.bluetooth_rounded
+                        : _isFaroWifiExternalLink
+                        ? (_isConnected
+                              ? Icons.wifi_tethering_rounded
+                              : Icons.portable_wifi_off_rounded)
                         : (_isConnected ? Icons.wifi : Icons.wifi_off),
                     size: 17,
                     color: _isConnected ? Colors.greenAccent : Colors.amber,
@@ -5305,9 +5489,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                     child: FittedBox(
                       fit: BoxFit.scaleDown,
                       child: Text(
-                        _isConnected
-                            ? VrJoystickTranslationConstants.buttonReconnect
-                            : VrJoystickTranslationConstants.buttonConnect,
+                        _primaryConnectButtonLabel,
                         style: const TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.bold,
@@ -5355,49 +5537,31 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     ),
   );
 
-  Widget _buildDrivingStatus() => Row(
+  Widget _buildDrivingStatus() => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    mainAxisSize: MainAxisSize.min,
     children: [
-      Expanded(
-        child: FittedBox(
-          fit: BoxFit.scaleDown,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                _motionCapability == VrMotionCapability.checking
-                    ? VrJoystickTranslationConstants.drivingStatusCheckingGyro
-                    : _steering.motionAvailable
-                    ? VrJoystickTranslationConstants.drivingStatusTurnPhone
-                    : VrJoystickTranslationConstants.drivingStatusNoGyro,
-                style: TextStyle(
-                  color: _steering.motionAvailable
-                      ? const Color(0xFF10B981)
-                      : Colors.amber,
-                  fontSize: 11,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              Text(
-                _steering.state.paused
-                    ? VrJoystickTranslationConstants.drivingStatusPaused
-                    : _steering.motionAvailable
-                    ? VrJoystickTranslationConstants
-                          .drivingStatusTiltInstructions
-                    : VrJoystickTranslationConstants.drivingStatusPedalsOnly,
-                style: const TextStyle(color: Colors.white70, fontSize: 10),
-              ),
-            ],
-          ),
+      Text(
+        _motionCapability == VrMotionCapability.checking
+            ? VrJoystickTranslationConstants.drivingStatusCheckingGyro
+            : _steering.motionAvailable
+            ? VrJoystickTranslationConstants.drivingStatusTurnPhone
+            : VrJoystickTranslationConstants.drivingStatusNoGyro,
+        style: TextStyle(
+          color: _steering.motionAvailable
+              ? const Color(0xFF10B981)
+              : Colors.amber,
+          fontSize: 11,
+          fontWeight: FontWeight.bold,
         ),
       ),
-      const SizedBox(width: 8),
-      TextButton(
-        onPressed: _toggleDrivingPause,
-        child: Text(
-          _steering.state.paused
-              ? VrJoystickTranslationConstants.drivingButtonContinue
-              : VrJoystickTranslationConstants.drivingButtonPause,
-        ),
+      Text(
+        _steering.state.paused
+            ? VrJoystickTranslationConstants.drivingStatusPaused
+            : _steering.motionAvailable
+            ? VrJoystickTranslationConstants.drivingStatusTiltInstructions
+            : VrJoystickTranslationConstants.drivingStatusPedalsOnly,
+        style: const TextStyle(color: Colors.white70, fontSize: 10),
       ),
     ],
   );
@@ -5788,28 +5952,36 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     return ValueListenableBuilder<Uri?>(
       valueListenable: _castPreview,
       builder: (context, castUri, _) {
-        final yawDeg = _laserYaw * (180.0 / math.pi);
-        final pitchDeg = _laserPitch * (180.0 / math.pi);
         return Stack(
           fit: StackFit.expand,
           children: [
-            VrLaserPointingView(
-              aimX: _laserStickX,
-              aimY: _laserStickY,
-              yawDegrees: yawDeg,
-              pitchDegrees: pitchDeg,
-              dwellProgress: _laserSteadyDwell.progress,
-              dwellRemainingSeconds: _laserSteadyDwell.remainingSeconds,
-              clickActive: _triggerActive || _btnAActive,
-              activeSearchQuery: _activeSearchQuery,
-              previewWidget: castUri == null ? null : _castImagePanel(castUri),
-              onTapClick: _pulseLaserClick,
-              onLongPressSearch: _openWordsphereSearchSheet,
-              onPanAimDelta: _nudgeLaserAimByPan,
-              onPanAimEnd: () {},
-              onRecenter: _recenterController,
-              onReturnToJoystick: () =>
-                  _selectMode(RemoteControllerMode.joystick),
+            ValueListenableBuilder<int>(
+              valueListenable: _laserAimViewRevision,
+              builder: (context, _, _) {
+                final yawDeg = _laserYaw * (180.0 / math.pi);
+                final pitchDeg = _laserPitch * (180.0 / math.pi);
+                return VrLaserPointingView(
+                  aimX: _laserStickX,
+                  aimY: _laserStickY,
+                  yawDegrees: yawDeg,
+                  pitchDegrees: pitchDeg,
+                  dwellProgress: _laserSteadyDwell.progress,
+                  dwellRemainingSeconds: _laserSteadyDwell.remainingSeconds,
+                  clickActive: _triggerActive || _btnAActive,
+                  pointingReady: _laserInteractionReady,
+                  activeSearchQuery: _activeSearchQuery,
+                  previewWidget: castUri == null
+                      ? null
+                      : _castImagePanel(castUri),
+                  onTapClick: _pulseLaserClick,
+                  onLongPressSearch: _openWordsphereSearchSheet,
+                  onPanAimDelta: _nudgeLaserAimByPan,
+                  onPanAimEnd: () {},
+                  onRecenter: _recenterController,
+                  onReturnToJoystick: () =>
+                      _selectMode(RemoteControllerMode.joystick),
+                );
+              },
             ),
             if (_wordsphereSearchSheetVisible)
               Positioned.fill(
@@ -5937,9 +6109,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         child: Row(
           children: [
             Icon(
-              isWarning
-                  ? Icons.speed_rounded
-                  : Icons.tips_and_updates_outlined,
+              isWarning ? Icons.speed_rounded : Icons.tips_and_updates_outlined,
               size: 12,
               color: accent,
             ),

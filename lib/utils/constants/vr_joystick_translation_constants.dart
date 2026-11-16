@@ -1,4 +1,9 @@
 abstract final class VrJoystickTranslationConstants {
+  static const String laserPostureInstruction =
+      'Horizontal y erguido al costado: pantalla hacia el cuerpo, cámara hacia afuera';
+
+  static const String laserPosturePausedBadge = 'LÁSER EN PAUSA';
+
   // Exceptions & Validation Messages
   static const String errorPastePairingLink =
       'Pega el enlace de emparejamiento del visor.';
@@ -70,6 +75,7 @@ abstract final class VrJoystickTranslationConstants {
   static const String transportWifiDirectPending = 'Wi-Fi Direct (pendiente)';
   static const String transportDirectSocket = 'Conexión Directa (Socket)';
   static const String transportExternalLink = 'Enlace externo';
+  static const String transportFaroWifi = 'Faro Wi-Fi LAN';
   static const String transportPending = 'Transporte pendiente.';
 
   // Default Button Action Captions
@@ -202,6 +208,8 @@ abstract final class VrJoystickTranslationConstants {
       'No se pudo vincular por ';
   static const String statusExternalConnectFailedSuffix =
       '. Revisa el visor, los permisos y vuelve a intentar.';
+  static const String statusFaroConnectFailedSuffix =
+      ' por Wi-Fi LAN. Verifica que la Estación Faro esté activa en la misma red.';
   static const String statusWifiConnectFailed =
       'No se pudo vincular. Verifica el enlace del visor y la red Wi-Fi.';
   static const String statusDisconnectedManual =
@@ -251,10 +259,14 @@ abstract final class VrJoystickTranslationConstants {
       'CONEXIÓN CON EL VISOR PADRE';
   static const String settingsDirectBleSubtitle =
       'Vínculo directo Bluetooth con el visor.';
+  static const String settingsFaroWifiSubtitle =
+      'Enlace Wi-Fi LAN coordinado por Estación Faro (Bluetooth LE inactivo).';
   static const String settingsIpHint =
       '192.168.1.XX:8080 o vrlizate://pair?...';
   static const String buttonReconnect = 'RECONECTAR';
   static const String buttonConnect = 'CONECTAR';
+  static const String statusFaroWifiConnectedShort = 'FARO WI-FI · ACTIVO';
+  static const String buttonConnectFaro = 'CONECTAR FARO';
   static const String roleChildDirect = 'Mando Hijo (Enlace Directo)';
   static const String roleStandalone = 'Mando Independiente';
   static const String settingsGesturesSection = 'GESTOS Y RECENTRADO';
@@ -385,8 +397,7 @@ abstract final class VrJoystickTranslationConstants {
   static const String laserHorizontalLabelPrefix = 'H: ';
   static const String laserVerticalLabelPrefix = '°  ·  V: ';
   static const String laserDegreeSuffix = '°';
-  static const String wordsphereSheetTitle =
-      'BÚSQUEDA Y DESTINOS WORDSPHERE';
+  static const String wordsphereSheetTitle = 'BÚSQUEDA Y DESTINOS WORDSPHERE';
   static const String wordsphereSheetSubtitle =
       'Traza palabras en la esfera con tu mano libre o elige un destino de VRlizate';
   static const String wordsphereSearchFieldHint =
@@ -400,10 +411,8 @@ abstract final class VrJoystickTranslationConstants {
 
   // Dual-Thumb Center-to-Lateral Passthrough Split Gesture Strings
   static const String passthroughMixBadgePrefix = 'PASSTHROUGH MIX: ';
-  static const String passthroughCycleBadgePrefix =
-      'PASSTHROUGH 0→100→0%: ';
-  static const String passthroughFastSwipeBadgePrefix =
-      'PASSTHROUGH RÁPIDO: ';
+  static const String passthroughCycleBadgePrefix = 'PASSTHROUGH 0→100→0%: ';
+  static const String passthroughFastSwipeBadgePrefix = 'PASSTHROUGH RÁPIDO: ';
   static const String passthroughPercentSuffix = '%';
   static const String passthroughCenterArmedHint =
       'DESLIZA PULGARES A LOS LADOS · RÁPIDO: ON/OFF · LENTO: MIX 0→100→0%';

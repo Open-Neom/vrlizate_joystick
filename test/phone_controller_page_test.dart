@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -9,8 +10,6 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vrlizate/vrlizate.dart';
-import 'package:vrlizate_joystick/src/vr_controller_region.dart';
-import 'package:vrlizate_joystick/src/nes_controller_layout.dart';
 import 'package:vrlizate_joystick/vrlizate_joystick.dart';
 
 class _RealHttpOverrides extends HttpOverrides {}
@@ -454,6 +453,7 @@ void main() {
               size: size,
               padding: insets,
               viewPadding: insets,
+              systemGestureInsets: const EdgeInsets.fromLTRB(8, 12, 8, 20),
               textScaler: TextScaler.linear(textScale),
             ),
             child: child!,
@@ -468,11 +468,22 @@ void main() {
       final bounds = tester.getRect(
         find.byKey(const ValueKey('joystick_surface')),
       );
+      final safe = Rect.fromLTRB(
+        math.max(8, insets.left),
+        12,
+        size.width - math.max(8, insets.right),
+        size.height - 20,
+      );
+      final comfortable = safe.width >= 760 && safe.height >= 400;
+      final target = comfortable ? 56.0 : 48.0;
+      final gap = comfortable ? 10.0 : 8.0;
       final regions = <String, Rect>{};
       final paths = <String, Path>{};
       for (final key in [
         'joystick_button_L',
         'joystick_button_R',
+        'joystick_button_ZL',
+        'joystick_button_ZR',
         'joystick_button_Y',
         'joystick_button_X',
         'joystick_button_B',
@@ -493,10 +504,30 @@ void main() {
           final widget = tester.widget<VrControllerRegion>(finder);
           path = widget.path.shift(region.topLeft);
           expect(widget.path.contains(widget.labelPosition), isTrue);
-          expect(
-            tester.hitTestOnBinding(region.topLeft + widget.labelPosition).path,
-            isNotEmpty,
+          final core = Rect.fromCenter(
+            center: region.topLeft + widget.labelPosition,
+            width: target - .02,
+            height: target - .02,
           );
+          expect(safe.contains(core.topLeft), isTrue, reason: key);
+          expect(safe.contains(core.bottomRight), isTrue, reason: key);
+          final clip = tester.renderObject<RenderClipPath>(
+            find.descendant(of: finder, matching: find.byType(ClipPath)),
+          );
+          for (final point in [
+            core.topLeft,
+            core.topRight,
+            core.bottomLeft,
+            core.bottomRight,
+            core.center,
+          ]) {
+            expect(path.contains(point), isTrue, reason: '$key at $point');
+            expect(
+              tester.hitTestOnBinding(point).path.map((entry) => entry.target),
+              contains(clip),
+              reason: '$key at $point',
+            );
+          }
         } else if (key.endsWith('_stick')) {
           path = Path()..addOval(region);
         } else {
@@ -517,6 +548,22 @@ void main() {
         paths[key] = path;
       }
       expect(bounds, Offset.zero & size);
+      for (final (outer, trigger, side, bottom) in [
+        ('L', 'ZL', 'Y', 'X'),
+        ('R', 'ZR', 'B', 'A'),
+      ]) {
+        final first = regions['joystick_button_$outer']!;
+        final second = regions['joystick_button_$trigger']!;
+        final shoulderGap = (first.center.dx < second.center.dx
+            ? second.left - first.right
+            : first.left - second.right);
+        expect(shoulderGap, closeTo(gap, .01));
+        expect(
+          regions['joystick_button_$bottom']!.top -
+              regions['joystick_button_$side']!.bottom,
+          closeTo(gap, .01),
+        );
+      }
       for (final (key, point) in [
         ('L', const Offset(1, 1)),
         ('R', Offset(size.width - 1, 1)),
@@ -572,6 +619,19 @@ void main() {
       expect(
         regions['joystick_look_stick']!.width,
         lessThan(regions['joystick_move_stick']!.width),
+      );
+      final view = tester.getRect(
+        find.byKey(const ValueKey('right_mode_view')),
+      );
+      final laser = tester.getRect(
+        find.byKey(const ValueKey('right_mode_laser')),
+      );
+      expect(view.shortestSide, greaterThanOrEqualTo(target - .01));
+      expect(laser.shortestSide, greaterThanOrEqualTo(target - .01));
+      expect(laser.left - view.right, closeTo(gap, .01));
+      expect(
+        view.top - regions['joystick_recenter']!.bottom,
+        greaterThanOrEqualTo(gap - .01),
       );
       await _selectRightMode(tester, laser: true);
       expect(find.byKey(const ValueKey('joystick_look_stick')), findsNothing);
@@ -887,7 +947,7 @@ void main() {
     },
   );
 
-  testWidgets('inner shoulders send L/R while outer edges still send Y/B', (
+  testWidgets('four shoulders stay independent while the stick is held', (
     tester,
   ) async {
     await tester.binding.setSurfaceSize(const Size(800, 360));
@@ -916,21 +976,17 @@ void main() {
     final rightStick = tester.getRect(
       find.byKey(const ValueKey('joystick_look_stick')),
     );
-    final leftRegion = tester.getRect(
-      find.byKey(const ValueKey('joystick_button_L')),
-    );
-    final rightRegion = tester.getRect(
-      find.byKey(const ValueKey('joystick_button_R')),
-    );
     Set<String> active() => {
       if (service.latestState.btnL) 'L',
       if (service.latestState.btnR) 'R',
+      if (service.latestState.btnZL) 'ZL',
+      if (service.latestState.btnZR) 'ZR',
       if (service.latestState.btnY) 'Y',
       if (service.latestState.btnB) 'B',
     };
     for (final (key, point) in [
-      ('L', Offset(leftRegion.right - 6, leftStick.top - 6)),
-      ('R', Offset(rightRegion.left + 6, rightStick.top - 6)),
+      for (final key in ['L', 'R', 'ZL', 'ZR'])
+        (key, _buttonPoint(tester, key)),
       ('Y', Offset(1, leftStick.center.dy)),
       ('B', Offset(799, rightStick.center.dy)),
     ]) {
@@ -941,9 +997,25 @@ void main() {
         reason: '$key at $point',
       );
       expect(active(), {key}, reason: 'the region must emit exactly its owner');
+      if (key.startsWith('Z')) {
+        expect(service.latestState.isTriggerPressed, isFalse);
+      }
       await finger.up();
       await _pumpUntil(tester, () => active().isEmpty);
     }
+    final movement = await tester.startGesture(leftStick.center);
+    await movement.moveBy(Offset(0, -leftStick.height / 3));
+    final leftTrigger = await tester.startGesture(_buttonPoint(tester, 'ZL'));
+    final rightTrigger = await tester.startGesture(_buttonPoint(tester, 'ZR'));
+    await _pumpUntil(tester, () => active().length == 2);
+    expect(active(), {'ZL', 'ZR'});
+    await _pumpUntil(tester, () => service.latestState.stickY > 0);
+    await rightTrigger.cancel();
+    await _pumpUntil(tester, () => active().length == 1);
+    expect(active(), {'ZL'});
+    await leftTrigger.up();
+    await _pumpUntil(tester, () => active().isEmpty);
+    await movement.up();
     await tester.pumpWidget(const SizedBox.shrink());
     await _pumpUntil(tester, () => !service.isConnected);
     expect(tester.takeException(), isNull);
@@ -1033,6 +1105,7 @@ void main() {
     (const Size(480, 280), EdgeInsets.zero, 1.0),
     (const Size(640, 320), EdgeInsets.zero, 1.0),
     (const Size(800, 360), EdgeInsets.zero, 1.0),
+    (const Size(960, 540), EdgeInsets.zero, 1.0),
     (const Size(640, 360), const EdgeInsets.only(left: 48), 1.3),
     (const Size(640, 360), const EdgeInsets.only(right: 48), 1.3),
   ]) {
@@ -1082,6 +1155,10 @@ void main() {
           ),
         );
         await tester.pump();
+        final touchAreas = <Rect>[];
+        final spacious = size.width >= 760 && size.height >= 400;
+        final target = spacious ? 56.0 : 48.0;
+        final gap = spacious ? 10.0 : 8.0;
         for (final key in [
           for (final button in ['L', 'R', 'Y', 'X', 'B', 'A'])
             'joystick_button_$button',
@@ -1097,6 +1174,16 @@ void main() {
           expect(bounds.right, lessThanOrEqualTo(size.width - insets.right));
           expect(bounds.top, greaterThanOrEqualTo(0));
           expect(bounds.bottom, lessThanOrEqualTo(size.height));
+          if (key != 'driving_wheel') {
+            expect(bounds.shortestSide, greaterThanOrEqualTo(target));
+            expect(finder.hitTestable(), findsOneWidget);
+            touchAreas.add(bounds);
+          }
+        }
+        for (var i = 0; i < touchAreas.length; i++) {
+          for (final other in touchAreas.skip(i + 1)) {
+            expect(touchAreas[i].inflate(gap - .01).overlaps(other), isFalse);
+          }
         }
         final wheel = tester.getRect(
           find.byKey(const ValueKey('driving_wheel')),

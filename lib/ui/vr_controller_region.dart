@@ -12,6 +12,7 @@ class VrControllerRegion extends StatefulWidget {
     required this.path,
     required this.labelPosition,
     required this.label,
+    this.actionLabel,
     required this.colors,
     required this.active,
     required this.onDown,
@@ -21,6 +22,7 @@ class VrControllerRegion extends StatefulWidget {
   final Path path;
   final Offset labelPosition;
   final String label;
+  final String? actionLabel;
   final List<Color> colors;
   final bool active;
   final Color textColor;
@@ -53,7 +55,10 @@ class _VrControllerRegionState extends State<VrControllerRegion> {
       onPointerCancel: _release,
       child: Semantics(
         button: true,
-        label: widget.label,
+        label: widget.actionLabel == null || widget.actionLabel == widget.label
+            ? widget.label
+            : '${widget.label} · ${widget.actionLabel}',
+        excludeSemantics: true,
         onTap: () {
           if (_owner != null) return;
           widget.onDown();
