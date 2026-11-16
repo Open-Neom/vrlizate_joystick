@@ -1667,6 +1667,8 @@ class VrRemoteControllerService {
       stickX: prev.stickX,
       stickY: prev.stickY,
       moveAtEdge: prev.moveAtEdge,
+      dpadX: prev.dpadX,
+      dpadY: prev.dpadY,
       touchX: prev.touchX,
       touchY: prev.touchY,
       turnRate: prev.turnRate,

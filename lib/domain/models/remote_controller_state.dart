@@ -25,6 +25,8 @@ class RemoteControllerState {
   /// Null means a legacy sender/transport; hosts may then infer the rim from
   /// the conditioned stick magnitude. This is intent, not a turn command.
   final bool? moveAtEdge;
+  final double dpadX;
+  final double dpadY;
   final double touchX;
   final double touchY;
   final double turnRate;
@@ -108,6 +110,8 @@ class RemoteControllerState {
     this.stickX = 0.0,
     this.stickY = 0.0,
     this.moveAtEdge,
+    this.dpadX = 0.0,
+    this.dpadY = 0.0,
     this.touchX = 0.0,
     this.touchY = 0.0,
     double turnRate = 0.0,
