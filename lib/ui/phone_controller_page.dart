@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -975,15 +976,27 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   Future<void> _probeLocalHardwareCapabilities() async {
     try {
-      final raw = await _deviceCapabilitiesChannel.invokeMethod<Object?>(
-        'read',
-      );
-      if (!mounted || raw is! Map) return;
-      final hasGyro = raw['hasHardwareGyroscope'];
-      final hasCam3 = raw['hasConcurrentCameras'];
-      final ramMb = raw['totalRamMb'];
+      Map<Object?, Object?>? raw;
+      if (!kIsWeb) {
+        final directBridge = VrDirectDeviceBridge.instance;
+        final isDirectAndroid =
+            defaultTargetPlatform == TargetPlatform.android &&
+            directBridge.androidOpenXrHandlesSync() != null;
+        final isDirectIos =
+            defaultTargetPlatform == TargetPlatform.iOS && Platform.isIOS;
+        if (isDirectAndroid || isDirectIos) {
+          raw = directBridge.readDeviceCapabilitiesSync();
+        }
+      }
+      final channelRaw =
+          raw ?? await _deviceCapabilitiesChannel.invokeMethod<Object?>('read');
+      if (!mounted || channelRaw is! Map) return;
+      final map = channelRaw;
+      final hasGyro = map['hasHardwareGyroscope'];
+      final hasCam3 = map['hasConcurrentCameras'];
+      final ramMb = map['totalRamMb'];
       final lowRam =
-          raw['isLowRamDevice'] == true || (ramMb is int && ramMb <= 4200);
+          map['isLowRamDevice'] == true || (ramMb is int && ramMb <= 4200);
       setState(() {
         if (hasGyro is bool) _deviceHasHardwareGyroscope = hasGyro;
         if (hasCam3 is bool) _deviceHasConcurrentCameras = hasCam3;
