@@ -217,6 +217,21 @@ void main() {
       expect(parsed.actions.keys, ['B']);
       // Captions are plain text; rendering must never interpret markup.
       expect(parsed.actions['B'], '<b>Atrás</b>');
+
+      final bidiCleaned = VrControllerModeRequest.sanitizeActions({
+        'A': 'Saltar\u202E\nAhora',
+      });
+      expect(bidiCleaned['A'], 'Saltar Ahora');
+
+      expect(
+        VrControllerModeRequest.tryParse({
+          'type': VrControllerModeRequest.type,
+          'version': VrControllerModeRequest.version,
+          'mode': 'joystick',
+          'revision': double.infinity,
+        }),
+        isNull,
+      );
     });
   });
 }

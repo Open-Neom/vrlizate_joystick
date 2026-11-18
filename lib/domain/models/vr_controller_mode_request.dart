@@ -43,8 +43,13 @@ class VrControllerModeRequest {
   /// the field, a host that has none omits it. Empty means "use defaults".
   final Map<String, String> actions;
 
+  static final RegExp _disallowedControlOrBidi = RegExp(
+    r'[\x00-\x1F\x7F-\x9F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]',
+  );
+
   Map<String, Object> toJson() {
     if (mode == RemoteControllerMode.laser ||
+        !revision.isFinite ||
         revision < 0 ||
         revision > maxRevision) {
       throw ArgumentError(
@@ -74,7 +79,10 @@ class VrControllerModeRequest {
       if (key is! String || value is! String) continue;
       final upper = key.trim().toUpperCase();
       if (!actionKeys.contains(upper)) continue;
-      final text = value.trim();
+      final text = value
+          .replaceAll(_disallowedControlOrBidi, ' ')
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
       if (text.isEmpty) continue;
       out[upper] = text.length <= maxActionLength
           ? text
@@ -93,7 +101,10 @@ class VrControllerModeRequest {
         return null;
       }
       final revision = value[VrJoystickConstants.fieldRevision];
-      if (revision is! int || revision < 0 || revision > maxRevision) {
+      if (revision is! int ||
+          !revision.isFinite ||
+          revision < 0 ||
+          revision > maxRevision) {
         return null;
       }
       if (value.containsKey(VrJoystickConstants.fieldHorizontalLook) &&

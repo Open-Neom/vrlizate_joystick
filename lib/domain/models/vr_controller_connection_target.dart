@@ -1,14 +1,25 @@
-import 'package:vrlizate/vrlizate.dart';
+import 'package:vrlizate/core/network/vr_pairing_payload.dart';
 
 import '../../utils/constants/vr_joystick_constants.dart';
 import '../../utils/constants/vr_joystick_translation_constants.dart';
 
+final RegExp _pairingControlOrBidi = RegExp(
+  r'[\x00-\x1F\x7F-\x9F\u0085\u061C\u200B-\u200F\u2028-\u202E\u2060\u2066-\u2069\uFEFF]',
+);
+final RegExp _unsafeTargetHostChars = RegExp(r'[\s/\\@#?%\u3002\uFF0E\uFF61]');
+
 /// Accepts canonical invitations and Flutter's path-only delivery of /pair.
 /// Missing credentials or invalid enums are never repaired with defaults.
 VrPairingPayload? tryParseVrPairingUri(String? raw) {
-  if (raw == null || raw.trim().isEmpty) return null;
+  if (raw == null || _pairingControlOrBidi.hasMatch(raw)) return null;
+  final trimmed = raw.trim();
+  if (trimmed.isEmpty ||
+      trimmed.length > 2048 ||
+      _pairingControlOrBidi.hasMatch(trimmed)) {
+    return null;
+  }
   try {
-    var uri = Uri.parse(raw.trim());
+    var uri = Uri.parse(trimmed);
     if (uri.scheme.isEmpty &&
         !uri.hasAuthority &&
         (uri.path == VrJoystickConstants.pathPair ||
@@ -57,9 +68,21 @@ class VrControllerConnectionTarget {
     String? sessionToken,
     VrTransportType transportType = VrTransportType.localSocket,
   }) {
+    if (_pairingControlOrBidi.hasMatch(input)) {
+      throw const FormatException(
+        VrJoystickTranslationConstants.errorPastePairingLink,
+      );
+    }
     final raw = input.trim();
+    if (raw.isEmpty ||
+        raw.length > 2048 ||
+        _pairingControlOrBidi.hasMatch(raw)) {
+      throw const FormatException(
+        VrJoystickTranslationConstants.errorPastePairingLink,
+      );
+    }
     final uri = Uri.tryParse(raw);
-    if (uri == null || raw.isEmpty) {
+    if (uri == null) {
       throw const FormatException(
         VrJoystickTranslationConstants.errorPastePairingLink,
       );
@@ -89,12 +112,17 @@ class VrControllerConnectionTarget {
       final port = uri.hasPort ? uri.port : (secure ? 443 : 80);
       final tokens = uri.queryParametersAll[VrJoystickConstants.queryToken];
       if (uri.host.isEmpty ||
+          uri.host.length > 255 ||
+          _unsafeTargetHostChars.hasMatch(uri.host) ||
+          isBlockedVrPairingHost(uri.host) ||
           uri.userInfo.isNotEmpty ||
           uri.hasFragment ||
           (uri.path.isNotEmpty && uri.path != VrJoystickConstants.pathRoot) ||
           tokens == null ||
           tokens.length != 1 ||
           tokens.single.trim().isEmpty ||
+          tokens.single.length > 256 ||
+          _pairingControlOrBidi.hasMatch(tokens.single) ||
           port < 1 ||
           port > 65535) {
         throw const FormatException(
@@ -111,13 +139,18 @@ class VrControllerConnectionTarget {
 
     _requireSupportedTransport(transportType);
     if (raw != pairedHost ||
+        raw.length > 255 ||
+        _unsafeTargetHostChars.hasMatch(raw) ||
+        isBlockedVrPairingHost(raw) ||
         sessionToken == null ||
-        sessionToken.trim().isEmpty) {
+        sessionToken.trim().isEmpty ||
+        sessionToken.length > 256 ||
+        _pairingControlOrBidi.hasMatch(sessionToken)) {
       throw const FormatException(
         VrJoystickTranslationConstants.errorIpAloneDoesNotAuthorize,
       );
     }
-    if (pairedPort < 1 || pairedPort > 65535) {
+    if (!pairedPort.isFinite || pairedPort < 1 || pairedPort > 65535) {
       throw const FormatException(
         VrJoystickTranslationConstants.errorInvalidVisorPort,
       );

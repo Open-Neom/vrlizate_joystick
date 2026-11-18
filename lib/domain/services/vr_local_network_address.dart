@@ -8,6 +8,9 @@ import '../models/vr_local_address_candidate.dart';
 /// This is an advertisement policy, not proof of peer reachability: routers can
 /// still isolate clients. The WebSocket server remains bound to any IPv4.
 abstract final class VrLocalNetworkAddress {
+  static final _unsafeIfaceChars = RegExp(
+    r'[\x00-\x20\x7F-\x9F\u0085\u061C\u200B-\u200F\u2028-\u202E\u2060\u2066-\u2069\uFEFF]',
+  );
   static final _excluded = RegExp(
     VrJoystickConstants.excludedInterfacePattern,
   );
@@ -22,6 +25,11 @@ abstract final class VrLocalNetworkAddress {
     var selectedRank = 3;
     var selectedNumber = 0;
     for (final candidate in candidates) {
+      if (candidate.interfaceName.isEmpty ||
+          candidate.interfaceName.length > 64 ||
+          _unsafeIfaceChars.hasMatch(candidate.interfaceName)) {
+        continue;
+      }
       final name = candidate.interfaceName.toLowerCase();
       if (_excluded.hasMatch(name)) continue;
       final octets = candidate.address.split(VrJoystickConstants.dotSeparator);
@@ -35,8 +43,16 @@ abstract final class VrLocalNetworkAddress {
         bytes.add(value);
       }
       if (bytes.length != 4) continue;
-      final a = bytes[0], b = bytes[1];
-      if (a == 0 || a == 127 || a >= 224 || (a == 169 && b == 254)) {
+      final a = bytes[0], b = bytes[1], c = bytes[2];
+      if (a == 0 ||
+          a == 127 ||
+          a >= 224 ||
+          (a == 169 && b == 254) ||
+          (a == 100 && b == 100 && c == 100 && bytes[3] == 200) ||
+          (a == 192 && b == 0 && (c == 0 || c == 2)) ||
+          (a == 198 && (b == 18 || b == 19)) ||
+          (a == 198 && b == 51 && c == 100) ||
+          (a == 203 && b == 0 && c == 113)) {
         continue;
       }
       final privateLan =
@@ -46,7 +62,10 @@ abstract final class VrLocalNetworkAddress {
           : (_ethernet.hasMatch(name) ? 1 : 2);
       // Unknown interfaces only qualify when their address is private LAN.
       if (rank == 2 && !privateLan) continue;
-      final number = (a << 24) | (b << 16) | (bytes[2] << 8) | bytes[3];
+      // 53-bit JS-safe unsigned IPv4 integer (`* 0x1000000` instead of `<< 24`
+      // which overflows into negative 32-bit signed ints on Dart2JS when a >= 128).
+      final number =
+          a * 0x1000000 + b * 0x10000 + bytes[2] * 0x100 + bytes[3];
       final nameOrder = selectedName == null
           ? -1
           : name.compareTo(selectedName);
@@ -73,6 +92,11 @@ abstract final class VrLocalNetworkAddress {
     final scored = <({String address, String name, int rank, int number})>[];
     final seen = <String>{};
     for (final candidate in candidates) {
+      if (candidate.interfaceName.isEmpty ||
+          candidate.interfaceName.length > 64 ||
+          _unsafeIfaceChars.hasMatch(candidate.interfaceName)) {
+        continue;
+      }
       final name = candidate.interfaceName.toLowerCase();
       if (_excluded.hasMatch(name)) continue;
       final octets = candidate.address.split(VrJoystickConstants.dotSeparator);
@@ -86,8 +110,16 @@ abstract final class VrLocalNetworkAddress {
         bytes.add(value);
       }
       if (bytes.length != 4) continue;
-      final a = bytes[0], b = bytes[1];
-      if (a == 0 || a == 127 || a >= 224 || (a == 169 && b == 254)) {
+      final a = bytes[0], b = bytes[1], c = bytes[2];
+      if (a == 0 ||
+          a == 127 ||
+          a >= 224 ||
+          (a == 169 && b == 254) ||
+          (a == 100 && b == 100 && c == 100 && bytes[3] == 200) ||
+          (a == 192 && b == 0 && (c == 0 || c == 2)) ||
+          (a == 198 && (b == 18 || b == 19)) ||
+          (a == 198 && b == 51 && c == 100) ||
+          (a == 203 && b == 0 && c == 113)) {
         continue;
       }
       final privateLan =
@@ -97,7 +129,8 @@ abstract final class VrLocalNetworkAddress {
           : (_ethernet.hasMatch(name) ? 1 : 2);
       if (rank == 2 && !privateLan) continue;
       if (!seen.add(candidate.address)) continue;
-      final number = (a << 24) | (b << 16) | (bytes[2] << 8) | bytes[3];
+      final number =
+          a * 0x1000000 + b * 0x10000 + bytes[2] * 0x100 + bytes[3];
       scored.add((
         address: candidate.address,
         name: name,
