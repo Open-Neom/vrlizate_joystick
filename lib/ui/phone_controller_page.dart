@@ -2069,6 +2069,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     if (_acceptEffectivePassthroughState(data) ||
         _acceptDesktopBridgeState(data) ||
         _acceptCastOffer(data) ||
+        _acceptHapticPulse(data) ||
         _acceptAiInferRequest(data, socket, generation)) {
       return;
     }
@@ -3844,6 +3845,35 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       );
     } catch (_) {
       // Optional AI capability discovery must never disrupt controller input.
+    }
+  }
+
+  bool _acceptHapticPulse(Object? data) {
+    if (data is! String || data.length > 160) return false;
+    if (!data.contains(VrJoystickConstants.hapticPulseMessageType)) {
+      return false;
+    }
+    try {
+      final decoded = jsonDecode(data);
+      if (decoded is! Map<String, dynamic> ||
+          decoded[VrJoystickConstants.fieldType] !=
+              VrJoystickConstants.hapticPulseMessageType) {
+        return false;
+      }
+      if (!_hapticsEnabled) return true;
+      switch (decoded['p']) {
+        case 'heavy':
+          HapticFeedback.heavyImpact();
+          break;
+        case 'medium':
+          HapticFeedback.mediumImpact();
+          break;
+        default:
+          HapticFeedback.selectionClick();
+      }
+      return true;
+    } catch (_) {
+      return false;
     }
   }
 

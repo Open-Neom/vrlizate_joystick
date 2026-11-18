@@ -96,6 +96,7 @@ abstract final class VrJoystickConstants {
   static const String aiCapabilitiesMessageType = 'ai_caps';
   static const String aiInferRequestMessageType = 'ai_infer_req';
   static const String aiInferResponseMessageType = 'ai_infer_res';
+  static const String hapticPulseMessageType = 'haptic_pulse';
 
   // Action & Button Keys
   static const String actionKeyA = 'A';

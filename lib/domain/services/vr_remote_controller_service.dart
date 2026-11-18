@@ -761,6 +761,40 @@ class VrRemoteControllerService {
     }
   }
 
+  int _lastRemoteHapticSentUs = -100000;
+
+  /// Sends a lightweight tactile detent (`'tick'`, `'medium'`, or `'heavy'`)
+  /// over the authenticated `VrControllerLink` to the paired handheld Joystick
+  /// smartphone in `2D`/`3D` mode, throttled to protect 120 Hz link budgets.
+  ///
+  /// Returns `true` when dispatched to a remote joystick peer.
+  bool sendHapticPulse(String pattern, {bool throttle = true}) {
+    final client = _client;
+    if (_disposed || client == null || _localHandheldActive) return false;
+    final nowUs = _nowUs;
+    if (throttle && pattern == 'tick' && (nowUs - _lastRemoteHapticSentUs) < 14000) {
+      return true;
+    }
+    _lastRemoteHapticSentUs = nowUs;
+    final clean = switch (pattern) {
+      'medium' => 'medium',
+      'heavy' => 'heavy',
+      _ => 'tick',
+    };
+    try {
+      client.add(
+        jsonEncode({
+          VrJoystickConstants.fieldType:
+              VrJoystickConstants.hapticPulseMessageType,
+          'p': clean,
+        }),
+      );
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   void _clearPeerAiState() {
     _peerAiSupported = false;
     _peerAiEngineLabel = null;
