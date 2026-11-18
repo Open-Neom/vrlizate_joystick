@@ -94,6 +94,12 @@ class VrRemoteControllerService {
   Uri? _castPreviewUri;
   VrDesktopBridgeState? _desktopBridgeState;
   int _desktopBridgeRevision = 0;
+  bool _peerAiSupported = false;
+  String? _peerAiEngineLabel;
+  int? _peerAiRamMb;
+  int _aiReqCounter = 0;
+  final Map<String, Completer<({String text, String engine})?>>
+  _pendingAiRequests = <String, Completer<({String text, String engine})?>>{};
   double? _effectivePassthroughMix;
   bool _effectiveCameraEnabled = false;
   int _effectivePassthroughRevision = 0;
@@ -693,6 +699,83 @@ class VrRemoteControllerService {
     _sendCastPreview(message);
   }
 
+  /// True when a paired secondary smartphone (`2D` Joystick) has advertised
+  /// sufficient hardware/model capability to run embedded AI inference on
+  /// behalf of this Visor.
+  bool get peerSupportsEmbeddedAi =>
+      _client != null && !_localHandheldActive && _peerAiSupported;
+
+  String? get peerAiEngineLabel => _peerAiEngineLabel;
+  int? get peerAiRamMb => _peerAiRamMb;
+
+  /// Offloads a bounded AI prompt (`<= 920 B` UTF-8 wire frame) to the paired
+  /// Joystick smartphone over the active authenticated controller link.
+  Future<({String text, String engine})?> requestPeerAiInference({
+    required String prompt,
+    String? systemPrompt,
+    int maxTokens = 160,
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    final client = _client;
+    if (_disposed ||
+        client == null ||
+        _localHandheldActive ||
+        !_peerAiSupported ||
+        _pendingAiRequests.length >= 6) {
+      return null;
+    }
+    var cleanPrompt = prompt.trim();
+    if (cleanPrompt.isEmpty) return null;
+    var cleanSys = systemPrompt?.trim();
+    if (cleanSys != null && cleanSys.length > 260) {
+      cleanSys = cleanSys.substring(0, 260);
+    }
+    while (utf8.encode(cleanPrompt).length > 520 && cleanPrompt.length > 40) {
+      cleanPrompt = cleanPrompt.substring(
+        0,
+        (cleanPrompt.length * 0.85).floor(),
+      );
+    }
+    final reqId = 'ai_${++_aiReqCounter}';
+    final completer = Completer<({String text, String engine})?>();
+    _pendingAiRequests[reqId] = completer;
+    try {
+      final wire = jsonEncode({
+        VrJoystickConstants.fieldType:
+            VrJoystickConstants.aiInferRequestMessageType,
+        'reqId': reqId,
+        'prompt': cleanPrompt,
+        if (cleanSys != null && cleanSys.isNotEmpty) 'sys': cleanSys,
+        'maxTok': maxTokens.clamp(32, 320),
+      });
+      if (utf8.encode(wire).length > _maxCastPreviewMessageBytes) {
+        _pendingAiRequests.remove(reqId);
+        return null;
+      }
+      client.add(wire);
+      return await completer.future.timeout(timeout, onTimeout: () => null);
+    } catch (_) {
+      return null;
+    } finally {
+      _pendingAiRequests.remove(reqId);
+    }
+  }
+
+  void _clearPeerAiState() {
+    _peerAiSupported = false;
+    _peerAiEngineLabel = null;
+    _peerAiRamMb = null;
+    if (_pendingAiRequests.isNotEmpty) {
+      final pending = List<Completer<({String text, String engine})?>>.of(
+        _pendingAiRequests.values,
+      );
+      _pendingAiRequests.clear();
+      for (final c in pending) {
+        if (!c.isCompleted) c.complete(null);
+      }
+    }
+  }
+
   static String _castPreviewMessage(Uri? uri) => jsonEncode({
     VrJoystickConstants.fieldType: VrJoystickConstants.castPreviewMessageType,
     VrJoystickConstants.fieldUrl: uri?.toString(),
@@ -1069,6 +1152,7 @@ class VrRemoteControllerService {
 
   void _handleControllerLink(VrControllerLink socket) {
     _trackingMarker = null;
+    _clearPeerAiState();
     // One controller owns the input state. A reconnect replaces it atomically;
     // late onDone/onError callbacks from the old socket cannot clear the new one.
     final previous = _client;
@@ -1225,10 +1309,6 @@ class VrRemoteControllerService {
           }
           return;
         }
-        if (_wireFormat == VrControllerWireFormat.binaryPose) {
-          _rejectedStates++;
-          return;
-        }
         try {
           final decoded = jsonDecode(data as String);
           if (decoded is! Map<String, dynamic>) {
@@ -1270,6 +1350,40 @@ class VrRemoteControllerService {
               VrJoystickConstants.visionTelemetryMessageType) {
             _ingestVisionTelemetry(json);
             _emitWithLatchedPassthrough();
+            return;
+          }
+          if (json[VrJoystickConstants.fieldType] ==
+              VrJoystickConstants.aiCapabilitiesMessageType) {
+            _peerAiSupported = json['supported'] == true;
+            final eng = json['engine'];
+            _peerAiEngineLabel = eng is String && eng.length <= 80 ? eng : null;
+            final ram = json['ramMb'];
+            _peerAiRamMb = ram is int && ram > 0 ? ram : null;
+            return;
+          }
+          if (json[VrJoystickConstants.fieldType] ==
+              VrJoystickConstants.aiInferResponseMessageType) {
+            final reqId = json['reqId'];
+            if (reqId is String) {
+              final pending = _pendingAiRequests.remove(reqId);
+              if (pending != null && !pending.isCompleted) {
+                final ok = json['ok'] == true;
+                final txt = json['text'];
+                final eng = json['engine'];
+                if (ok && txt is String && txt.trim().isNotEmpty) {
+                  pending.complete((
+                    text: txt.trim(),
+                    engine: eng is String ? eng : 'peer_saia',
+                  ));
+                } else {
+                  pending.complete(null);
+                }
+              }
+            }
+            return;
+          }
+          if (_wireFormat == VrControllerWireFormat.binaryPose) {
+            _rejectedStates++;
             return;
           }
           final sequence = _optionalCounter(
@@ -1947,6 +2061,7 @@ class VrRemoteControllerService {
     _effectivePassthroughTimer?.cancel();
     _effectivePassthroughTimer = null;
     _trackingMarker = null;
+    _clearPeerAiState();
     _lastDisconnectReason = reason;
     _client = null;
     _heldCaptionAckRevision = null;

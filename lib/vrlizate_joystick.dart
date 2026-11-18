@@ -13,6 +13,7 @@ export 'domain/models/vr_controller_link_quality.dart';
 export 'domain/models/vr_controller_mode_request.dart';
 export 'domain/models/vr_controller_telemetry.dart';
 export 'domain/models/vr_desktop_bridge_state.dart';
+export 'domain/models/vr_joystick_ai_coprocessor.dart';
 export 'domain/models/vr_joystick_geometry.dart';
 export 'domain/models/vr_local_address_candidate.dart';
 export 'domain/models/vr_pairing_camera_state.dart';

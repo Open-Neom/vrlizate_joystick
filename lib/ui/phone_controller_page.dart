@@ -18,6 +18,7 @@ import '../domain/models/vr_controller_connection_exception.dart';
 import '../domain/models/vr_controller_connection_target.dart';
 import '../domain/models/vr_controller_link_quality.dart';
 import '../domain/models/vr_desktop_bridge_state.dart';
+import '../domain/models/vr_joystick_ai_coprocessor.dart';
 import '../domain/models/vr_joystick_geometry.dart';
 import '../domain/models/vr_steering_state.dart';
 import '../domain/models/vr_tracking_marker_configuration.dart';
@@ -114,6 +115,10 @@ class PhoneControllerPage extends StatefulWidget {
   /// Optional monotonic microsecond clock override for deterministic pacing tests.
   final int Function()? monotonicMicroseconds;
 
+  /// Optional embedded AI co-processor allowing this Joystick smartphone (`2D`)
+  /// to run local SAIA/GGUF inference on behalf of the Visor smartphone.
+  final VrJoystickAiCoProcessor? aiCoProcessor;
+
   const PhoneControllerPage({
     super.key,
     this.initialMode = RemoteControllerMode.joystick,
@@ -132,6 +137,7 @@ class PhoneControllerPage extends StatefulWidget {
     this.onConnected,
     this.onSessionExpired,
     this.monotonicMicroseconds,
+    this.aiCoProcessor,
   });
 
   @override
@@ -1669,6 +1675,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       );
       _sendState();
       _sendPublicTrackingMarker();
+      unawaited(_announceAiCapabilities(socket, generation));
       // The callback is observational; a host storage failure must not tear
       // down the authenticated controller transport.
       if (_isConnected && identical(_socket, socket)) {
@@ -2061,7 +2068,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     }
     if (_acceptEffectivePassthroughState(data) ||
         _acceptDesktopBridgeState(data) ||
-        _acceptCastOffer(data)) {
+        _acceptCastOffer(data) ||
+        _acceptAiInferRequest(data, socket, generation)) {
       return;
     }
     final hadHostRequest = _hostModeSession.revision != null;
@@ -3807,6 +3815,138 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     } catch (_) {
       _onDisconnected(socket);
     }
+  }
+
+  Future<void> _announceAiCapabilities(
+    VrControllerLink socket,
+    int generation,
+  ) async {
+    final coProcessor =
+        widget.aiCoProcessor ?? VrJoystickAiCoProcessor.defaultCoProcessor;
+    if (coProcessor == null) return;
+    try {
+      final caps = await coProcessor.probeCapabilities();
+      if (!mounted ||
+          !_isConnected ||
+          generation != _socketGeneration ||
+          !identical(_socket, socket) ||
+          !socket.isOpen) {
+        return;
+      }
+      socket.add(
+        jsonEncode({
+          VrJoystickConstants.fieldType:
+              VrJoystickConstants.aiCapabilitiesMessageType,
+          'supported': caps.supported,
+          'engine': caps.engineLabel,
+          'ramMb': caps.ramMb,
+        }),
+      );
+    } catch (_) {
+      // Optional AI capability discovery must never disrupt controller input.
+    }
+  }
+
+  bool _acceptAiInferRequest(
+    Object? data,
+    VrControllerLink socket,
+    int generation,
+  ) {
+    if (data is! String || data.length > 4096) return false;
+    Object? decoded;
+    try {
+      decoded = jsonDecode(data);
+    } catch (_) {
+      return false;
+    }
+    if (decoded is! Map<String, dynamic> ||
+        decoded[VrJoystickConstants.fieldType] !=
+            VrJoystickConstants.aiInferRequestMessageType) {
+      return false;
+    }
+    final reqId = decoded['reqId'];
+    final prompt = decoded['prompt'];
+    final sys = decoded['sys'];
+    final maxTok = decoded['maxTok'];
+    if (reqId is! String ||
+        reqId.isEmpty ||
+        reqId.length > 48 ||
+        prompt is! String ||
+        prompt.trim().isEmpty ||
+        prompt.length > 2048 ||
+        (sys != null && (sys is! String || sys.length > 1024))) {
+      return true;
+    }
+    final coProcessor =
+        widget.aiCoProcessor ?? VrJoystickAiCoProcessor.defaultCoProcessor;
+    if (coProcessor == null) {
+      try {
+        socket.add(
+          jsonEncode({
+            VrJoystickConstants.fieldType:
+                VrJoystickConstants.aiInferResponseMessageType,
+            'reqId': reqId,
+            'ok': false,
+            'text': '',
+            'engine': 'unavailable',
+          }),
+        );
+      } catch (_) {}
+      return true;
+    }
+    final boundedMaxTokens = (maxTok is int ? maxTok : 160).clamp(32, 320);
+    unawaited(() async {
+      try {
+        final result = await coProcessor.infer(
+          prompt: prompt,
+          systemPrompt: sys as String?,
+          maxTokens: boundedMaxTokens,
+        );
+        if (!mounted ||
+            !_isConnected ||
+            generation != _socketGeneration ||
+            !identical(_socket, socket) ||
+            !socket.isOpen) {
+          return;
+        }
+        var replyText = result.text.trim();
+        // Keep UTF-8 payload well below 1023-byte BLE GATT control frame ceiling.
+        while (utf8.encode(replyText).length > 760 && replyText.length > 32) {
+          replyText =
+              '${replyText.substring(0, (replyText.length * 0.85).floor())}…';
+        }
+        socket.add(
+          jsonEncode({
+            VrJoystickConstants.fieldType:
+                VrJoystickConstants.aiInferResponseMessageType,
+            'reqId': reqId,
+            'ok': result.ok && replyText.isNotEmpty,
+            'text': replyText,
+            'engine': result.engineLabel,
+          }),
+        );
+      } catch (_) {
+        if (mounted &&
+            _isConnected &&
+            generation == _socketGeneration &&
+            identical(_socket, socket) &&
+            socket.isOpen) {
+          try {
+            socket.add(
+              jsonEncode({
+                VrJoystickConstants.fieldType:
+                    VrJoystickConstants.aiInferResponseMessageType,
+                'reqId': reqId,
+                'ok': false,
+                'text': '',
+                'engine': 'error',
+              }),
+            );
+          } catch (_) {}
+        }
+      }
+    }());
+    return true;
   }
 
   Future<void> _openPublicTrackingMarker() async {

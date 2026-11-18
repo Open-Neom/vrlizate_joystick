@@ -93,6 +93,9 @@ abstract final class VrJoystickConstants {
   static const int maxSafeJsRevision = 9007199254740991;
   static const int maxActionCaptionLength = 24;
   static const String castPreviewMessageType = 'cast_preview';
+  static const String aiCapabilitiesMessageType = 'ai_caps';
+  static const String aiInferRequestMessageType = 'ai_infer_req';
+  static const String aiInferResponseMessageType = 'ai_infer_res';
 
   // Action & Button Keys
   static const String actionKeyA = 'A';
