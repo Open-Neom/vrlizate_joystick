@@ -159,6 +159,12 @@ class VrRemoteControllerService {
   final StreamController<bool> _connectionController =
       StreamController<bool>.broadcast();
 
+  final _actionChanges = StreamController<Map<String, String>>.broadcast();
+
+  /// Caption revisions for local controls. Held buttons and motion stay intact.
+  Stream<Map<String, String>> get onRecommendedActionsChanged =>
+      _actionChanges.stream;
+
   Stream<RemoteControllerState> get onState => _stateController.stream;
   Stream<bool> get onConnectionChanged => _connectionController.stream;
 
@@ -922,6 +928,7 @@ class VrRemoteControllerService {
       actions: clean,
       horizontalLook: horizontalLook,
     );
+    _actionChanges.add(_modeRequest.actions);
     _heldCaptionAckRevision = preserveHeldAck ? _modeRequest.revision : null;
     if (!sameProfile) {
       if (_localHandheldActive && _client == null) {
@@ -2199,5 +2206,6 @@ class VrRemoteControllerService {
     _clock.stop();
     _stateController.close();
     _connectionController.close();
+    _actionChanges.close();
   }
 }

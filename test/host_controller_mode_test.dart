@@ -111,6 +111,26 @@ void main() {
     },
   );
 
+  test(
+    'local and remote controls receive the same distinct caption updates',
+    () async {
+      final captions = <Map<String, String>>[];
+      final sub = service.onRecommendedActionsChanged.listen(captions.add);
+      addTearDown(sub.cancel);
+      await connect();
+      for (final action in ['Saltar', 'Levantarse', 'Levantarse']) {
+        service.requestControllerMode(
+          RemoteControllerMode.joystick,
+          actions: {'B': action},
+        );
+      }
+      await _until(() => captions.length == 2 && messages.length == 3);
+      expect(captions, [messages[1].actions, messages[2].actions]);
+      expect(captions.last, {'B': 'Levantarse'});
+      expect(states.where((s) => s.btnB), isEmpty);
+    },
+  );
+
   test('caption-only request relabels without releasing held inputs', () async {
     final socket = await connect();
     send(socket, 0, 0, 'joystick');
