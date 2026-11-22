@@ -93,6 +93,7 @@ class VrControllerPairingPage extends StatefulWidget {
     this.customInviteBuilder,
     this.headerBannerBuilder,
     this.supportedTransports = const {VrTransportType.localSocket},
+    this.embedded = false,
   });
 
   /// Overrides the native camera backend; the page owns and disposes it.
@@ -117,6 +118,11 @@ class VrControllerPairingPage extends StatefulWidget {
 
   /// Additional transports require a host-provided controller builder.
   final Set<VrTransportType> supportedTransports;
+
+  /// When `true`, renders without its own [Scaffold]/[AppBar] and defers screen
+  /// orientation management to the parent container (e.g. a Tab inside
+  /// `VrDevicePairingPage`).
+  final bool embedded;
 
   @override
   State<VrControllerPairingPage> createState() =>
@@ -199,7 +205,13 @@ class _VrControllerPairingPageState extends State<VrControllerPairingPage>
   }
 
   void _applyScannerOrientation() {
-    if (_disposed || !_foreground || !_routeCurrent || _navigated) return;
+    if (widget.embedded ||
+        _disposed ||
+        !_foreground ||
+        !_routeCurrent ||
+        _navigated) {
+      return;
+    }
     unawaited(
       SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]),
     );
@@ -419,9 +431,251 @@ class _VrControllerPairingPageState extends State<VrControllerPairingPage>
           : VrJoystickTranslationConstants.pairingPreparingCamera,
   };
 
+  Widget _buildCameraPreviewPanel(
+    BuildContext context, {
+    required VrPairingCameraSession? camera,
+    required double previewHeight,
+  }) {
+    if (_busy) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Center(child: CircularProgressIndicator()),
+            SizedBox(height: 12),
+            Text(
+              VrJoystickTranslationConstants.pairingClosingCamera,
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      );
+    }
+    if (camera == null) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: const Color(0xFF101933),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: const Color(0xFF34D399).withValues(alpha: 0.35),
+          ),
+        ),
+        child: const Text(
+          VrJoystickTranslationConstants.pairingDesktopFallbackNotice,
+          textAlign: TextAlign.center,
+        ),
+      );
+    }
+    return ValueListenableBuilder<VrPairingCameraState>(
+      valueListenable: camera.state,
+      builder: (context, state, _) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(20),
+            child: SizedBox(
+              height: previewHeight,
+              width: double.infinity,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  camera.buildPreview(context),
+                  const IgnorePointer(
+                    child: Center(
+                      child: Icon(
+                        Icons.crop_free,
+                        size: 136,
+                        color: Colors.white70,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(_cameraMessage(state), textAlign: TextAlign.center),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              if (state.torchAvailable)
+                TextButton.icon(
+                  key: const ValueKey(VrJoystickConstants.keyVrPairingTorch),
+                  onPressed: state.running ? _toggleTorch : null,
+                  icon: Icon(
+                    state.torchOn ? Icons.flashlight_off : Icons.flashlight_on,
+                  ),
+                  label: const Text(
+                    VrJoystickTranslationConstants.pairingTorchLabel,
+                  ),
+                ),
+              if (state.error != null)
+                TextButton(
+                  key: const ValueKey(VrJoystickConstants.keyVrPairingRetry),
+                  onPressed: () => _syncCamera(retry: true),
+                  child: const Text(
+                    VrJoystickTranslationConstants.pairingRetryCamera,
+                  ),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _buildManualFallbackWidgets() => [
+    if (_error != null) ...[
+      const SizedBox(height: 14),
+      Text(
+        _error!,
+        key: const ValueKey(VrJoystickConstants.keyVrPairingError),
+        style: const TextStyle(color: Colors.amber),
+      ),
+    ],
+    const SizedBox(height: 16),
+    OutlinedButton.icon(
+      key: const ValueKey(VrJoystickConstants.keyVrPairingPaste),
+      onPressed: _busy ? null : _pasteLink,
+      icon: const Icon(Icons.content_paste),
+      label: const Text(VrJoystickTranslationConstants.pairingPasteLinkButton),
+    ),
+    const SizedBox(height: 12),
+    TextField(
+      key: const ValueKey(VrJoystickConstants.keyVrPairingLink),
+      controller: _link,
+      enabled: !_busy,
+      autocorrect: false,
+      enableSuggestions: false,
+      keyboardType: TextInputType.url,
+      decoration: const InputDecoration(
+        labelText: VrJoystickTranslationConstants.pairingLinkLabel,
+        hintText: VrJoystickTranslationConstants.pairingLinkHint,
+        border: OutlineInputBorder(),
+      ),
+      onSubmitted: (raw) => unawaited(_acceptCode(raw)),
+    ),
+    const SizedBox(height: 12),
+    FilledButton(
+      key: const ValueKey(VrJoystickConstants.keyVrPairingConnect),
+      onPressed: _busy ? null : () => unawaited(_acceptCode(_link.text)),
+      child: const Text(VrJoystickTranslationConstants.pairingTitle),
+    ),
+  ];
+
+  Widget _buildEmbeddedBody(BuildContext context) {
+    final camera = _camera;
+    return Theme(
+      data: ThemeData.dark(useMaterial3: true),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final isWide = constraints.maxWidth >= 560;
+          if (isWide) {
+            final previewHeight = (constraints.maxHeight - 86).clamp(
+              150.0,
+              320.0,
+            );
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 10, 16),
+                    child: _buildCameraPreviewPanel(
+                      context,
+                      camera: camera,
+                      previewHeight: previewHeight,
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.fromLTRB(10, 8, 16, 16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text(
+                          VrJoystickTranslationConstants.pairingScanQrHeading,
+                          style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(_connectionInstructions),
+                        if (widget.headerBannerBuilder != null && !_busy) ...[
+                          const SizedBox(height: 12),
+                          widget.headerBannerBuilder!(
+                            context,
+                            _openCustomControllerPage,
+                          ),
+                        ],
+                        ..._buildManualFallbackWidgets(),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            );
+          }
+
+          final previewHeight = (constraints.maxHeight * 0.36).clamp(
+            180.0,
+            280.0,
+          );
+          return SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 680),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _buildCameraPreviewPanel(
+                      context,
+                      camera: camera,
+                      previewHeight: previewHeight,
+                    ),
+                    const SizedBox(height: 12),
+                    const Text(
+                      VrJoystickTranslationConstants.pairingScanQrHeading,
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(_connectionInstructions),
+                    if (widget.headerBannerBuilder != null && !_busy) ...[
+                      const SizedBox(height: 12),
+                      widget.headerBannerBuilder!(
+                        context,
+                        _openCustomControllerPage,
+                      ),
+                    ],
+                    ..._buildManualFallbackWidgets(),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (widget.embedded) {
+      return _buildEmbeddedBody(context);
+    }
     final camera = _camera;
+    final previewHeight = (MediaQuery.sizeOf(context).height * .38).clamp(
+      180.0,
+      320.0,
+    );
     return Theme(
       data: ThemeData.dark(useMaterial3: true),
       child: Scaffold(
@@ -455,139 +709,12 @@ class _VrControllerPairingPageState extends State<VrControllerPairingPage>
                       ),
                     ],
                     const SizedBox(height: 20),
-                    if (_busy) ...[
-                      const Center(child: CircularProgressIndicator()),
-                      const SizedBox(height: 12),
-                      const Text(
-                        VrJoystickTranslationConstants.pairingClosingCamera,
-                        textAlign: TextAlign.center,
-                      ),
-                    ] else if (camera != null)
-                      ValueListenableBuilder<VrPairingCameraState>(
-                        valueListenable: camera.state,
-                        builder: (context, state, _) => Column(
-                          children: [
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(20),
-                              child: SizedBox(
-                                height:
-                                    (MediaQuery.sizeOf(context).height * .38)
-                                        .clamp(180.0, 320.0),
-                                width: double.infinity,
-                                child: Stack(
-                                  fit: StackFit.expand,
-                                  children: [
-                                    camera.buildPreview(context),
-                                    const IgnorePointer(
-                                      child: Center(
-                                        child: Icon(
-                                          Icons.crop_free,
-                                          size: 150,
-                                          color: Colors.white70,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 10),
-                            Text(
-                              _cameraMessage(state),
-                              textAlign: TextAlign.center,
-                            ),
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                if (state.torchAvailable)
-                                  TextButton.icon(
-                                    key: const ValueKey(
-                                      VrJoystickConstants.keyVrPairingTorch,
-                                    ),
-                                    onPressed: state.running
-                                        ? _toggleTorch
-                                        : null,
-                                    icon: Icon(
-                                      state.torchOn
-                                          ? Icons.flashlight_off
-                                          : Icons.flashlight_on,
-                                    ),
-                                    label: const Text(
-                                      VrJoystickTranslationConstants
-                                          .pairingTorchLabel,
-                                    ),
-                                  ),
-                                if (state.error != null)
-                                  TextButton(
-                                    key: const ValueKey(
-                                      VrJoystickConstants.keyVrPairingRetry,
-                                    ),
-                                    onPressed: () => _syncCamera(retry: true),
-                                    child: const Text(
-                                      VrJoystickTranslationConstants
-                                          .pairingRetryCamera,
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      )
-                    else
-                      const Text(
-                        VrJoystickTranslationConstants
-                            .pairingDesktopFallbackNotice,
-                      ),
-                    if (_error != null) ...[
-                      const SizedBox(height: 16),
-                      Text(
-                        _error!,
-                        key: const ValueKey(
-                          VrJoystickConstants.keyVrPairingError,
-                        ),
-                        style: const TextStyle(color: Colors.amber),
-                      ),
-                    ],
-                    const SizedBox(height: 20),
-                    OutlinedButton.icon(
-                      key: const ValueKey(
-                        VrJoystickConstants.keyVrPairingPaste,
-                      ),
-                      onPressed: _busy ? null : _pasteLink,
-                      icon: const Icon(Icons.content_paste),
-                      label: const Text(
-                        VrJoystickTranslationConstants.pairingPasteLinkButton,
-                      ),
+                    _buildCameraPreviewPanel(
+                      context,
+                      camera: camera,
+                      previewHeight: previewHeight,
                     ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      key: const ValueKey(VrJoystickConstants.keyVrPairingLink),
-                      controller: _link,
-                      enabled: !_busy,
-                      autocorrect: false,
-                      enableSuggestions: false,
-                      keyboardType: TextInputType.url,
-                      decoration: const InputDecoration(
-                        labelText:
-                            VrJoystickTranslationConstants.pairingLinkLabel,
-                        hintText:
-                            VrJoystickTranslationConstants.pairingLinkHint,
-                        border: OutlineInputBorder(),
-                      ),
-                      onSubmitted: (raw) => unawaited(_acceptCode(raw)),
-                    ),
-                    const SizedBox(height: 12),
-                    FilledButton(
-                      key: const ValueKey(
-                        VrJoystickConstants.keyVrPairingConnect,
-                      ),
-                      onPressed: _busy
-                          ? null
-                          : () => unawaited(_acceptCode(_link.text)),
-                      child: const Text(
-                        VrJoystickTranslationConstants.pairingTitle,
-                      ),
-                    ),
+                    ..._buildManualFallbackWidgets(),
                   ],
                 ),
               ),
