@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -441,211 +440,204 @@ void main() {
     (const Size(640, 320), const EdgeInsets.only(left: 48), 2.0),
     (const Size(640, 320), const EdgeInsets.only(right: 48), 2.0),
   ]) {
-    testWidgets('edge bands fit landscape $size, $insets, $textScale', (
-      tester,
-    ) async {
-      await tester.binding.setSurfaceSize(size);
-      addTearDown(() => tester.binding.setSurfaceSize(null));
-      await tester.pumpWidget(
-        MaterialApp(
-          builder: (context, child) => MediaQuery(
-            data: MediaQuery.of(context).copyWith(
-              size: size,
-              padding: insets,
-              viewPadding: insets,
-              systemGestureInsets: const EdgeInsets.fromLTRB(8, 12, 8, 20),
-              textScaler: TextScaler.linear(textScale),
+    testWidgets(
+      '1D-style Yin-Yang decks fit landscape $size, $insets, $textScale',
+      (tester) async {
+        await tester.binding.setSurfaceSize(size);
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(
+          MaterialApp(
+            builder: (context, child) => MediaQuery(
+              data: MediaQuery.of(context).copyWith(
+                size: size,
+                padding: insets,
+                viewPadding: insets,
+                systemGestureInsets: const EdgeInsets.fromLTRB(8, 12, 8, 20),
+                textScaler: TextScaler.linear(textScale),
+              ),
+              child: child!,
             ),
-            child: child!,
+            home: const PhoneControllerPage(
+              targetHost: '127.0.0.1',
+              isChildRole: true,
+            ),
           ),
-          home: const PhoneControllerPage(
-            targetHost: '127.0.0.1',
-            isChildRole: true,
-          ),
-        ),
-      );
-      await tester.pump();
-      final bounds = tester.getRect(
-        find.byKey(const ValueKey('joystick_surface')),
-      );
-      final safe = Rect.fromLTRB(
-        math.max(8, insets.left),
-        12,
-        size.width - math.max(8, insets.right),
-        size.height - 20,
-      );
-      final comfortable = safe.width >= 760 && safe.height >= 400;
-      final target = comfortable ? 56.0 : 48.0;
-      final gap = comfortable ? 10.0 : 8.0;
-      final regions = <String, Rect>{};
-      final paths = <String, Path>{};
-      for (final key in [
-        'joystick_button_L',
-        'joystick_button_R',
-        'joystick_button_ZL',
-        'joystick_button_ZR',
-        'joystick_button_Y',
-        'joystick_button_X',
-        'joystick_button_B',
-        'joystick_button_A',
-        'joystick_move_stick',
-        'joystick_look_stick',
-        'joystick_recenter',
-      ]) {
-        final finder = find.byKey(ValueKey(key));
-        expect(finder, findsOneWidget, reason: key);
-        final region = tester.getRect(finder);
-        expect(region.left, greaterThanOrEqualTo(bounds.left - 1e-6));
-        expect(region.top, greaterThanOrEqualTo(bounds.top - 1e-6));
-        expect(region.right, lessThanOrEqualTo(bounds.right + 1e-6));
-        expect(region.bottom, lessThanOrEqualTo(bounds.bottom + 1e-6));
-        final Path path;
-        if (key.startsWith('joystick_button_')) {
-          final widget = tester.widget<VrControllerRegion>(finder);
-          path = widget.path.shift(region.topLeft);
-          expect(widget.path.contains(widget.labelPosition), isTrue);
-          final core = Rect.fromCenter(
-            center: region.topLeft + widget.labelPosition,
-            width: target - .02,
-            height: target - .02,
-          );
-          expect(safe.contains(core.topLeft), isTrue, reason: key);
-          expect(safe.contains(core.bottomRight), isTrue, reason: key);
-          final clip = tester.renderObject<RenderClipPath>(
-            find.descendant(of: finder, matching: find.byType(ClipPath)),
-          );
-          for (final point in [
-            core.topLeft,
-            core.topRight,
-            core.bottomLeft,
-            core.bottomRight,
-            core.center,
-          ]) {
-            expect(path.contains(point), isTrue, reason: '$key at $point');
-            expect(
-              tester.hitTestOnBinding(point).path.map((entry) => entry.target),
-              contains(clip),
-              reason: '$key at $point',
-            );
-          }
-        } else if (key.endsWith('_stick')) {
-          path = Path()..addOval(region);
-        } else {
-          path = Path()..addRect(region);
+        );
+        await tester.pump();
+        final bounds = tester.getRect(
+          find.byKey(const ValueKey('joystick_surface')),
+        );
+        expect(bounds, Offset.zero & size);
+
+        final leftDeck = tester.getRect(
+          find.byKey(const ValueKey('joystick_deck_left')),
+        );
+        final rightDeck = tester.getRect(
+          find.byKey(const ValueKey('joystick_deck_right')),
+        );
+        expect(leftDeck.left, greaterThanOrEqualTo(insets.left - 1e-6));
+        expect(
+          rightDeck.right,
+          lessThanOrEqualTo(size.width - insets.right + 1e-6),
+        );
+        expect(leftDeck.right, lessThan(rightDeck.left));
+        expect(leftDeck.width, closeTo(rightDeck.width, 0.5));
+
+        expect(find.byType(VrYinYangButtonPair), findsNWidgets(4));
+
+        final regions = <String, Rect>{};
+        for (final key in [
+          'joystick_button_L',
+          'joystick_button_R',
+          'joystick_button_ZL',
+          'joystick_button_ZR',
+          'joystick_button_Y',
+          'joystick_button_X',
+          'joystick_button_B',
+          'joystick_button_A',
+          'joystick_move_stick',
+          'joystick_look_stick',
+          'joystick_recenter',
+        ]) {
+          final finder = find.byKey(ValueKey(key));
+          expect(finder, findsOneWidget, reason: key);
+          final region = tester.getRect(finder);
+          expect(region.left, greaterThanOrEqualTo(bounds.left - 1e-6));
+          expect(region.top, greaterThanOrEqualTo(bounds.top - 1e-6));
+          expect(region.right, lessThanOrEqualTo(bounds.right + 1e-6));
+          expect(region.bottom, lessThanOrEqualTo(bounds.bottom + 1e-6));
+          regions[key] = region;
         }
-        for (final existing in paths.entries) {
+
+        // Verify all 4 Yin-Yang pairs sit strictly inside their wing deck and
+        // do not overlap either thumbstick or each other.
+        final moveStick = regions['joystick_move_stick']!;
+        final lookStick = regions['joystick_look_stick']!;
+        final pairWidgets = tester
+            .widgetList<VrYinYangButtonPair>(find.byType(VrYinYangButtonPair))
+            .toList();
+        final pairRects = <Rect>[];
+        for (var i = 0; i < pairWidgets.length; i++) {
+          final pairFinder = find.byType(VrYinYangButtonPair).at(i);
+          final pairRect = tester.getRect(pairFinder);
+          final paths = VrYinYangGeometry.buildPaths(pairRect.size);
           expect(
             Path.combine(
               PathOperation.intersect,
-              path,
-              existing.value,
+              paths.lowerLeft,
+              paths.upperRight,
             ).computeMetrics(),
             isEmpty,
-            reason: '$key overlaps ${existing.key}',
+            reason: 'Yin-Yang lobes must stay strictly disjoint',
           );
+          expect(
+            paths.lowerLeft.contains(
+              VrYinYangGeometry.lowerLeftCenter(pairRect.size),
+            ),
+            isTrue,
+          );
+          expect(
+            paths.upperRight.contains(
+              VrYinYangGeometry.upperRightCenter(pairRect.size),
+            ),
+            isTrue,
+          );
+          expect(
+            pairRect.overlaps(moveStick),
+            isFalse,
+            reason: 'Yin-Yang pair $i overlaps MOVER stick',
+          );
+          expect(
+            pairRect.overlaps(lookStick),
+            isFalse,
+            reason: 'Yin-Yang pair $i overlaps MIRAR stick',
+          );
+          for (final prev in pairRects) {
+            expect(
+              pairRect.overlaps(prev),
+              isFalse,
+              reason: 'Yin-Yang pairs must not overlap each other',
+            );
+          }
+          pairRects.add(pairRect);
         }
-        regions[key] = region;
-        paths[key] = path;
-      }
-      expect(bounds, Offset.zero & size);
-      for (final (outer, trigger, side, bottom) in [
-        ('L', 'ZL', 'Y', 'X'),
-        ('R', 'ZR', 'B', 'A'),
-      ]) {
-        final first = regions['joystick_button_$outer']!;
-        final second = regions['joystick_button_$trigger']!;
-        final shoulderGap = (first.center.dx < second.center.dx
-            ? second.left - first.right
-            : first.left - second.right);
-        expect(shoulderGap, closeTo(gap, .01));
+
+        // Left deck vertical order: Top Yin-Yang (L/ZL) -> MOVER -> Bottom Yin-Yang (X/Y)
         expect(
-          regions['joystick_button_$bottom']!.top -
-              regions['joystick_button_$side']!.bottom,
-          closeTo(gap, .01),
+          regions['joystick_button_L']!.bottom,
+          lessThanOrEqualTo(moveStick.top),
         );
-      }
-      for (final (key, point) in [
-        ('L', const Offset(1, 1)),
-        ('R', Offset(size.width - 1, 1)),
-        ('X', Offset(1, size.height - 1)),
-        ('A', Offset(size.width - 1, size.height - 1)),
-        ('Y', Offset(1, regions['joystick_move_stick']!.center.dy)),
-        (
-          'B',
-          Offset(size.width - 1, regions['joystick_look_stick']!.center.dy),
-        ),
-      ]) {
-        expect(paths['joystick_button_$key']!.contains(point), isTrue);
-      }
-      expect(
-        tester
-                .widget<VrControllerRegion>(
-                  find.byKey(const ValueKey('joystick_button_Y')),
-                )
-                .labelPosition
-                .dx +
-            regions['joystick_button_Y']!.left,
-        lessThan(regions['joystick_move_stick']!.left),
-      );
-      expect(
-        tester
-                .widget<VrControllerRegion>(
-                  find.byKey(const ValueKey('joystick_button_B')),
-                )
-                .labelPosition
-                .dx +
-            regions['joystick_button_B']!.left,
-        greaterThan(regions['joystick_look_stick']!.right),
-      );
-      expect(
-        tester.getCenter(find.text('L')).dy,
-        lessThan(regions['joystick_button_Y']!.top),
-      );
-      expect(
-        regions['joystick_button_X']!.top,
-        greaterThan(regions['joystick_button_Y']!.bottom),
-      );
-      expect(
-        regions['joystick_button_A']!.shortestSide,
-        greaterThanOrEqualTo(44),
-      );
-      expect(find.text('GATILLO (CLIC)'), findsNothing);
-      expect(find.byType(VirtualThumbstick), findsNWidgets(2));
-      expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
-      expect(
-        find.byKey(const ValueKey('controller_center_panel')),
-        findsOneWidget,
-      );
-      expect(
-        regions['joystick_look_stick']!.width,
-        lessThan(regions['joystick_move_stick']!.width),
-      );
-      final view = tester.getRect(
-        find.byKey(const ValueKey('right_mode_view')),
-      );
-      final laser = tester.getRect(
-        find.byKey(const ValueKey('right_mode_laser')),
-      );
-      expect(view.shortestSide, greaterThanOrEqualTo(target - .01));
-      expect(laser.shortestSide, greaterThanOrEqualTo(target - .01));
-      expect(laser.left - view.right, closeTo(gap, .01));
-      expect(
-        view.top - regions['joystick_recenter']!.bottom,
-        greaterThanOrEqualTo(gap - .01),
-      );
-      await _selectRightMode(tester, laser: true);
-      expect(find.byKey(const ValueKey('joystick_look_stick')), findsNothing);
-      expect(find.byType(VirtualThumbstick), findsOneWidget);
-      final laserRect = tester.getRect(
-        find.byKey(const ValueKey('laser_slide_pad')),
-      );
-      expect(laserRect, regions['joystick_look_stick']);
-      await _selectRightMode(tester, laser: false);
-      expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
-      expect(tester.takeException(), isNull);
-      await tester.pumpWidget(const SizedBox.shrink());
-      expect(tester.takeException(), isNull);
-    });
+        expect(
+          regions['joystick_button_ZL']!.bottom,
+          lessThanOrEqualTo(moveStick.top),
+        );
+        expect(
+          regions['joystick_button_X']!.top,
+          greaterThanOrEqualTo(moveStick.bottom),
+        );
+        expect(
+          regions['joystick_button_Y']!.top,
+          greaterThanOrEqualTo(moveStick.bottom),
+        );
+        // Right deck vertical order: Top Yin-Yang (ZR/R) -> MIRAR -> Bottom Yin-Yang (A/B)
+        expect(
+          regions['joystick_button_ZR']!.bottom,
+          lessThanOrEqualTo(lookStick.top),
+        );
+        expect(
+          regions['joystick_button_R']!.bottom,
+          lessThanOrEqualTo(lookStick.top),
+        );
+        expect(
+          regions['joystick_button_A']!.top,
+          greaterThanOrEqualTo(lookStick.bottom),
+        );
+        expect(
+          regions['joystick_button_B']!.top,
+          greaterThanOrEqualTo(lookStick.bottom),
+        );
+
+        // Both MOVER & MIRAR sticks are symmetrical, large, equal-sized controls.
+        expect(lookStick.width, closeTo(moveStick.width, 0.5));
+        expect(lookStick.height, closeTo(moveStick.height, 0.5));
+        expect(moveStick.width, greaterThanOrEqualTo(48));
+
+        expect(find.text('GATILLO (CLIC)'), findsNothing);
+        expect(find.byType(VirtualThumbstick), findsNWidgets(2));
+        expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
+        expect(
+          find.byKey(const ValueKey('controller_center_panel')),
+          findsOneWidget,
+        );
+
+        final view = tester.getRect(
+          find.byKey(const ValueKey('right_mode_view')),
+        );
+        final laser = tester.getRect(
+          find.byKey(const ValueKey('right_mode_laser')),
+        );
+        expect(view.shortestSide, greaterThanOrEqualTo(32));
+        expect(laser.shortestSide, greaterThanOrEqualTo(32));
+        expect(laser.left, greaterThan(view.right));
+        expect(
+          view.top,
+          greaterThanOrEqualTo(regions['joystick_recenter']!.bottom),
+        );
+
+        await _selectRightMode(tester, laser: true);
+        expect(find.byKey(const ValueKey('joystick_look_stick')), findsNothing);
+        expect(find.byType(VirtualThumbstick), findsOneWidget);
+        final laserRect = tester.getRect(
+          find.byKey(const ValueKey('laser_slide_pad')),
+        );
+        expect(laserRect, lookStick);
+        await _selectRightMode(tester, laser: false);
+        expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+        expect(tester.takeException(), isNull);
+      },
+    );
   }
 
   testWidgets(
@@ -973,9 +965,6 @@ void main() {
     final leftStick = tester.getRect(
       find.byKey(const ValueKey('joystick_move_stick')),
     );
-    final rightStick = tester.getRect(
-      find.byKey(const ValueKey('joystick_look_stick')),
-    );
     Set<String> active() => {
       if (service.latestState.btnL) 'L',
       if (service.latestState.btnR) 'R',
@@ -985,10 +974,8 @@ void main() {
       if (service.latestState.btnB) 'B',
     };
     for (final (key, point) in [
-      for (final key in ['L', 'R', 'ZL', 'ZR'])
+      for (final key in ['L', 'R', 'ZL', 'ZR', 'Y', 'B'])
         (key, _buttonPoint(tester, key)),
-      ('Y', Offset(1, leftStick.center.dy)),
-      ('B', Offset(799, rightStick.center.dy)),
     ]) {
       final finger = await tester.startGesture(point);
       await _pumpUntil(

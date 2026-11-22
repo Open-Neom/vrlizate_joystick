@@ -244,36 +244,36 @@ void main() {
         await tester.pump(const Duration(milliseconds: 40));
         expect(link.packets, isNotEmpty);
 
-        // 1D console thumbstick badges render on both sticks.
+        // 1D console Yin-Yang pairs and equal-sized MOVER/MIRAR thumbsticks render.
+        expect(find.byType(VrYinYangButtonPair), findsNWidgets(4));
         expect(find.text('MOVER'), findsOneWidget);
         expect(find.text('MIRAR'), findsOneWidget);
 
-        // Locate a point on button X hugging the lower rim of moveStick
-        // (away from X's corner label) and drag smoothly into the stick.
+        // Locate a point on the top rim of the bottom-left Yin-Yang pair (X/Y)
+        // hugging the lower rim of moveStick (away from X & Y label centers)
+        // and drag smoothly into the stick.
         final moveStickRect = tester.getRect(
           find.byKey(const ValueKey('joystick_move_stick')),
         );
-        final xFinder = find.byKey(const ValueKey('joystick_button_X'));
-        final xRect = tester.getRect(xFinder);
-        final xWidget = tester.widget<VrControllerRegion>(xFinder);
-        Offset? collarPoint;
-        for (var dy = 12.0; dy <= 28.0; dy += 2.0) {
-          final candidate = Offset(
-            moveStickRect.center.dx,
-            moveStickRect.bottom + dy,
-          );
-          if (xWidget.path.contains(candidate - xRect.topLeft)) {
-            collarPoint = candidate;
-            break;
-          }
-        }
-        expect(collarPoint, isNotNull);
+        final lookStickRect = tester.getRect(
+          find.byKey(const ValueKey('joystick_look_stick')),
+        );
+        expect(lookStickRect.width, closeTo(moveStickRect.width, 0.5));
+
+        final xyPairFinder = find.ancestor(
+          of: find.byKey(const ValueKey('joystick_button_X')),
+          matching: find.byType(VrYinYangButtonPair),
+        );
+        final xyPairRect = tester.getRect(xyPairFinder);
+        final collarPoint = Offset(moveStickRect.center.dx, xyPairRect.top + 4);
+        expect(xyPairRect.contains(collarPoint), isTrue);
 
         final beforeCount = link.packets.length;
-        final gesture = await tester.startGesture(collarPoint!, pointer: 21);
+        final gesture = await tester.startGesture(collarPoint, pointer: 21);
         await tester.pump(const Duration(milliseconds: 12));
-        // Still deferred -> X must NOT have fired!
+        // Still deferred -> neither X nor Y may have fired!
         expect(link.packets.last['btnX'], isFalse);
+        expect(link.packets.last['btnY'], isFalse);
 
         // Drag up-right smoothly into the stick -> hands off to moveStick!
         await gesture.moveBy(const Offset(48, -32));
@@ -281,18 +281,21 @@ void main() {
 
         final handedPackets = link.packets.sublist(beforeCount);
         expect(handedPackets.any((p) => p['btnX'] == true), isFalse);
+        expect(handedPackets.any((p) => p['btnY'] == true), isFalse);
         expect((link.packets.last['stickX'] as num), greaterThan(0.05));
 
         await gesture.up();
         await tester.pump(const Duration(milliseconds: 50));
         expect(link.packets.last['btnX'], isFalse);
+        expect(link.packets.last['btnY'], isFalse);
         expect((link.packets.last['stickX'] as num), 0);
 
-        // Direct tap on A label fires btnA immediately (0 ms latency).
+        // Direct tap on A lobe center fires btnA immediately (0 ms latency).
         final aFinder = find.byKey(const ValueKey('joystick_button_A'));
-        final aWidget = tester.widget<VrControllerRegion>(aFinder);
-        final aLabelGlobal = tester.getTopLeft(aFinder) + aWidget.labelPosition;
-        final tapA = await tester.startGesture(aLabelGlobal, pointer: 22);
+        final tapA = await tester.startGesture(
+          tester.getCenter(aFinder),
+          pointer: 22,
+        );
         await tester.pump();
         expect(link.packets.last['btnA'], isTrue);
         await tapA.up();

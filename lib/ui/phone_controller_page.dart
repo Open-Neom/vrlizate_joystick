@@ -19,7 +19,6 @@ import '../domain/models/vr_controller_connection_target.dart';
 import '../domain/models/vr_controller_link_quality.dart';
 import '../domain/models/vr_desktop_bridge_state.dart';
 import '../domain/models/vr_joystick_ai_coprocessor.dart';
-import '../domain/models/vr_joystick_geometry.dart';
 import '../domain/models/vr_steering_state.dart';
 import '../domain/models/vr_tracking_marker_configuration.dart';
 import '../domain/services/vr_auto_walk_lock_controller.dart';
@@ -41,19 +40,18 @@ import '../domain/services/vr_web_socket_controller_link.dart';
 import '../utils/constants/vr_joystick_constants.dart';
 import '../utils/constants/vr_joystick_translation_constants.dart';
 import '../utils/enums/remote_controller_mode.dart';
-import '../utils/enums/vr_joystick_control.dart';
 import '../utils/enums/vr_motion_capability.dart';
 import '../utils/enums/vr_right_stick_look_mode.dart';
 import 'nes_controller_layout.dart';
 import 'virtual_thumbstick.dart';
 import 'vr_breakthrough_curtain_bar.dart';
-import 'vr_controller_region.dart';
 import 'vr_driving_wheel_painter.dart';
 import 'vr_laser_pointing_view.dart';
 import 'vr_laser_slide_pad_painter.dart';
 import 'vr_passthrough_curtain_overlay_painter.dart';
 import 'vr_public_tracking_marker_page.dart';
 import 'vr_wordsphere_search_sheet.dart';
+import 'vr_yinyang_button_pair.dart';
 
 /// Native Smartphone VR Controller & Joystick Screen.
 ///
@@ -305,8 +303,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   EdgeInsets? _nesInsets;
   EdgeInsets? _joystickInsets;
   bool _settingsOpen = false;
-  VrJoystickGeometry? _joystickGeometry;
-  final Map<VrJoystickControl, Path> _joystickLocalPaths = {};
+  Vr2dYinYangDeckLayout? _deckLayout;
   VrControllerConnectionTarget? _lastTarget;
   VrControllerConnectionTarget? _socketTarget;
   String _status = VrJoystickTranslationConstants.statusSearchingWifi;
@@ -4837,7 +4834,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     );
   }
 
-  // ─── Modo Joystick Virtual Layout ────────────────────────────────────────
+  // ─── Modo Joystick Virtual Layout (1D-Style Symmetrical Yin-Yang Decks) ──
 
   Widget _buildJoystickLayout() {
     final driving = _activeMode == RemoteControllerMode.driving;
@@ -4848,83 +4845,112 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           return const SizedBox.shrink();
         }
         final insets = _joystickSafeInsets(context);
-        if (_joystickSize != constraints.biggest || _joystickInsets != insets) {
+        if (_joystickSize != constraints.biggest ||
+            _joystickInsets != insets ||
+            _deckLayout == null) {
           _joystickSize = constraints.biggest;
           _joystickInsets = insets;
-          _joystickGeometry = VrJoystickGeometry.fit(
+          _deckLayout = Vr2dYinYangDeckLayout.fit(
             constraints.biggest,
             leftInset: insets.left,
             rightInset: insets.right,
             topInset: insets.top,
             bottomInset: insets.bottom,
           );
-          _joystickLocalPaths.clear();
-          for (final control in VrJoystickControl.values) {
-            _joystickLocalPaths[control] = _joystickGeometry!
-                .shape(control)
-                .shift(-_joystickGeometry![control].topLeft);
-          }
         }
-        final geometry = _joystickGeometry!;
+        final deck = _deckLayout!;
 
-        Widget button(
-          VrJoystickControl control, {
-          required String title,
-          required String subtitle,
-          required bool active,
-          required List<Color> colors,
-          required VoidCallback onDown,
-          required VoidCallback onUp,
-          Color textColor = Colors.white,
+        Widget yinYangPair({
+          required Rect rect,
+          required bool isLeftWing,
+          required bool emphasized,
+          required String firstTitle,
+          required String firstSubtitle,
+          required bool firstActive,
+          required Color firstColor,
+          required VoidCallback onFirstDown,
+          required VoidCallback onFirstUp,
+          required String secondTitle,
+          required String secondSubtitle,
+          required bool secondActive,
+          required Color secondColor,
+          required VoidCallback onSecondDown,
+          required VoidCallback onSecondUp,
         }) {
-          final rect = geometry[control];
-          final isLeftWing =
-              control == VrJoystickControl.l ||
-              control == VrJoystickControl.zl ||
-              control == VrJoystickControl.y ||
-              control == VrJoystickControl.x;
           final enableStickIntent = !driving && (isLeftWing || !_rightLaser);
-          final stickControl = isLeftWing
-              ? VrJoystickControl.moveStick
-              : VrJoystickControl.lookStick;
-          final stickRect = geometry[stickControl];
+          final stickRect = isLeftWing
+              ? deck.leftStickRect
+              : deck.rightStickRect;
           final stickCenter = stickRect.center;
-          final stickRadius = stickRect.shortestSide / 2;
+          final stickRadius = stickRect.shortestSide / 2.0;
           final stickController = isLeftWing
               ? _moveStickController
               : _lookStickController;
-          final labelInSurface = geometry.labels[control]!;
+
+          void triggerDown(bool isFirst) {
+            if (isFirst) {
+              onFirstDown();
+            } else {
+              onSecondDown();
+            }
+          }
+
+          void triggerUp(bool isFirst) {
+            if (isFirst) {
+              onFirstUp();
+            } else {
+              onSecondUp();
+            }
+          }
 
           return Positioned.fromRect(
             rect: rect,
             child: _exclusivePassthroughControl(
-              VrControllerRegion(
-                key: ValueKey(
-                  '${VrJoystickConstants.keyJoystickButtonPrefix}$title',
+              VrYinYangButtonPair(
+                width: rect.width,
+                height: rect.height,
+                emphasized: emphasized,
+                firstKey: ValueKey(
+                  '${VrJoystickConstants.keyJoystickButtonPrefix}$firstTitle',
                 ),
-                path: _joystickLocalPaths[control]!,
-                labelPosition: labelInSurface - rect.topLeft,
-                label: title,
-                actionLabel: subtitle,
-                active: active,
-                colors: colors,
-                textColor: textColor,
-                onDown: () {
+                firstPrimary: firstTitle,
+                firstCaption: firstSubtitle,
+                firstActive: firstActive,
+                firstColor: firstColor,
+                onFirstChanged: (down) {
                   if (!_acceptsSurfaceInput(surfaceEpoch)) return;
-                  onDown();
-                  _hapticMedium();
+                  if (down) {
+                    onFirstDown();
+                    _hapticMedium();
+                  } else {
+                    onFirstUp();
+                    _hapticLight();
+                  }
                   _sendState();
                 },
-                onUp: () {
+                secondKey: ValueKey(
+                  '${VrJoystickConstants.keyJoystickButtonPrefix}$secondTitle',
+                ),
+                secondPrimary: secondTitle,
+                secondCaption: secondSubtitle,
+                secondActive: secondActive,
+                secondColor: secondColor,
+                onSecondChanged: (down) {
                   if (!_acceptsSurfaceInput(surfaceEpoch)) return;
-                  onUp();
-                  _hapticLight();
+                  if (down) {
+                    onSecondDown();
+                    _hapticMedium();
+                  } else {
+                    onSecondUp();
+                    _hapticLight();
+                  }
                   _sendState();
                 },
                 onPointerDownIntercept: enableStickIntent
-                    ? (event) {
+                    ? (isFirst, event, lobeCenterLocal) {
                         if (!_acceptsSurfaceInput(surfaceEpoch)) return;
                         final surfacePos = rect.topLeft + event.localPosition;
+                        final labelInSurface = rect.topLeft + lobeCenterLocal;
                         _buttonDownGlobalPositions[event.pointer] =
                             event.position;
                         final action = _touchIntentArbiter.onButtonPointerDown(
@@ -4938,7 +4964,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                           stickAlreadyActiveOnWing: stickController.isActive,
                         );
                         if (action == VrTouchIntentAction.fireButtonDown) {
-                          onDown();
+                          triggerDown(isFirst);
                           _hapticMedium();
                           _sendState();
                         } else if (action == VrTouchIntentAction.defer) {
@@ -4954,7 +4980,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                                   .onDeferTimerExpired(event.pointer);
                               if (expired ==
                                   VrTouchIntentAction.fireButtonDown) {
-                                onDown();
+                                triggerDown(isFirst);
                                 _hapticMedium();
                                 _sendState();
                               }
@@ -4964,7 +4990,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       }
                     : null,
                 onPointerMoveIntercept: enableStickIntent
-                    ? (event) {
+                    ? (isFirst, event) {
                         if (!_acceptsSurfaceInput(surfaceEpoch)) return;
                         final surfacePos = rect.topLeft + event.localPosition;
                         final action = _touchIntentArbiter.onButtonPointerMove(
@@ -4987,7 +5013,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                           case VrTouchIntentAction
                               .cancelButtonAndHandoffToStick:
                             _buttonDeferTimers.remove(event.pointer)?.cancel();
-                            onUp();
+                            triggerUp(isFirst);
                             stickController.beginExternalDrag(
                               pointerId: event.pointer,
                               globalPosition: event.position,
@@ -5002,7 +5028,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                             );
                           case VrTouchIntentAction.fireButtonDown:
                             _buttonDeferTimers.remove(event.pointer)?.cancel();
-                            onDown();
+                            triggerDown(isFirst);
                             _hapticMedium();
                             _sendState();
                           case VrTouchIntentAction.defer:
@@ -5015,7 +5041,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       }
                     : null,
                 onPointerEndIntercept: enableStickIntent
-                    ? (event, {required bool cancelled}) {
+                    ? (isFirst, event, {required bool cancelled}) {
                         _buttonDeferTimers.remove(event.pointer)?.cancel();
                         _buttonDownGlobalPositions.remove(event.pointer);
                         final action = _touchIntentArbiter.onButtonPointerEnd(
@@ -5033,13 +5059,13 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                         }
                         switch (action) {
                           case VrTouchIntentAction.quickTapButton:
-                            onDown();
+                            triggerDown(isFirst);
                             _hapticMedium();
                             _sendState(force: true);
-                            onUp();
+                            triggerUp(isFirst);
                             _sendState(force: true);
                           case VrTouchIntentAction.releaseButton:
-                            onUp();
+                            triggerUp(isFirst);
                             _hapticLight();
                             _sendState();
                           case VrTouchIntentAction.releaseStickHandoff:
@@ -5062,8 +5088,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           );
         }
 
-        Widget stickCaptureHalo(VrJoystickControl control, bool movement) {
-          final rect = geometry[control].inflate(14.0);
+        Widget stickCaptureHalo(Rect baseRect, bool movement) {
+          final deckBounds = movement ? deck.leftDeck : deck.rightDeck;
+          final rect = Rect.fromLTRB(
+            math.max(deckBounds.left + 2, baseRect.left - 18.0),
+            math.max(deckBounds.top + 2, baseRect.top - 16.0),
+            math.min(deckBounds.right - 2, baseRect.right + 18.0),
+            math.min(deckBounds.bottom - 2, baseRect.bottom + 16.0),
+          );
           final stickController = movement
               ? _moveStickController
               : _lookStickController;
@@ -5082,6 +5114,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       anchorGlobalPosition: event.position,
                     )) {
                       _stickHaloActiveWings[event.pointer] = movement;
+                      _sendState(force: true);
                     }
                   },
                   onPointerMove: (event) {
@@ -5114,8 +5147,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           );
         }
 
-        Widget stick(VrJoystickControl control, bool movement) {
-          final rect = geometry[control];
+        Widget stick(Rect rect, bool movement) {
           return Positioned.fromRect(
             rect: rect,
             child: ClipOval(
@@ -5129,7 +5161,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                     ? _moveStickController
                     : _lookStickController,
                 size: rect.width,
-                knobRadius: rect.width * .185,
+                knobRadius: rect.width * .195,
                 centerLabel: movement ? 'MOVER' : 'MIRAR',
                 // The radial response applies one continuous deadzone.
                 deadzone: 0,
@@ -5197,8 +5229,6 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                     if (justLocked) {
                       _hapticMedium();
                     }
-                    // Preserve rim intent before the progressive speed ramp.
-                    // Hysteresis prevents tiny finger drift from rearming it.
                     final radiusSquared = x * x + y * y;
                     _moveAtEdge =
                         _leftAutoWalkController.isAutoWalkLocked ||
@@ -5268,6 +5298,45 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
             ),
           );
         }
+
+        Widget deckShell({
+          required Key key,
+          required Rect rect,
+          required Color accent,
+          required bool highlighted,
+        }) {
+          return Positioned.fromRect(
+            rect: rect,
+            child: IgnorePointer(
+              child: AnimatedContainer(
+                key: key,
+                duration: const Duration(milliseconds: 140),
+                curve: Curves.easeOut,
+                decoration: BoxDecoration(
+                  color: highlighted
+                      ? const Color(0x9A0B1429)
+                      : const Color(0x80080D1B),
+                  borderRadius: BorderRadius.circular(24),
+                  border: Border.all(
+                    color: highlighted
+                        ? accent.withValues(alpha: 0.86)
+                        : accent.withValues(alpha: 0.40),
+                    width: highlighted ? 1.7 : 1.25,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: accent.withValues(alpha: highlighted ? 0.16 : 0.07),
+                      blurRadius: 16,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }
+
+        final moveActive = _moveStickController.isActive;
+        final lookActive = _lookStickController.isActive || _lookStickHeld;
 
         return Listener(
           behavior: HitTestBehavior.translucent,
@@ -5346,83 +5415,70 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           child: Stack(
             key: const ValueKey(VrJoystickConstants.keyJoystickSurface),
             children: [
+              // 1D-style dark-obsidian glass shells for Left Deck, Right Deck & Center
+              deckShell(
+                key: const ValueKey('joystick_deck_left'),
+                rect: deck.leftDeck,
+                accent: const Color(0xFF00E5FF),
+                highlighted: lookActive && !moveActive,
+              ),
+              deckShell(
+                key: const ValueKey('joystick_deck_right'),
+                rect: deck.rightDeck,
+                accent: const Color(0xFF818CF8),
+                highlighted: moveActive && !lookActive,
+              ),
               Positioned.fromRect(
-                rect: geometry.centerPanel,
+                rect: deck.centerPanel,
                 child: IgnorePointer(
                   child: DecoratedBox(
                     decoration: BoxDecoration(
                       color: const Color(0xFF0A1020),
-                      borderRadius: BorderRadius.circular(16),
+                      borderRadius: BorderRadius.circular(18),
                       border: Border.all(
                         color:
                             (_btnGripActive
                                     ? const Color(0xFFFF9100)
                                     : const Color(0xFF00E5FF))
-                                .withValues(alpha: .32),
+                                .withValues(alpha: .30),
                       ),
                     ),
                   ),
                 ),
               ),
-              if (!driving) stickCaptureHalo(VrJoystickControl.moveStick, true),
+              // Expanded stick-capture halos inside each deck
+              if (!driving) stickCaptureHalo(deck.leftStickRect, true),
               if (!driving && !_rightLaser)
-                stickCaptureHalo(VrJoystickControl.lookStick, false),
-              button(
-                VrJoystickControl.l,
-                title: VrJoystickConstants.actionKeyL,
-                subtitle: _actionLabel(VrJoystickConstants.actionKeyL),
-                active: _btnLActive,
-                colors: const [Color(0xFF38BDF8), Color(0xFF00E5FF)],
-                onDown: () => setState(
+                stickCaptureHalo(deck.rightStickRect, false),
+              // LEFT DECK: Top Yin-Yang (L / ZL) -> HUGE MOVER Stick -> Bottom Yin-Yang (X / Y)
+              yinYangPair(
+                rect: deck.leftTopPairRect,
+                isLeftWing: true,
+                emphasized: lookActive && !moveActive,
+                firstTitle: VrJoystickConstants.actionKeyL,
+                firstSubtitle: _actionLabel(VrJoystickConstants.actionKeyL),
+                firstActive: _btnLActive,
+                firstColor: const Color(0xFF38BDF8),
+                onFirstDown: () => setState(
                   () => _btnLActive = !driving || !_steering.state.paused,
                 ),
-                onUp: () => setState(() => _btnLActive = false),
+                onFirstUp: () => setState(() => _btnLActive = false),
+                secondTitle: VrJoystickConstants.actionKeyZL,
+                secondSubtitle: _actionLabel(VrJoystickConstants.actionKeyZL),
+                secondActive: _btnZLActive,
+                secondColor: const Color(0xFF00E5FF),
+                onSecondDown: () => setState(() => _btnZLActive = true),
+                onSecondUp: () => setState(() => _btnZLActive = false),
               ),
-              button(
-                VrJoystickControl.r,
-                title: VrJoystickConstants.actionKeyR,
-                subtitle: _actionLabel(VrJoystickConstants.actionKeyR),
-                active: _btnRActive,
-                colors: const [Color(0xFF818CF8), Color(0xFF6366F1)],
-                onDown: () => setState(
-                  () => _btnRActive = !driving || !_steering.state.paused,
-                ),
-                onUp: () => setState(() => _btnRActive = false),
-              ),
-              button(
-                VrJoystickControl.zl,
-                title: VrJoystickConstants.actionKeyZL,
-                subtitle: _actionLabel(VrJoystickConstants.actionKeyZL),
-                active: _btnZLActive,
-                colors: const [Color(0xFF00E5FF), Color(0xFF0284C7)],
-                onDown: () => setState(() => _btnZLActive = true),
-                onUp: () => setState(() => _btnZLActive = false),
-              ),
-              button(
-                VrJoystickControl.zr,
-                title: VrJoystickConstants.actionKeyZR,
-                subtitle: _actionLabel(VrJoystickConstants.actionKeyZR),
-                active: _btnZRActive,
-                colors: const [Color(0xFFA78BFA), Color(0xFF7C3AED)],
-                onDown: () => setState(() => _btnZRActive = true),
-                onUp: () => setState(() => _btnZRActive = false),
-              ),
-              button(
-                VrJoystickControl.y,
-                title: VrJoystickConstants.actionKeyY,
-                subtitle: _actionLabel(VrJoystickConstants.actionKeyY),
-                active: _btnYActive,
-                colors: const [Color(0xFFFBBF24), Color(0xFFF59E0B)],
-                onDown: () => setState(() => _btnYActive = true),
-                onUp: () => setState(() => _btnYActive = false),
-              ),
-              button(
-                VrJoystickControl.x,
-                title: VrJoystickConstants.actionKeyX,
-                subtitle: _actionLabel(VrJoystickConstants.actionKeyX),
-                active: _btnXActive,
-                colors: const [Color(0xFF60A5FA), Color(0xFF2563EB)],
-                onDown: () {
+              yinYangPair(
+                rect: deck.leftBottomPairRect,
+                isLeftWing: true,
+                emphasized: lookActive && !moveActive,
+                firstTitle: VrJoystickConstants.actionKeyX,
+                firstSubtitle: _actionLabel(VrJoystickConstants.actionKeyX),
+                firstActive: _btnXActive,
+                firstColor: const Color(0xFF60A5FA),
+                onFirstDown: () {
                   if (driving) {
                     setState(() {
                       _steering.setPaused(true);
@@ -5434,51 +5490,78 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                     setState(() => _btnXActive = true);
                   }
                 },
-                onUp: () => setState(() => _btnXActive = false),
+                onFirstUp: () => setState(() => _btnXActive = false),
+                secondTitle: VrJoystickConstants.actionKeyY,
+                secondSubtitle: _actionLabel(VrJoystickConstants.actionKeyY),
+                secondActive: _btnYActive,
+                secondColor: const Color(0xFFFBBF24),
+                onSecondDown: () => setState(() => _btnYActive = true),
+                onSecondUp: () => setState(() => _btnYActive = false),
               ),
-              button(
-                VrJoystickControl.b,
-                title: VrJoystickConstants.actionKeyB,
-                subtitle: _actionLabel(VrJoystickConstants.actionKeyB),
-                active: _btnBActive,
-                colors: const [Color(0xFFF87171), Color(0xFFE11D48)],
-                onDown: () => setState(() {
+              // RIGHT DECK: Top Yin-Yang (ZR / R) -> HUGE Equal MIRAR Stick -> Bottom Yin-Yang (A / B)
+              yinYangPair(
+                rect: deck.rightTopPairRect,
+                isLeftWing: false,
+                emphasized: moveActive && !lookActive,
+                firstTitle: VrJoystickConstants.actionKeyZR,
+                firstSubtitle: _actionLabel(VrJoystickConstants.actionKeyZR),
+                firstActive: _btnZRActive,
+                firstColor: const Color(0xFFA78BFA),
+                onFirstDown: () => setState(() => _btnZRActive = true),
+                onFirstUp: () => setState(() => _btnZRActive = false),
+                secondTitle: VrJoystickConstants.actionKeyR,
+                secondSubtitle: _actionLabel(VrJoystickConstants.actionKeyR),
+                secondActive: _btnRActive,
+                secondColor: const Color(0xFF818CF8),
+                onSecondDown: () => setState(
+                  () => _btnRActive = !driving || !_steering.state.paused,
+                ),
+                onSecondUp: () => setState(() => _btnRActive = false),
+              ),
+              yinYangPair(
+                rect: deck.rightBottomPairRect,
+                isLeftWing: false,
+                emphasized: moveActive && !lookActive,
+                firstTitle: VrJoystickConstants.actionKeyA,
+                firstSubtitle: _actionLabel(VrJoystickConstants.actionKeyA),
+                firstActive: _btnAActive,
+                firstColor: const Color(0xFF34D399),
+                onFirstDown: driving
+                    ? _selectDrivingMenu
+                    : () => setState(() => _btnAActive = true),
+                onFirstUp: () => setState(() => _btnAActive = false),
+                secondTitle: VrJoystickConstants.actionKeyB,
+                secondSubtitle: _actionLabel(VrJoystickConstants.actionKeyB),
+                secondActive: _btnBActive,
+                secondColor: const Color(0xFFF87171),
+                onSecondDown: () => setState(() {
                   if (driving) {
                     _steering.setPaused(true);
                     _releaseInputs();
                   }
                   _btnBActive = true;
                 }),
-                onUp: () => setState(() => _btnBActive = false),
+                onSecondUp: () => setState(() => _btnBActive = false),
               ),
-              button(
-                VrJoystickControl.a,
-                title: VrJoystickConstants.actionKeyA,
-                subtitle: _actionLabel(VrJoystickConstants.actionKeyA),
-                active: _btnAActive,
-                colors: const [Color(0xFF34D399), Color(0xFF059669)],
-                onDown: driving
-                    ? _selectDrivingMenu
-                    : () => setState(() => _btnAActive = true),
-                onUp: () => setState(() => _btnAActive = false),
-              ),
-              stick(VrJoystickControl.moveStick, true),
+              // BIG EQUAL-SIZED LEFT (MOVER) & RIGHT (MIRAR / LASER) STICKS
+              stick(deck.leftStickRect, true),
               if (_rightLaser)
                 Positioned.fromRect(
-                  rect: geometry[VrJoystickControl.lookStick],
+                  rect: deck.rightStickRect,
                   child: ClipOval(child: _buildLaserSlidePad()),
                 )
               else
-                stick(VrJoystickControl.lookStick, false),
+                stick(deck.rightStickRect, false),
+              // CENTER COLUMN CHROME, RECENTER, PREVIEW / VISTA-LASER, STATUS
               Positioned(
-                left: geometry.centerPanel.left + 6,
-                width: geometry.centerPanel.width - 12,
+                left: deck.centerPanel.left + 6,
+                width: deck.centerPanel.width - 12,
                 top: 0,
-                height: geometry[VrJoystickControl.recenter].top - 4,
+                height: math.max(20.0, deck.recenterRect.top - 4),
                 child: _buildJoystickChrome(),
               ),
               Positioned.fromRect(
-                rect: geometry[VrJoystickControl.recenter],
+                rect: deck.recenterRect,
                 child: _buildButton(
                   key: const ValueKey(VrJoystickConstants.keyJoystickRecenter),
                   title: driving
@@ -5496,22 +5579,17 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 ),
               ),
               Positioned.fromRect(
-                rect: geometry.previewPanel,
+                rect: deck.previewPanel,
                 child: _buildJoystickCenter(
-                  buttonHeight: math.max(
-                    44,
-                    geometry[VrJoystickControl.recenter].height,
-                  ),
-                  buttonGap:
-                      geometry.previewPanel.top -
-                      geometry[VrJoystickControl.recenter].bottom,
+                  buttonHeight: math.max(40, deck.recenterRect.height),
+                  buttonGap: deck.previewPanel.top - deck.recenterRect.bottom,
                 ),
               ),
               Positioned(
-                left: geometry.centerPanel.left + 6,
-                right: constraints.maxWidth - geometry.centerPanel.right + 6,
+                left: deck.centerPanel.left + 6,
+                right: constraints.maxWidth - deck.centerPanel.right + 6,
                 bottom: 0,
-                height: geometry.footerHeight,
+                height: deck.footerHeight,
                 child: driving ? _buildDrivingStatus() : _buildJoystickStatus(),
               ),
               if (_canControlPassthrough &&

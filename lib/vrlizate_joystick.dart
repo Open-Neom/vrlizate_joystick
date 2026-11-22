@@ -54,6 +54,7 @@ export 'ui/phone_controller_page.dart';
 export 'ui/nes_controller_layout.dart';
 export 'ui/remote_controller_qr_dialog.dart';
 export 'ui/virtual_thumbstick.dart';
+export 'ui/vr_yinyang_button_pair.dart';
 export 'ui/vr_breakthrough_curtain_bar.dart';
 export 'ui/vr_cast_scope.dart';
 export 'ui/vr_controller_pairing_page.dart';
