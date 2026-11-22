@@ -14,6 +14,19 @@ class VrVisionInferenceBudget {
        assert(maxIntervalUs >= searchIntervalUs),
        assert(targetDuty > 0 && targetDuty <= 1);
 
+  /// Low-latency budget for dedicated lightweight 21-pt hand landmarking
+  /// (`RunningMode.VIDEO` + ROI tracking), matching Desktop Faro cadence
+  /// (`~20-30 Hz` when a hand is tracked, `~15 Hz` while searching).
+  VrVisionInferenceBudget.handTracking({
+    this.minIntervalUs = 33000,
+    this.searchIntervalUs = 66000,
+    this.maxIntervalUs = 180000,
+    this.targetDuty = .72,
+  }) : assert(minIntervalUs >= 16000),
+       assert(searchIntervalUs >= minIntervalUs),
+       assert(maxIntervalUs >= searchIntervalUs),
+       assert(targetDuty > 0 && targetDuty <= 1);
+
   final int minIntervalUs;
   final int searchIntervalUs;
   final int maxIntervalUs;

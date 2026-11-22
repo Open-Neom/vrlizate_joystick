@@ -100,4 +100,31 @@ void main() {
       expect(budget.tryStart(1500000), isTrue);
     },
   );
+
+  test(
+    'handTracking preset runs at ~30 Hz when hands are active and ~15 Hz searching',
+    () {
+      final budget = VrVisionInferenceBudget.handTracking();
+      expect(budget.intervalUs, 66000);
+      expect(budget.tryStart(0), isTrue);
+      // Fast 10 ms native MediaPipe VIDEO frame -> unlocks 33 ms (~30 Hz) cadence.
+      budget.recordCompletion(
+        startedUs: 0,
+        finishedUs: 10000,
+        confirmedBody: true,
+      );
+      expect(budget.intervalUs, 33000);
+      expect(budget.effectiveMaxHz, greaterThan(29.0));
+      expect(budget.tryStart(32999), isFalse);
+      expect(budget.tryStart(33000), isTrue);
+
+      // Slow frame backs off gracefully without exceeding maxIntervalUs (180 ms).
+      budget.recordCompletion(
+        startedUs: 33000,
+        finishedUs: 190000,
+        confirmedBody: false,
+      );
+      expect(budget.intervalUs, 180000);
+    },
+  );
 }
