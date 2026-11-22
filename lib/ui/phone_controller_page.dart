@@ -30,6 +30,7 @@ import '../domain/services/vr_controller_state_pacer.dart';
 import '../domain/services/vr_flick_stick_controller.dart';
 import '../domain/services/vr_inertial_trackball_controller.dart';
 import '../domain/services/vr_joystick_camera_vision_service.dart';
+import '../domain/services/vr_joystick_touch_intent_arbiter.dart';
 import '../domain/services/vr_laser_steady_dwell_controller.dart';
 import '../domain/services/vr_motion_look_controller.dart';
 import '../domain/services/vr_one_handed_laser_detector.dart';
@@ -339,6 +340,15 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   final _moveResponse = VrProgressiveStick();
   final _lookResponse = VrProgressiveStick(initialGain: .45, maxGain: .8);
   final _motionLook = VrMotionLookController();
+  final VrJoystickTouchIntentArbiter _touchIntentArbiter =
+      VrJoystickTouchIntentArbiter();
+  final VirtualThumbstickController _moveStickController =
+      VirtualThumbstickController();
+  final VirtualThumbstickController _lookStickController =
+      VirtualThumbstickController();
+  final Map<int, Timer> _buttonDeferTimers = <int, Timer>{};
+  final Map<int, Offset> _buttonDownGlobalPositions = <int, Offset>{};
+  final Map<int, bool> _stickHaloActiveWings = <int, bool>{};
   bool _lookStickHeld = false;
   bool _motionLookEnabled = true;
   double _laserStickX = 0.0; // Laser pointer horizontal steering
@@ -2254,7 +2264,18 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _scheduleReconnect();
   }
 
+  void _clearTouchIntentState() {
+    for (final timer in _buttonDeferTimers.values) {
+      timer.cancel();
+    }
+    _buttonDeferTimers.clear();
+    _buttonDownGlobalPositions.clear();
+    _stickHaloActiveWings.clear();
+    _touchIntentArbiter.clear();
+  }
+
   void _releaseInputs({bool send = false}) {
+    _clearTouchIntentState();
     _moveResponse.reset();
     _lookResponse.reset();
     _motionLook.reset();
@@ -4857,6 +4878,23 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           Color textColor = Colors.white,
         }) {
           final rect = geometry[control];
+          final isLeftWing =
+              control == VrJoystickControl.l ||
+              control == VrJoystickControl.zl ||
+              control == VrJoystickControl.y ||
+              control == VrJoystickControl.x;
+          final enableStickIntent = !driving && (isLeftWing || !_rightLaser);
+          final stickControl = isLeftWing
+              ? VrJoystickControl.moveStick
+              : VrJoystickControl.lookStick;
+          final stickRect = geometry[stickControl];
+          final stickCenter = stickRect.center;
+          final stickRadius = stickRect.shortestSide / 2;
+          final stickController = isLeftWing
+              ? _moveStickController
+              : _lookStickController;
+          final labelInSurface = geometry.labels[control]!;
+
           return Positioned.fromRect(
             rect: rect,
             child: _exclusivePassthroughControl(
@@ -4865,7 +4903,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   '${VrJoystickConstants.keyJoystickButtonPrefix}$title',
                 ),
                 path: _joystickLocalPaths[control]!,
-                labelPosition: geometry.labels[control]! - rect.topLeft,
+                labelPosition: labelInSurface - rect.topLeft,
                 label: title,
                 actionLabel: subtitle,
                 active: active,
@@ -4883,6 +4921,194 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   _hapticLight();
                   _sendState();
                 },
+                onPointerDownIntercept: enableStickIntent
+                    ? (event) {
+                        if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                        final surfacePos = rect.topLeft + event.localPosition;
+                        _buttonDownGlobalPositions[event.pointer] =
+                            event.position;
+                        final action = _touchIntentArbiter.onButtonPointerDown(
+                          pointerId: event.pointer,
+                          isLeftWing: isLeftWing,
+                          position: surfacePos,
+                          buttonLabelPosition: labelInSurface,
+                          stickCenter: stickCenter,
+                          stickRadius: stickRadius,
+                          timestampUs: _nowUs,
+                          stickAlreadyActiveOnWing: stickController.isActive,
+                        );
+                        if (action == VrTouchIntentAction.fireButtonDown) {
+                          onDown();
+                          _hapticMedium();
+                          _sendState();
+                        } else if (action == VrTouchIntentAction.defer) {
+                          _buttonDeferTimers[event.pointer]?.cancel();
+                          _buttonDeferTimers[event.pointer] = Timer(
+                            Duration(
+                              microseconds: _touchIntentArbiter.deferWindowUs,
+                            ),
+                            () {
+                              _buttonDeferTimers.remove(event.pointer);
+                              if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                              final expired = _touchIntentArbiter
+                                  .onDeferTimerExpired(event.pointer);
+                              if (expired ==
+                                  VrTouchIntentAction.fireButtonDown) {
+                                onDown();
+                                _hapticMedium();
+                                _sendState();
+                              }
+                            },
+                          );
+                        }
+                      }
+                    : null,
+                onPointerMoveIntercept: enableStickIntent
+                    ? (event) {
+                        if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                        final surfacePos = rect.topLeft + event.localPosition;
+                        final action = _touchIntentArbiter.onButtonPointerMove(
+                          pointerId: event.pointer,
+                          position: surfacePos,
+                          timestampUs: _nowUs,
+                          stickAlreadyActiveOnWing: stickController.isActive,
+                        );
+                        switch (action) {
+                          case VrTouchIntentAction.handoffToStick:
+                            _buttonDeferTimers.remove(event.pointer)?.cancel();
+                            if (stickController.beginExternalDrag(
+                              pointerId: event.pointer,
+                              globalPosition: event.position,
+                              anchorGlobalPosition:
+                                  _buttonDownGlobalPositions[event.pointer],
+                            )) {
+                              _sendState(force: true);
+                            }
+                          case VrTouchIntentAction
+                              .cancelButtonAndHandoffToStick:
+                            _buttonDeferTimers.remove(event.pointer)?.cancel();
+                            onUp();
+                            stickController.beginExternalDrag(
+                              pointerId: event.pointer,
+                              globalPosition: event.position,
+                              anchorGlobalPosition:
+                                  _buttonDownGlobalPositions[event.pointer],
+                            );
+                            _sendState(force: true);
+                          case VrTouchIntentAction.continueStickHandoff:
+                            stickController.updateExternalDrag(
+                              pointerId: event.pointer,
+                              globalPosition: event.position,
+                            );
+                          case VrTouchIntentAction.fireButtonDown:
+                            _buttonDeferTimers.remove(event.pointer)?.cancel();
+                            onDown();
+                            _hapticMedium();
+                            _sendState();
+                          case VrTouchIntentAction.defer:
+                          case VrTouchIntentAction.quickTapButton:
+                          case VrTouchIntentAction.releaseButton:
+                          case VrTouchIntentAction.releaseStickHandoff:
+                          case VrTouchIntentAction.none:
+                            break;
+                        }
+                      }
+                    : null,
+                onPointerEndIntercept: enableStickIntent
+                    ? (event, {required bool cancelled}) {
+                        _buttonDeferTimers.remove(event.pointer)?.cancel();
+                        _buttonDownGlobalPositions.remove(event.pointer);
+                        final action = _touchIntentArbiter.onButtonPointerEnd(
+                          event.pointer,
+                          cancelled: cancelled,
+                        );
+                        if (!_acceptsSurfaceInput(surfaceEpoch)) {
+                          if (action ==
+                              VrTouchIntentAction.releaseStickHandoff) {
+                            stickController.endExternalDrag(
+                              pointerId: event.pointer,
+                            );
+                          }
+                          return;
+                        }
+                        switch (action) {
+                          case VrTouchIntentAction.quickTapButton:
+                            onDown();
+                            _hapticMedium();
+                            _sendState(force: true);
+                            onUp();
+                            _sendState(force: true);
+                          case VrTouchIntentAction.releaseButton:
+                            onUp();
+                            _hapticLight();
+                            _sendState();
+                          case VrTouchIntentAction.releaseStickHandoff:
+                            stickController.endExternalDrag(
+                              pointerId: event.pointer,
+                            );
+                          case VrTouchIntentAction.defer:
+                          case VrTouchIntentAction.fireButtonDown:
+                          case VrTouchIntentAction.handoffToStick:
+                          case VrTouchIntentAction
+                              .cancelButtonAndHandoffToStick:
+                          case VrTouchIntentAction.continueStickHandoff:
+                          case VrTouchIntentAction.none:
+                            break;
+                        }
+                      }
+                    : null,
+              ),
+            ),
+          );
+        }
+
+        Widget stickCaptureHalo(VrJoystickControl control, bool movement) {
+          final rect = geometry[control].inflate(14.0);
+          final stickController = movement
+              ? _moveStickController
+              : _lookStickController;
+          return Positioned.fromRect(
+            rect: rect,
+            child: _exclusivePassthroughControl(
+              ClipOval(
+                child: Listener(
+                  behavior: HitTestBehavior.opaque,
+                  onPointerDown: (event) {
+                    if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                    if (stickController.isActive) return;
+                    if (stickController.beginExternalDrag(
+                      pointerId: event.pointer,
+                      globalPosition: event.position,
+                      anchorGlobalPosition: event.position,
+                    )) {
+                      _stickHaloActiveWings[event.pointer] = movement;
+                    }
+                  },
+                  onPointerMove: (event) {
+                    if (_stickHaloActiveWings[event.pointer] != movement) {
+                      return;
+                    }
+                    stickController.updateExternalDrag(
+                      pointerId: event.pointer,
+                      globalPosition: event.position,
+                    );
+                  },
+                  onPointerUp: (event) {
+                    if (_stickHaloActiveWings.remove(event.pointer) !=
+                        movement) {
+                      return;
+                    }
+                    stickController.endExternalDrag(pointerId: event.pointer);
+                  },
+                  onPointerCancel: (event) {
+                    if (_stickHaloActiveWings.remove(event.pointer) !=
+                        movement) {
+                      return;
+                    }
+                    stickController.endExternalDrag(pointerId: event.pointer);
+                  },
+                  child: const SizedBox.expand(),
+                ),
               ),
             ),
           );
@@ -4899,14 +5125,18 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       ? VrJoystickConstants.keyJoystickMoveStick
                       : VrJoystickConstants.keyJoystickLookStick,
                 ),
+                controller: movement
+                    ? _moveStickController
+                    : _lookStickController,
                 size: rect.width,
-                knobRadius: rect.width * .19,
+                knobRadius: rect.width * .185,
+                centerLabel: movement ? 'MOVER' : 'MIRAR',
                 // The radial response applies one continuous deadzone.
                 deadzone: 0,
                 horizontalEnabled: movement || _horizontalLookEnabled,
                 accentColor: movement
                     ? const Color(0xFF00E5FF)
-                    : const Color(0xFFFF9100),
+                    : const Color(0xFF818CF8),
                 hapticsEnabled: _hapticsEnabled,
                 dynamicTouchOrigin: _dynamicTouchOriginEnabled,
                 enableCardinalDetents: _cardinalDetentsEnabled,
@@ -5121,25 +5351,28 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 child: IgnorePointer(
                   child: DecoratedBox(
                     decoration: BoxDecoration(
-                      color: const Color(0xFF101528),
+                      color: const Color(0xFF0A1020),
                       borderRadius: BorderRadius.circular(16),
                       border: Border.all(
                         color:
                             (_btnGripActive
                                     ? const Color(0xFFFF9100)
-                                    : const Color(0xFF10B981))
-                                .withValues(alpha: .35),
+                                    : const Color(0xFF00E5FF))
+                                .withValues(alpha: .32),
                       ),
                     ),
                   ),
                 ),
               ),
+              if (!driving) stickCaptureHalo(VrJoystickControl.moveStick, true),
+              if (!driving && !_rightLaser)
+                stickCaptureHalo(VrJoystickControl.lookStick, false),
               button(
                 VrJoystickControl.l,
                 title: VrJoystickConstants.actionKeyL,
                 subtitle: _actionLabel(VrJoystickConstants.actionKeyL),
                 active: _btnLActive,
-                colors: const [Color(0xFF00A7B5), Color(0xFF395AB5)],
+                colors: const [Color(0xFF38BDF8), Color(0xFF00E5FF)],
                 onDown: () => setState(
                   () => _btnLActive = !driving || !_steering.state.paused,
                 ),
@@ -5150,7 +5383,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 title: VrJoystickConstants.actionKeyR,
                 subtitle: _actionLabel(VrJoystickConstants.actionKeyR),
                 active: _btnRActive,
-                colors: const [Color(0xFFFF9100), Color(0xFFD64D18)],
+                colors: const [Color(0xFF818CF8), Color(0xFF6366F1)],
                 onDown: () => setState(
                   () => _btnRActive = !driving || !_steering.state.paused,
                 ),
@@ -5161,7 +5394,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 title: VrJoystickConstants.actionKeyZL,
                 subtitle: _actionLabel(VrJoystickConstants.actionKeyZL),
                 active: _btnZLActive,
-                colors: const [Color(0xFF18687E), Color(0xFF294D94)],
+                colors: const [Color(0xFF00E5FF), Color(0xFF0284C7)],
                 onDown: () => setState(() => _btnZLActive = true),
                 onUp: () => setState(() => _btnZLActive = false),
               ),
@@ -5170,7 +5403,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 title: VrJoystickConstants.actionKeyZR,
                 subtitle: _actionLabel(VrJoystickConstants.actionKeyZR),
                 active: _btnZRActive,
-                colors: const [Color(0xFFE06A23), Color(0xFFAF3A32)],
+                colors: const [Color(0xFFA78BFA), Color(0xFF7C3AED)],
                 onDown: () => setState(() => _btnZRActive = true),
                 onUp: () => setState(() => _btnZRActive = false),
               ),
@@ -5179,8 +5412,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 title: VrJoystickConstants.actionKeyY,
                 subtitle: _actionLabel(VrJoystickConstants.actionKeyY),
                 active: _btnYActive,
-                colors: const [Color(0xFFFFD54F), Color(0xFFF59E0B)],
-                textColor: const Color(0xFF211500),
+                colors: const [Color(0xFFFBBF24), Color(0xFFF59E0B)],
                 onDown: () => setState(() => _btnYActive = true),
                 onUp: () => setState(() => _btnYActive = false),
               ),
@@ -5189,7 +5421,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 title: VrJoystickConstants.actionKeyX,
                 subtitle: _actionLabel(VrJoystickConstants.actionKeyX),
                 active: _btnXActive,
-                colors: const [Color(0xFF2979FF), Color(0xFF1555BA)],
+                colors: const [Color(0xFF60A5FA), Color(0xFF2563EB)],
                 onDown: () {
                   if (driving) {
                     setState(() {
@@ -5209,7 +5441,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 title: VrJoystickConstants.actionKeyB,
                 subtitle: _actionLabel(VrJoystickConstants.actionKeyB),
                 active: _btnBActive,
-                colors: const [Color(0xFFFF5252), Color(0xFFB71C45)],
+                colors: const [Color(0xFFF87171), Color(0xFFE11D48)],
                 onDown: () => setState(() {
                   if (driving) {
                     _steering.setPaused(true);
@@ -5224,7 +5456,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 title: VrJoystickConstants.actionKeyA,
                 subtitle: _actionLabel(VrJoystickConstants.actionKeyA),
                 active: _btnAActive,
-                colors: const [Color(0xFF10B981), Color(0xFF087848)],
+                colors: const [Color(0xFF34D399), Color(0xFF059669)],
                 onDown: driving
                     ? _selectDrivingMenu
                     : () => setState(() => _btnAActive = true),

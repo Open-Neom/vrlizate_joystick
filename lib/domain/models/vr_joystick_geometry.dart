@@ -73,8 +73,8 @@ class VrJoystickGeometry {
         width >= 2 * minimumSideWidth + 96 &&
         safeHeight >= 3 * target + 2 * clearance;
     final preferredCenterWidth = math.min(
-      width * .4,
-      (width * .30).clamp(128.0, 360.0),
+      width * .38,
+      (width * .26).clamp(124.0, 320.0),
     );
     final leftSideWidth = math.max(
       (width - preferredCenterWidth) / 2,
@@ -108,10 +108,10 @@ class VrJoystickGeometry {
       8.0,
       math.min(
         roomForOpening,
-        math.min(height * .31, (leftSideWidth - rail) / 2),
+        math.min(height * .322, (leftSideWidth - rail) / 2),
       ),
     );
-    final preferredStickRadius = radius - math.min(14.0, radius * .22);
+    final preferredStickRadius = radius - math.min(13.0, radius * .19);
     final stickRadius = math.max(
       4.0,
       hasTargetSpace

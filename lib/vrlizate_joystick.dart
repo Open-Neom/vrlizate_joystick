@@ -32,6 +32,7 @@ export 'domain/services/vr_flick_stick_controller.dart';
 export 'domain/services/vr_gravity_driving_tilt.dart';
 export 'domain/services/vr_inertial_trackball_controller.dart';
 export 'domain/services/vr_joystick_camera_vision_service.dart';
+export 'domain/services/vr_joystick_touch_intent_arbiter.dart';
 export 'domain/services/vr_laser_steady_dwell_controller.dart';
 export 'domain/services/vr_local_network_address.dart';
 export 'domain/services/vr_mobile_pairing_camera_session.dart';
