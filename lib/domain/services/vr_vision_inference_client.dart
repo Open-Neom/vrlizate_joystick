@@ -74,6 +74,7 @@ class VrVisionInferenceClient {
     required int sequence,
     bool detectPose = true,
     bool detectMarker = false,
+    bool detectHands = false,
   }) async {
     if (_disposed) return {'status': 'disposed'};
     if (_busy) return {'status': 'busy'};
@@ -184,6 +185,7 @@ class VrVisionInferenceClient {
           'captureSequence': sequence,
           'detectPose': detectPose,
           'detectMarker': detectMarker,
+          if (detectHands) 'detectHands': true,
           if (iosNv12)
             'mirrored': camera.lensDirection == CameraLensDirection.front,
         },
