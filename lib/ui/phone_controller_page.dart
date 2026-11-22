@@ -798,12 +798,21 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   void _startUdpAutoDiscovery() async {
     if (!widget.allowWifiConnection) return;
     try {
-      final socket = await RawDatagramSocket.bind(
-        InternetAddress.anyIPv4,
-        VrJoystickConstants.udpDiscoveryPort,
-        reuseAddress: true,
-        reusePort: true,
-      );
+      RawDatagramSocket socket;
+      try {
+        socket = await RawDatagramSocket.bind(
+          InternetAddress.anyIPv4,
+          VrJoystickConstants.udpDiscoveryPort,
+          reuseAddress: true,
+          reusePort: !Platform.isWindows && !Platform.isAndroid,
+        );
+      } catch (_) {
+        socket = await RawDatagramSocket.bind(
+          InternetAddress.anyIPv4,
+          VrJoystickConstants.udpDiscoveryPort,
+          reuseAddress: true,
+        );
+      }
       if (!mounted || !widget.allowWifiConnection) {
         socket.close();
         return;
