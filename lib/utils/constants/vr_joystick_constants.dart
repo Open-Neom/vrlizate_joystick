@@ -234,6 +234,16 @@ abstract final class VrJoystickConstants {
   static const String fieldHandU = 'handU';
   static const String fieldHandV = 'handV';
   static const String fieldHandConfidence = 'handConfidence';
+  static const String fieldRightHandDepth = 'rhD';
+  static const String fieldRightHandPinch = 'rhP';
+  static const String fieldRightHandPinchFinger = 'rhF';
+  static const String fieldLeftHandU = 'lhU';
+  static const String fieldLeftHandV = 'lhV';
+  static const String fieldLeftHandConfidence = 'lhC';
+  static const String fieldLeftHandDepth = 'lhD';
+  static const String fieldLeftHandPinch = 'lhP';
+  static const String fieldLeftHandPinchFinger = 'lhF';
+  static const String fieldHandSource = 'handSrc';
   static const String fieldVisorU = 'visorU';
   static const String fieldVisorV = 'visorV';
   static const String fieldVisorWidth = 'visorWidth';

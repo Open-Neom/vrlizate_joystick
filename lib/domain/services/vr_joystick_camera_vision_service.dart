@@ -8,6 +8,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:vrlizate/vrlizate.dart'
+    show ControllerHand, VrHandLandmarks21, VrPinchFinger;
 
 import '../../utils/constants/vr_joystick_constants.dart';
 import 'vr_body_pose_gate.dart';
@@ -81,10 +83,28 @@ class VrJoystickCameraVisionService extends ChangeNotifier
   final VrVisionInferenceClient _inferenceClient;
   final VrBodyPoseGate _bodyPoseGate = VrBodyPoseGate();
   final VrVisionInferenceBudget _inferenceBudget = VrVisionInferenceBudget();
+  final VrVisionInferenceBudget _handInferenceBudget =
+      VrVisionInferenceBudget.handTracking();
   bool _bodyDetectionEnabled = false;
+  bool _handDetectionEnabled = false;
   bool _bodyUnavailable = false;
+  bool _handUnavailable = false;
   int _bodyEpoch = 0;
   int? _lastBodySampleUs;
+  int? _lastMlHandSampleUs;
+  double? _mlLeftHandU;
+  double? _mlLeftHandV;
+  double _mlLeftHandConfidence = 0.0;
+  double? _mlLeftHandDepthMeters;
+  double _mlLeftHandPinch = 0.0;
+  VrPinchFinger? _mlLeftHandPinchFinger;
+  double? _mlRightHandU;
+  double? _mlRightHandV;
+  double _mlRightHandConfidence = 0.0;
+  double? _mlRightHandDepthMeters;
+  double _mlRightHandPinch = 0.0;
+  VrPinchFinger? _mlRightHandPinchFinger;
+  double? _handInferenceMs;
   int _inferenceSequence = 0;
   int _inferenceFramesDropped = 0;
   int _lastBodyMetricsLogUs = 0;
@@ -239,6 +259,64 @@ class VrJoystickCameraVisionService extends ChangeNotifier
       await _queueLensOpen(_activeRole, ++_cameraGeneration);
     }
   }
+
+  /// Enables/disables native 21-point MediaPipe hand landmarking + 4-finger
+  /// Pinch on the Joystick phone's camera (`front` upward view or `rear`) for
+  /// tri-camera fusion and gorilla-arm-free resting-hand gestures.
+  Future<void> setHandDetectionEnabled(bool enabled) async {
+    if (_disposed || _handDetectionEnabled == enabled) return;
+    _handDetectionEnabled = enabled;
+    _handUnavailable = false;
+    _handInferenceBudget.reset();
+    if (!enabled) {
+      _clearMlHands();
+    }
+    notifyListeners();
+    if (_wantsCameraRunning && _cameras.isNotEmpty && !_suspended) {
+      await _queueLensOpen(_activeRole, ++_cameraGeneration);
+    }
+  }
+
+  void _clearMlHands() {
+    _lastMlHandSampleUs = null;
+    _mlLeftHandU = null;
+    _mlLeftHandV = null;
+    _mlLeftHandConfidence = 0.0;
+    _mlLeftHandDepthMeters = null;
+    _mlLeftHandPinch = 0.0;
+    _mlLeftHandPinchFinger = null;
+    _mlRightHandU = null;
+    _mlRightHandV = null;
+    _mlRightHandConfidence = 0.0;
+    _mlRightHandDepthMeters = null;
+    _mlRightHandPinch = 0.0;
+    _mlRightHandPinchFinger = null;
+  }
+
+  bool get handDetectionEnabled => _handDetectionEnabled;
+  bool get hasFreshMlHandSample =>
+      _handDetectionEnabled && _isFresh(_lastMlHandSampleUs, 750000);
+  double? get handInferenceMs => _handInferenceMs;
+  double? get mlLeftHandU => hasFreshMlHandSample ? _mlLeftHandU : null;
+  double? get mlLeftHandV => hasFreshMlHandSample ? _mlLeftHandV : null;
+  double get mlLeftHandConfidence =>
+      hasFreshMlHandSample ? _mlLeftHandConfidence : 0.0;
+  double? get mlLeftHandDepthMeters =>
+      hasFreshMlHandSample ? _mlLeftHandDepthMeters : null;
+  double get mlLeftHandPinchStrength =>
+      hasFreshMlHandSample ? _mlLeftHandPinch : 0.0;
+  VrPinchFinger? get mlLeftHandPinchFinger =>
+      hasFreshMlHandSample ? _mlLeftHandPinchFinger : null;
+  double? get mlRightHandU => hasFreshMlHandSample ? _mlRightHandU : null;
+  double? get mlRightHandV => hasFreshMlHandSample ? _mlRightHandV : null;
+  double get mlRightHandConfidence =>
+      hasFreshMlHandSample ? _mlRightHandConfidence : 0.0;
+  double? get mlRightHandDepthMeters =>
+      hasFreshMlHandSample ? _mlRightHandDepthMeters : null;
+  double get mlRightHandPinchStrength =>
+      hasFreshMlHandSample ? _mlRightHandPinch : 0.0;
+  VrPinchFinger? get mlRightHandPinchFinger =>
+      hasFreshMlHandSample ? _mlRightHandPinchFinger : null;
 
   void _invalidateBody(String status) {
     _bodyEpoch++;
@@ -506,12 +584,18 @@ class VrJoystickCameraVisionService extends ChangeNotifier
     );
     if (matching.isEmpty) return;
     final selected = matching.first;
-    final resolution = _bodyDetectionEnabled
+    final resolution = (_bodyDetectionEnabled || _handDetectionEnabled)
         ? ResolutionPreset.medium
         : ResolutionPreset.low;
+    final desiredIntervalMs =
+        (_handDetectionEnabled && !_bodyDetectionEnabled) ? 45 : 140;
     if (_controller?.description.name == selected.name &&
         _controller?.resolutionPreset == resolution &&
         isCameraStreaming) {
+      await VrCameraAnalysisBudget.configure(
+        _controller!,
+        intervalMs: desiredIntervalMs,
+      );
       return;
     }
     _invalidateBody(_bodyDetectionEnabled ? 'waiting_for_frame' : 'disabled');
@@ -525,7 +609,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
       selected,
       resolution,
       enableAudio: false,
-      fps: 12,
+      fps: _handDetectionEnabled ? 24 : 12,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
     try {
@@ -538,11 +622,11 @@ class VrJoystickCameraVisionService extends ChangeNotifier
       _lastFrameProcessedUs = null;
       final analysisConfigured = await VrCameraAnalysisBudget.configure(
         controller,
-        intervalMs: 140,
+        intervalMs: desiredIntervalMs,
       );
       if (!kReleaseMode) {
         debugPrint(
-          '[VrCameraAnalysisBudget] role=$role cameraId=${controller.cameraId} configured=$analysisConfigured intervalMs=140',
+          '[VrCameraAnalysisBudget] role=$role cameraId=${controller.cameraId} configured=$analysisConfigured intervalMs=$desiredIntervalMs',
         );
       }
       if (!_canOpen(generation)) {
@@ -720,11 +804,16 @@ class VrJoystickCameraVisionService extends ChangeNotifier
     required CameraDescription camera,
     required DeviceOrientation orientation,
   }) async {
-    if (_disposed || _suspended || !_bodyDetectionEnabled || _bodyUnavailable) {
+    final wantPose = _bodyDetectionEnabled && !_bodyUnavailable;
+    final wantHands = _handDetectionEnabled && !_handUnavailable;
+    if (_disposed || _suspended || (!wantPose && !wantHands)) {
       return;
     }
+    final budget = (wantHands && !wantPose)
+        ? _handInferenceBudget
+        : _inferenceBudget;
     final now = _nowMicroseconds();
-    if (_inferenceClient.isBusy || !_inferenceBudget.tryStart(now)) {
+    if (_inferenceClient.isBusy || !budget.tryStart(now)) {
       _inferenceFramesDropped++;
       return;
     }
@@ -738,17 +827,23 @@ class VrJoystickCameraVisionService extends ChangeNotifier
         orientation: orientation,
         sourceId: sourceId,
         sequence: ++_inferenceSequence,
-        detectPose: true,
+        detectPose: wantPose,
         detectMarker: false,
+        detectHands: wantHands,
       );
       if (_disposed || _suspended || epoch != _bodyEpoch) return;
       _bodyRoundTripMs = (_clock.elapsedMicroseconds - startedAt) / 1000;
-      _acceptBodyResult(result, sourceId, now);
+      if (wantPose) {
+        _acceptBodyResult(result, sourceId, now);
+      }
+      if (wantHands) {
+        _acceptHandResult(result, now);
+      }
     } finally {
-      _inferenceBudget.recordCompletion(
+      budget.recordCompletion(
         startedUs: now,
         finishedUs: _nowMicroseconds(),
-        confirmedBody: bodyPresent,
+        confirmedBody: bodyPresent || hasFreshMlHandSample,
       );
     }
     if (!kReleaseMode && now - _lastBodyMetricsLogUs >= 5000000) {
@@ -762,6 +857,106 @@ class VrJoystickCameraVisionService extends ChangeNotifier
         'dropped=$_inferenceFramesDropped',
       );
     }
+    notifyListeners();
+  }
+
+  void _acceptHandResult(Map<String, dynamic> result, int capturedAtUs) {
+    final status = result['status'];
+    if (status == 'thermal_backoff') {
+      final rawRetry = result['retryAfterMs'];
+      final retryMs = rawRetry is num && rawRetry.isFinite
+          ? rawRetry.toInt().clamp(2000, 60000)
+          : 2000;
+      _handInferenceBudget.deferFor(
+        _nowMicroseconds(),
+        retryAfterUs: retryMs * 1000,
+      );
+      _clearMlHands();
+      return;
+    }
+    if (status == 'unavailable' || result['handsStatus'] == 'hands_unavailable') {
+      _handUnavailable = status == 'unavailable';
+      _clearMlHands();
+      return;
+    }
+    final infMs = result['inferenceMs'];
+    if (infMs is num && infMs.isFinite) {
+      _handInferenceMs = infMs.toDouble();
+    }
+    final rawHands = result['hands'];
+    if (rawHands is! List) return;
+
+    VrHandLandmarks21? left;
+    VrHandLandmarks21? right;
+    for (final entry in rawHands) {
+      if (entry is! Map) continue;
+      final parsed = VrHandLandmarks21.fromNativeMap(
+        entry,
+        timestampMicros: capturedAtUs,
+      );
+      if (parsed == null) continue;
+      if (parsed.hand == ControllerHand.left) {
+        if (left == null || parsed.confidence > left.confidence) left = parsed;
+      } else {
+        if (right == null || parsed.confidence > right.confidence) {
+          right = parsed;
+        }
+      }
+    }
+
+    double estimateDepth(VrHandLandmarks21 h) {
+      final w = h.landmarks[0];
+      final m = h.landmarks[9];
+      final palmNorm = math
+          .sqrt((m.x - w.x) * (m.x - w.x) + (m.y - w.y) * (m.y - w.y))
+          .clamp(0.045, 0.65);
+      // Typical smartphone front/rear ~72 deg HFOV -> fNorm ~ 0.688; adult palm ~0.088 m.
+      return (0.088 * 0.688 / palmNorm).clamp(0.24, 1.35);
+    }
+
+    _lastMlHandSampleUs = capturedAtUs;
+    if (left != null) {
+      final uv = left.palmCenterUv;
+      _mlLeftHandU = uv.x.clamp(0.0, 1.0);
+      _mlLeftHandV = uv.y.clamp(0.0, 1.0);
+      _mlLeftHandConfidence = left.confidence.clamp(0.35, 1.0);
+      _mlLeftHandDepthMeters = estimateDepth(left);
+      _mlLeftHandPinch = left.maxPinchStrength;
+      _mlLeftHandPinchFinger = left.dominantPinchFinger;
+    } else {
+      _mlLeftHandU = null;
+      _mlLeftHandV = null;
+      _mlLeftHandConfidence = 0.0;
+      _mlLeftHandDepthMeters = null;
+      _mlLeftHandPinch = 0.0;
+      _mlLeftHandPinchFinger = null;
+    }
+
+    if (right != null) {
+      final uv = right.palmCenterUv;
+      _mlRightHandU = uv.x.clamp(0.0, 1.0);
+      _mlRightHandV = uv.y.clamp(0.0, 1.0);
+      _mlRightHandConfidence = right.confidence.clamp(0.35, 1.0);
+      _mlRightHandDepthMeters = estimateDepth(right);
+      _mlRightHandPinch = right.maxPinchStrength;
+      _mlRightHandPinchFinger = right.dominantPinchFinger;
+    } else {
+      _mlRightHandU = null;
+      _mlRightHandV = null;
+      _mlRightHandConfidence = 0.0;
+      _mlRightHandDepthMeters = null;
+      _mlRightHandPinch = 0.0;
+      _mlRightHandPinchFinger = null;
+    }
+  }
+
+  /// Directly feeds a native MediaPipe 21-pt hand result payload in tests.
+  @visibleForTesting
+  void ingestHandResultForTesting(
+    Map<String, dynamic> result, {
+    int? capturedAtUs,
+  }) {
+    _acceptHandResult(result, capturedAtUs ?? _nowMicroseconds());
     notifyListeners();
   }
 
@@ -1247,7 +1442,10 @@ class VrJoystickCameraVisionService extends ChangeNotifier
     bool includeMiniFrame = true,
   }) {
     if (_disposed ||
-        (!hasFreshCameraSample && !ultrasonicActive && !hasFreshBodySample)) {
+        (!hasFreshCameraSample &&
+            !ultrasonicActive &&
+            !hasFreshBodySample &&
+            !hasFreshMlHandSample)) {
       return null;
     }
     final latestRoleIsFresh = _activeRole == VrJoystickConstants.cameraRoleRear
@@ -1257,6 +1455,17 @@ class VrJoystickCameraVisionService extends ChangeNotifier
       _latestMiniFrameBase64 ??= base64Encode(_latestMiniFrame!);
     }
     final metricRange = currentRangeMeters;
+    final mlHandsActive = hasFreshMlHandSample &&
+        (_mlRightHandConfidence > 0 || _mlLeftHandConfidence > 0);
+    final effectiveRightU = mlHandsActive && _mlRightHandU != null
+        ? _mlRightHandU!
+        : _handU;
+    final effectiveRightV = mlHandsActive && _mlRightHandV != null
+        ? _mlRightHandV!
+        : _handV;
+    final effectiveRightConf = mlHandsActive
+        ? _mlRightHandConfidence
+        : handConfidence;
     return <String, Object?>{
       VrJoystickConstants.fieldType:
           VrJoystickConstants.visionTelemetryMessageType,
@@ -1264,16 +1473,42 @@ class VrJoystickCameraVisionService extends ChangeNotifier
           ? null
           : _round3(metricRange),
       'rangeSource': metricRange == null ? null : 'calibrated_acoustic_echo',
-      'opticalEstimated': true,
-      'opticalSource': 'heuristic_edges_chroma',
+      'opticalEstimated': !mlHandsActive,
+      'opticalSource': mlHandsActive
+          ? 'mediapipe_hand_21'
+          : 'heuristic_edges_chroma',
       VrJoystickConstants.fieldLeftFootU: _round3(_leftFootU),
       VrJoystickConstants.fieldLeftFootV: _round3(_leftFootV),
       VrJoystickConstants.fieldRightFootU: _round3(_rightFootU),
       VrJoystickConstants.fieldRightFootV: _round3(_rightFootV),
       VrJoystickConstants.fieldFeetConfidence: _round3(feetConfidence),
-      VrJoystickConstants.fieldHandU: _round3(_handU),
-      VrJoystickConstants.fieldHandV: _round3(_handV),
-      VrJoystickConstants.fieldHandConfidence: _round3(handConfidence),
+      VrJoystickConstants.fieldHandU: _round3(effectiveRightU),
+      VrJoystickConstants.fieldHandV: _round3(effectiveRightV),
+      VrJoystickConstants.fieldHandConfidence: _round3(effectiveRightConf),
+      if (mlHandsActive) ...{
+        VrJoystickConstants.fieldHandSource: 'mediapipe_21',
+        VrJoystickConstants.fieldRightHandDepth: _mlRightHandDepthMeters == null
+            ? null
+            : _round3(_mlRightHandDepthMeters!),
+        VrJoystickConstants.fieldRightHandPinch: _round3(_mlRightHandPinch),
+        VrJoystickConstants.fieldRightHandPinchFinger:
+            _mlRightHandPinchFinger?.name,
+        VrJoystickConstants.fieldLeftHandU: _mlLeftHandU == null
+            ? null
+            : _round3(_mlLeftHandU!),
+        VrJoystickConstants.fieldLeftHandV: _mlLeftHandV == null
+            ? null
+            : _round3(_mlLeftHandV!),
+        VrJoystickConstants.fieldLeftHandConfidence: _round3(
+          _mlLeftHandConfidence,
+        ),
+        VrJoystickConstants.fieldLeftHandDepth: _mlLeftHandDepthMeters == null
+            ? null
+            : _round3(_mlLeftHandDepthMeters!),
+        VrJoystickConstants.fieldLeftHandPinch: _round3(_mlLeftHandPinch),
+        VrJoystickConstants.fieldLeftHandPinchFinger:
+            _mlLeftHandPinchFinger?.name,
+      },
       VrJoystickConstants.fieldVisorU: _round3(_visorU),
       VrJoystickConstants.fieldVisorV: _round3(_visorV),
       VrJoystickConstants.fieldVisorWidth: _round3(_visorWidth),

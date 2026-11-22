@@ -3370,6 +3370,48 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                               ),
                               if (_visionService.bodyDetectionEnabled)
                                 _buildBodyInferenceDiagnostic(),
+                              SwitchListTile(
+                                key: const ValueKey(
+                                  'controller-hand-detection',
+                                ),
+                                contentPadding: EdgeInsets.zero,
+                                value: _visionService.handDetectionEnabled,
+                                activeThumbColor: const Color(0xFF00E5FF),
+                                title: const Text(
+                                  'Manos 21 pts y Pinch (Tri-Cámara)',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                subtitle: const Text(
+                                  'Detecta ambas manos, profundidad y Pinch de 4 dedos '
+                                  'desde el mando para fusionar con Visor y PC.',
+                                  style: TextStyle(
+                                    color: Colors.white60,
+                                    fontSize: 10,
+                                  ),
+                                ),
+                                onChanged: _cameraSettingsBusy
+                                    ? null
+                                    : (enabled) async {
+                                        setModalState(
+                                          () => _cameraSettingsBusy = true,
+                                        );
+                                        try {
+                                          await _visionService
+                                              .setHandDetectionEnabled(enabled);
+                                        } finally {
+                                          if (ctx.mounted) {
+                                            setModalState(
+                                              () => _cameraSettingsBusy = false,
+                                            );
+                                          } else {
+                                            _cameraSettingsBusy = false;
+                                          }
+                                        }
+                                      },
+                              ),
                               DropdownButton<String>(
                                 key: const ValueKey(
                                   'controller-auxiliary-lens',

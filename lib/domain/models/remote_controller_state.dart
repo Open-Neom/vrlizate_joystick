@@ -84,6 +84,16 @@ class RemoteControllerState {
   final double? handU;
   final double? handV;
   final double? handConfidence;
+  final double? rightHandDepthMeters;
+  final double? rightHandPinchStrength;
+  final String? rightHandPinchFinger;
+  final double? leftHandU;
+  final double? leftHandV;
+  final double? leftHandConfidence;
+  final double? leftHandDepthMeters;
+  final double? leftHandPinchStrength;
+  final String? leftHandPinchFinger;
+  final String? handTrackingSource;
   final double? visorU;
   final double? visorV;
   final double? visorWidth;
@@ -146,6 +156,16 @@ class RemoteControllerState {
     this.handU,
     this.handV,
     this.handConfidence,
+    this.rightHandDepthMeters,
+    this.rightHandPinchStrength,
+    this.rightHandPinchFinger,
+    this.leftHandU,
+    this.leftHandV,
+    this.leftHandConfidence,
+    this.leftHandDepthMeters,
+    this.leftHandPinchStrength,
+    this.leftHandPinchFinger,
+    this.handTrackingSource,
     this.visorU,
     this.visorV,
     this.visorWidth,
