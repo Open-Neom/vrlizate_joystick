@@ -11,6 +11,8 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:vrlizate/vrlizate.dart'
     show
         ControllerHand,
+        VrCompactMudraSample,
+        VrEMudraCameraRole,
         VrHandLandmarks21,
         VrHandLandmarks21GestureExt,
         VrHandPosture,
@@ -105,6 +107,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
   VrPinchFinger? _mlLeftHandPinchFinger;
   VrHandPosture _mlLeftHandPosture = VrHandPosture.unknown;
   double _mlLeftHandOpenness = 0.0;
+  String? _mlLeftMudraWire;
   double? _mlRightHandU;
   double? _mlRightHandV;
   double _mlRightHandConfidence = 0.0;
@@ -113,6 +116,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
   VrPinchFinger? _mlRightHandPinchFinger;
   VrHandPosture _mlRightHandPosture = VrHandPosture.unknown;
   double _mlRightHandOpenness = 0.0;
+  String? _mlRightMudraWire;
   double? _handInferenceMs;
   int _inferenceSequence = 0;
   int _inferenceFramesDropped = 0;
@@ -296,6 +300,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
     _mlLeftHandPinchFinger = null;
     _mlLeftHandPosture = VrHandPosture.unknown;
     _mlLeftHandOpenness = 0.0;
+    _mlLeftMudraWire = null;
     _mlRightHandU = null;
     _mlRightHandV = null;
     _mlRightHandConfidence = 0.0;
@@ -304,6 +309,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
     _mlRightHandPinchFinger = null;
     _mlRightHandPosture = VrHandPosture.unknown;
     _mlRightHandOpenness = 0.0;
+    _mlRightMudraWire = null;
   }
 
   /// One-tap activation of the Joystick phone's 21-pt MediaPipe hand & ademán
@@ -1023,14 +1029,22 @@ class VrJoystickCameraVisionService extends ChangeNotifier
     if (left != null) {
       final uv = left.palmCenterUv;
       final gesture = left.classifyPosture();
+      final depth = estimateDepth(left);
       _mlLeftHandU = uv.x.clamp(0.0, 1.0);
       _mlLeftHandV = uv.y.clamp(0.0, 1.0);
       _mlLeftHandConfidence = left.confidence.clamp(0.35, 1.0);
-      _mlLeftHandDepthMeters = estimateDepth(left);
+      _mlLeftHandDepthMeters = depth;
       _mlLeftHandPinch = left.maxPinchStrength;
       _mlLeftHandPinchFinger = left.dominantPinchFinger;
       _mlLeftHandPosture = gesture.posture;
       _mlLeftHandOpenness = gesture.openness;
+      _mlLeftMudraWire = VrCompactMudraSample.fromLandmarks21(
+        hand: ControllerHand.left,
+        cameraRole: VrEMudraCameraRole.joystickUpward,
+        landmarks21Normalized: left.landmarks,
+        confidence: _mlLeftHandConfidence,
+        palmDepthMeters: depth,
+      ).toWireString();
     } else {
       _mlLeftHandU = null;
       _mlLeftHandV = null;
@@ -1040,19 +1054,28 @@ class VrJoystickCameraVisionService extends ChangeNotifier
       _mlLeftHandPinchFinger = null;
       _mlLeftHandPosture = VrHandPosture.unknown;
       _mlLeftHandOpenness = 0.0;
+      _mlLeftMudraWire = null;
     }
 
     if (right != null) {
       final uv = right.palmCenterUv;
       final gesture = right.classifyPosture();
+      final depth = estimateDepth(right);
       _mlRightHandU = uv.x.clamp(0.0, 1.0);
       _mlRightHandV = uv.y.clamp(0.0, 1.0);
       _mlRightHandConfidence = right.confidence.clamp(0.35, 1.0);
-      _mlRightHandDepthMeters = estimateDepth(right);
+      _mlRightHandDepthMeters = depth;
       _mlRightHandPinch = right.maxPinchStrength;
       _mlRightHandPinchFinger = right.dominantPinchFinger;
       _mlRightHandPosture = gesture.posture;
       _mlRightHandOpenness = gesture.openness;
+      _mlRightMudraWire = VrCompactMudraSample.fromLandmarks21(
+        hand: ControllerHand.right,
+        cameraRole: VrEMudraCameraRole.joystickUpward,
+        landmarks21Normalized: right.landmarks,
+        confidence: _mlRightHandConfidence,
+        palmDepthMeters: depth,
+      ).toWireString();
     } else {
       _mlRightHandU = null;
       _mlRightHandV = null;
@@ -1062,6 +1085,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
       _mlRightHandPinchFinger = null;
       _mlRightHandPosture = VrHandPosture.unknown;
       _mlRightHandOpenness = 0.0;
+      _mlRightMudraWire = null;
     }
   }
 
@@ -1632,6 +1656,10 @@ class VrJoystickCameraVisionService extends ChangeNotifier
         VrJoystickConstants.fieldLeftHandOpenness: _round3(
           _mlLeftHandOpenness,
         ),
+        if (_mlRightMudraWire != null)
+          VrJoystickConstants.fieldRightMudraWire: _mlRightMudraWire,
+        if (_mlLeftMudraWire != null)
+          VrJoystickConstants.fieldLeftMudraWire: _mlLeftMudraWire,
       },
       VrJoystickConstants.fieldVisorU: _round3(_visorU),
       VrJoystickConstants.fieldVisorV: _round3(_visorV),

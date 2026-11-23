@@ -144,6 +144,8 @@ class VrButtonMapping {
       leftHandPinchFinger: state.leftHandPinchFinger,
       leftHandGesture: state.leftHandGesture,
       leftHandOpenness: state.leftHandOpenness,
+      rightMudraWire: state.rightMudraWire,
+      leftMudraWire: state.leftMudraWire,
       handTrackingSource: state.handTrackingSource,
       visorU: state.visorU,
       visorV: state.visorV,

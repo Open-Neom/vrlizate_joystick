@@ -97,6 +97,8 @@ class RemoteControllerState {
   final String? leftHandPinchFinger;
   final String? leftHandGesture;
   final double? leftHandOpenness;
+  final String? rightMudraWire;
+  final String? leftMudraWire;
   final String? handTrackingSource;
   final double? visorU;
   final double? visorV;
@@ -173,6 +175,8 @@ class RemoteControllerState {
     this.leftHandPinchFinger,
     this.leftHandGesture,
     this.leftHandOpenness,
+    this.rightMudraWire,
+    this.leftMudraWire,
     this.handTrackingSource,
     this.visorU,
     this.visorV,

@@ -5999,7 +5999,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                     behavior: HitTestBehavior.opaque,
                     onTap: () => unawaited(_toggleJoystickHands()),
                     child: Container(
-                      height: 24,
+                      height: 20,
                       padding: const EdgeInsets.symmetric(horizontal: 7),
                       decoration: BoxDecoration(
                         color: active

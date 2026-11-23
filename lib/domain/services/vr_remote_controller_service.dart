@@ -480,6 +480,8 @@ class VrRemoteControllerService {
         leftHandPinchFinger: src.leftHandPinchFinger,
         leftHandGesture: src.leftHandGesture,
         leftHandOpenness: src.leftHandOpenness,
+        rightMudraWire: src.rightMudraWire,
+        leftMudraWire: src.leftMudraWire,
         handTrackingSource: src.handTrackingSource,
         visorU: src.visorU,
         visorV: src.visorV,
@@ -1722,6 +1724,8 @@ class VrRemoteControllerService {
             leftHandPinchFinger: _latchedLeftHandPinchFinger,
             leftHandGesture: _latchedLeftHandGesture,
             leftHandOpenness: _latchedLeftHandOpenness,
+            rightMudraWire: _latchedRightMudraWire,
+            leftMudraWire: _latchedLeftMudraWire,
             handTrackingSource: _latchedHandTrackingSource,
             visorU: _latchedVisorU,
             visorV: _latchedVisorV,
@@ -1782,6 +1786,8 @@ class VrRemoteControllerService {
   String? _latchedLeftHandPinchFinger;
   String? _latchedLeftHandGesture;
   double? _latchedLeftHandOpenness;
+  String? _latchedRightMudraWire;
+  String? _latchedLeftMudraWire;
   String? _latchedHandTrackingSource;
   double? _latchedVisorU;
   double? _latchedVisorV;
@@ -1874,6 +1880,14 @@ class VrRemoteControllerService {
       _latchedLeftHandOpenness = finiteNum(
         VrJoystickConstants.fieldLeftHandOpenness,
       );
+    }
+    if (json.containsKey(VrJoystickConstants.fieldRightMudraWire)) {
+      final m = json[VrJoystickConstants.fieldRightMudraWire];
+      _latchedRightMudraWire = m is String && m.isNotEmpty ? m : null;
+    }
+    if (json.containsKey(VrJoystickConstants.fieldLeftMudraWire)) {
+      final m = json[VrJoystickConstants.fieldLeftMudraWire];
+      _latchedLeftMudraWire = m is String && m.isNotEmpty ? m : null;
     }
     final handSrc = json[VrJoystickConstants.fieldHandSource];
     if (handSrc is String && handSrc.isNotEmpty) {
@@ -1979,6 +1993,8 @@ class VrRemoteControllerService {
       leftHandPinchFinger: _latchedLeftHandPinchFinger,
       leftHandGesture: _latchedLeftHandGesture,
       leftHandOpenness: _latchedLeftHandOpenness,
+      rightMudraWire: _latchedRightMudraWire,
+      leftMudraWire: _latchedLeftMudraWire,
       handTrackingSource: _latchedHandTrackingSource,
       visorU: _latchedVisorU,
       visorV: _latchedVisorV,
@@ -2128,6 +2144,8 @@ class VrRemoteControllerService {
       leftHandPinchFinger: _latchedLeftHandPinchFinger,
       leftHandGesture: _latchedLeftHandGesture,
       leftHandOpenness: _latchedLeftHandOpenness,
+      rightMudraWire: _latchedRightMudraWire,
+      leftMudraWire: _latchedLeftMudraWire,
       handTrackingSource: _latchedHandTrackingSource,
       visorU: _latchedVisorU,
       visorV: _latchedVisorV,
@@ -2283,6 +2301,8 @@ class VrRemoteControllerService {
       leftHandPinchFinger: _latchedLeftHandPinchFinger,
       leftHandGesture: _latchedLeftHandGesture,
       leftHandOpenness: _latchedLeftHandOpenness,
+      rightMudraWire: _latchedRightMudraWire,
+      leftMudraWire: _latchedLeftMudraWire,
       handTrackingSource: _latchedHandTrackingSource,
       visorU: _latchedVisorU,
       visorV: _latchedVisorV,
