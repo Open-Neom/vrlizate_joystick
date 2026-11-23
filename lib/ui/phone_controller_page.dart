@@ -408,6 +408,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   bool _cameraSettingsBusy = false;
   bool _showAuxiliaryCameraPreview = false;
   int _lastVisionTelemetryUs = 0;
+  int _lastMiniFrameVisionUs = 0;
+  bool _userDisabledJoystickHands = false;
   int _lastPassthroughHapticBucket = 0;
   bool _spatialHudVisible = false;
   double _lastSentPassthroughMix = 0.0;
@@ -603,7 +605,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               _motionLook.updateGravity(event.x, event.y, event.z, nowUs);
               if (_visionService.enableHardwareCameraStream ||
                   _visionService.enableUltrasonicRanging ||
-                  _visionService.bodyDetectionEnabled) {
+                  _visionService.bodyDetectionEnabled ||
+                  _visionService.handDetectionEnabled) {
                 _visionService.updateImuGravity(event.x, event.y, event.z);
               }
               if (!_settingsOpen && !_castDialogOpen) {
@@ -1165,7 +1168,8 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       if (!_visionService.isDesktopOffloadPaused &&
           (_visionService.enableHardwareCameraStream ||
               _visionService.enableUltrasonicRanging ||
-              _visionService.bodyDetectionEnabled)) {
+              _visionService.bodyDetectionEnabled ||
+              _visionService.handDetectionEnabled)) {
         _visionService.tick();
         _sendVisionTelemetryMessageIfDue(now);
       }
@@ -1712,6 +1716,9 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _sendState();
       _sendPublicTrackingMarker();
       unawaited(_announceAiCapabilities(socket, generation));
+      if (!_showsBluetooth && !_userDisabledJoystickHands) {
+        unawaited(_visionService.autoStartHandsIfPermitted());
+      }
       // The callback is observational; a host storage failure must not tear
       // down the authenticated controller transport.
       if (_isConnected && identical(_socket, socket)) {
@@ -2449,9 +2456,25 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     setState(() {
       _spatialHudVisible = next;
     });
+    if (next && !_visionService.handDetectionEnabled) {
+      _userDisabledJoystickHands = false;
+      unawaited(_visionService.enableHandsSensing(preferFrontCamera: true));
+    }
     _hapticClick();
     _sendPassthroughControlMessage(force: true);
     _sendState(force: true);
+  }
+
+  Future<void> _toggleJoystickHands() async {
+    _hapticClick();
+    if (_visionService.handDetectionEnabled) {
+      _userDisabledJoystickHands = true;
+      await _visionService.disableHandsSensing();
+    } else {
+      _userDisabledJoystickHands = false;
+      await _visionService.enableHandsSensing(preferFrontCamera: true);
+    }
+    if (mounted) setState(() {});
   }
 
   void _sendPassthroughControlMessage({
@@ -2504,13 +2527,21 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   void _sendVisionTelemetryMessageIfDue(int nowUs) {
     final ws = _socket;
     if (ws == null || !ws.isOpen || !_isConnected || !_isForeground) return;
-    final minIntervalUs = _showsBluetooth ? 1500000 : 500000;
+    final fastHands =
+        _visionService.handDetectionEnabled ||
+        _visionService.hasFreshMlHandSample;
+    final minIntervalUs = fastHands
+        ? (_showsBluetooth ? 420000 : 65000)
+        : (_showsBluetooth ? 1500000 : 500000);
     if (nowUs - _lastVisionTelemetryUs < minIntervalUs) return;
+    final includeMini =
+        !_showsBluetooth && (nowUs - _lastMiniFrameVisionUs >= 500000);
     final payloadMap = _visionService.buildVisionTelemetryPayload(
-      includeMiniFrame: !_showsBluetooth,
+      includeMiniFrame: includeMini,
     );
     if (payloadMap == null) return;
     _lastVisionTelemetryUs = nowUs;
+    if (includeMini) _lastMiniFrameVisionUs = nowUs;
     try {
       ws.add(jsonEncode(payloadMap));
     } catch (_) {
@@ -4239,12 +4270,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
 
   EdgeInsets _joystickSafeInsets(BuildContext context) {
     final padding = MediaQuery.viewPaddingOf(context);
-    final gestures = MediaQuery.systemGestureInsetsOf(context);
+    // Keep horizontal camera-cutout clearance, while using minimal vertical
+    // margins so both Left & Right joystick decks stretch full screen height
+    // (top to bottom) without losing ~60 dp to Android edge-gesture bars.
     return EdgeInsets.fromLTRB(
-      math.max(padding.left, gestures.left),
-      math.max(padding.top, gestures.top),
-      math.max(padding.right, gestures.right),
-      math.max(padding.bottom, gestures.bottom),
+      padding.left,
+      math.min(padding.top, 4.0),
+      padding.right,
+      math.min(padding.bottom, 4.0),
     );
   }
 
@@ -4927,6 +4960,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           required Rect rect,
           required bool isLeftWing,
           required bool emphasized,
+          VrYinYangCradleEdge cradleEdge = VrYinYangCradleEdge.none,
           Key? firstKey,
           required String firstTitle,
           required String firstSubtitle,
@@ -4975,6 +5009,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 width: rect.width,
                 height: rect.height,
                 emphasized: emphasized,
+                cradleEdge: cradleEdge,
                 firstKey:
                     firstKey ??
                     ValueKey(
@@ -5385,9 +5420,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         Widget deckShell({
           required Key key,
           required Rect rect,
+          required Rect stickRect,
           required Color accent,
           required bool highlighted,
         }) {
+          final stickCenterLocal = stickRect.center - rect.topLeft;
+          final collarRadius = stickRect.shortestSide * 0.5 + 4.5;
           return Positioned.fromRect(
             rect: rect,
             child: IgnorePointer(
@@ -5399,19 +5437,27 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   color: highlighted
                       ? const Color(0x9A0B1429)
                       : const Color(0x80080D1B),
-                  borderRadius: BorderRadius.circular(24),
+                  borderRadius: BorderRadius.circular(22),
                   border: Border.all(
                     color: highlighted
-                        ? accent.withValues(alpha: 0.86)
-                        : accent.withValues(alpha: 0.40),
-                    width: highlighted ? 1.7 : 1.25,
+                        ? accent.withValues(alpha: 0.88)
+                        : accent.withValues(alpha: 0.44),
+                    width: highlighted ? 1.8 : 1.35,
                   ),
                   boxShadow: [
                     BoxShadow(
-                      color: accent.withValues(alpha: highlighted ? 0.16 : 0.07),
+                      color: accent.withValues(alpha: highlighted ? 0.18 : 0.08),
                       blurRadius: 16,
                     ),
                   ],
+                ),
+                child: CustomPaint(
+                  painter: _DeckStickCollarPainter(
+                    center: stickCenterLocal,
+                    radius: collarRadius,
+                    accent: accent,
+                    highlighted: highlighted,
+                  ),
                 ),
               ),
             ),
@@ -5502,12 +5548,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               deckShell(
                 key: const ValueKey('joystick_deck_left'),
                 rect: deck.leftDeck,
+                stickRect: deck.leftStickRect,
                 accent: const Color(0xFF00E5FF),
                 highlighted: lookActive && !moveActive,
               ),
               deckShell(
                 key: const ValueKey('joystick_deck_right'),
                 rect: deck.rightDeck,
+                stickRect: deck.rightStickRect,
                 accent: const Color(0xFF818CF8),
                 highlighted: moveActive && !lookActive,
               ),
@@ -5595,6 +5643,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 rect: deck.leftTopPairRect,
                 isLeftWing: true,
                 emphasized: lookActive && !moveActive,
+                cradleEdge: VrYinYangCradleEdge.bottom,
                 firstTitle: VrJoystickConstants.actionKeyX,
                 firstSubtitle: _actionLabel(VrJoystickConstants.actionKeyX),
                 firstActive: _btnXActive,
@@ -5623,6 +5672,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 rect: deck.leftBottomPairRect,
                 isLeftWing: true,
                 emphasized: lookActive && !moveActive,
+                cradleEdge: VrYinYangCradleEdge.top,
                 firstKey: const ValueKey(
                   '${VrJoystickConstants.keyJoystickButtonPrefix}left_${VrJoystickConstants.actionKeyA}',
                 ),
@@ -5655,6 +5705,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 rect: deck.rightTopPairRect,
                 isLeftWing: false,
                 emphasized: moveActive && !lookActive,
+                cradleEdge: VrYinYangCradleEdge.bottom,
                 firstKey: const ValueKey(
                   '${VrJoystickConstants.keyJoystickButtonPrefix}right_${VrJoystickConstants.actionKeyX}',
                 ),
@@ -5689,6 +5740,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 rect: deck.rightBottomPairRect,
                 isLeftWing: false,
                 emphasized: moveActive && !lookActive,
+                cradleEdge: VrYinYangCradleEdge.top,
                 firstTitle: VrJoystickConstants.actionKeyA,
                 firstSubtitle: _actionLabel(VrJoystickConstants.actionKeyA),
                 firstActive: _btnAActive,
@@ -5924,6 +5976,73 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 onToggleSpatialHud: () => _toggleSpatialHud(),
               ),
             ),
+          if (constraints.maxHeight >= buttonHeight + 92 + buttonGap) ...[
+            const SizedBox(height: 3),
+            _exclusivePassthroughControl(
+              ListenableBuilder(
+                listenable: _visionService,
+                builder: (_, _) {
+                  final active = _visionService.handDetectionEnabled;
+                  final summary = _visionService.liveHandsStatusSummary;
+                  final hasLock = _visionService.hasFreshMlHandSample &&
+                      (_visionService.mlLeftHandConfidence > 0 ||
+                          _visionService.mlRightHandConfidence > 0);
+                  final accent = hasLock
+                      ? const Color(0xFF10B981)
+                      : (active
+                            ? const Color(0xFF38BDF8)
+                            : const Color(0xFF94A3B8));
+                  return GestureDetector(
+                    key: const ValueKey(
+                      VrJoystickConstants.keyJoystickHandsToggle,
+                    ),
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => unawaited(_toggleJoystickHands()),
+                    child: Container(
+                      height: 24,
+                      padding: const EdgeInsets.symmetric(horizontal: 7),
+                      decoration: BoxDecoration(
+                        color: active
+                            ? accent.withValues(alpha: hasLock ? 0.22 : 0.14)
+                            : const Color(0xFF0E172A),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: active
+                              ? accent.withValues(alpha: 0.80)
+                              : Colors.white24,
+                          width: active ? 1.25 : 1.0,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            active
+                                ? Icons.pan_tool_rounded
+                                : Icons.pan_tool_outlined,
+                            size: 12,
+                            color: accent,
+                          ),
+                          const SizedBox(width: 5),
+                          Expanded(
+                            child: Text(
+                              summary ?? 'Manos 2D → Visor (Activar)',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: active ? Colors.white : Colors.white70,
+                                fontSize: 9.0,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
           if (constraints.maxHeight >= buttonHeight + 30 + buttonGap)
             SizedBox(height: buttonGap),
           SizedBox(
@@ -6827,4 +6946,64 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       ),
     );
   }
+}
+
+/// Paints a sculpted circular collar bezel inside each 2D controller deck shell
+/// so the giant `MOVER` / `MIRAR` thumbstick visually fuses with the concave
+/// curved `X/Y` and `A/B` Yin-Yang button wings.
+class _DeckStickCollarPainter extends CustomPainter {
+  const _DeckStickCollarPainter({
+    required this.center,
+    required this.radius,
+    required this.accent,
+    required this.highlighted,
+  });
+
+  final Offset center;
+  final double radius;
+  final Color accent;
+  final bool highlighted;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (radius <= 8.0) return;
+    final outerRect = Rect.fromCircle(center: center, radius: radius + 4.0);
+    canvas.drawCircle(
+      center,
+      radius + 2.0,
+      Paint()
+        ..color = accent.withValues(alpha: highlighted ? 0.14 : 0.07)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 5.5,
+    );
+    canvas.drawArc(
+      outerRect,
+      -math.pi * 0.78,
+      math.pi * 0.56,
+      false,
+      Paint()
+        ..color = accent.withValues(alpha: highlighted ? 0.56 : 0.30)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.6
+        ..strokeCap = StrokeCap.round,
+    );
+    canvas.drawArc(
+      outerRect,
+      math.pi * 0.22,
+      math.pi * 0.56,
+      false,
+      Paint()
+        ..color = accent.withValues(alpha: highlighted ? 0.56 : 0.30)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.6
+        ..strokeCap = StrokeCap.round,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _DeckStickCollarPainter oldDelegate) =>
+      oldDelegate.center != center ||
+      oldDelegate.radius != radius ||
+      oldDelegate.accent != accent ||
+      oldDelegate.highlighted != highlighted;
 }

@@ -470,12 +470,16 @@ class VrRemoteControllerService {
         rightHandDepthMeters: src.rightHandDepthMeters,
         rightHandPinchStrength: src.rightHandPinchStrength,
         rightHandPinchFinger: src.rightHandPinchFinger,
+        rightHandGesture: src.rightHandGesture,
+        rightHandOpenness: src.rightHandOpenness,
         leftHandU: src.leftHandU,
         leftHandV: src.leftHandV,
         leftHandConfidence: src.leftHandConfidence,
         leftHandDepthMeters: src.leftHandDepthMeters,
         leftHandPinchStrength: src.leftHandPinchStrength,
         leftHandPinchFinger: src.leftHandPinchFinger,
+        leftHandGesture: src.leftHandGesture,
+        leftHandOpenness: src.leftHandOpenness,
         handTrackingSource: src.handTrackingSource,
         visorU: src.visorU,
         visorV: src.visorV,
@@ -1708,12 +1712,16 @@ class VrRemoteControllerService {
             rightHandDepthMeters: _latchedRightHandDepthMeters,
             rightHandPinchStrength: _latchedRightHandPinchStrength,
             rightHandPinchFinger: _latchedRightHandPinchFinger,
+            rightHandGesture: _latchedRightHandGesture,
+            rightHandOpenness: _latchedRightHandOpenness,
             leftHandU: _latchedLeftHandU,
             leftHandV: _latchedLeftHandV,
             leftHandConfidence: _latchedLeftHandConfidence,
             leftHandDepthMeters: _latchedLeftHandDepthMeters,
             leftHandPinchStrength: _latchedLeftHandPinchStrength,
             leftHandPinchFinger: _latchedLeftHandPinchFinger,
+            leftHandGesture: _latchedLeftHandGesture,
+            leftHandOpenness: _latchedLeftHandOpenness,
             handTrackingSource: _latchedHandTrackingSource,
             visorU: _latchedVisorU,
             visorV: _latchedVisorV,
@@ -1764,12 +1772,16 @@ class VrRemoteControllerService {
   double? _latchedRightHandDepthMeters;
   double? _latchedRightHandPinchStrength;
   String? _latchedRightHandPinchFinger;
+  String? _latchedRightHandGesture;
+  double? _latchedRightHandOpenness;
   double? _latchedLeftHandU;
   double? _latchedLeftHandV;
   double? _latchedLeftHandConfidence;
   double? _latchedLeftHandDepthMeters;
   double? _latchedLeftHandPinchStrength;
   String? _latchedLeftHandPinchFinger;
+  String? _latchedLeftHandGesture;
+  double? _latchedLeftHandOpenness;
   String? _latchedHandTrackingSource;
   double? _latchedVisorU;
   double? _latchedVisorV;
@@ -1820,6 +1832,15 @@ class VrRemoteControllerService {
       final f = json[VrJoystickConstants.fieldRightHandPinchFinger];
       _latchedRightHandPinchFinger = f is String && f.isNotEmpty ? f : null;
     }
+    if (json.containsKey(VrJoystickConstants.fieldRightHandGesture)) {
+      final g = json[VrJoystickConstants.fieldRightHandGesture];
+      _latchedRightHandGesture = g is String && g.isNotEmpty ? g : null;
+    }
+    if (json.containsKey(VrJoystickConstants.fieldRightHandOpenness)) {
+      _latchedRightHandOpenness = finiteNum(
+        VrJoystickConstants.fieldRightHandOpenness,
+      );
+    }
     if (json.containsKey(VrJoystickConstants.fieldLeftHandU)) {
       _latchedLeftHandU = finiteNum(VrJoystickConstants.fieldLeftHandU);
     }
@@ -1844,6 +1865,15 @@ class VrRemoteControllerService {
     if (json.containsKey(VrJoystickConstants.fieldLeftHandPinchFinger)) {
       final f = json[VrJoystickConstants.fieldLeftHandPinchFinger];
       _latchedLeftHandPinchFinger = f is String && f.isNotEmpty ? f : null;
+    }
+    if (json.containsKey(VrJoystickConstants.fieldLeftHandGesture)) {
+      final g = json[VrJoystickConstants.fieldLeftHandGesture];
+      _latchedLeftHandGesture = g is String && g.isNotEmpty ? g : null;
+    }
+    if (json.containsKey(VrJoystickConstants.fieldLeftHandOpenness)) {
+      _latchedLeftHandOpenness = finiteNum(
+        VrJoystickConstants.fieldLeftHandOpenness,
+      );
     }
     final handSrc = json[VrJoystickConstants.fieldHandSource];
     if (handSrc is String && handSrc.isNotEmpty) {
@@ -1939,12 +1969,16 @@ class VrRemoteControllerService {
       rightHandDepthMeters: _latchedRightHandDepthMeters,
       rightHandPinchStrength: _latchedRightHandPinchStrength,
       rightHandPinchFinger: _latchedRightHandPinchFinger,
+      rightHandGesture: _latchedRightHandGesture,
+      rightHandOpenness: _latchedRightHandOpenness,
       leftHandU: _latchedLeftHandU,
       leftHandV: _latchedLeftHandV,
       leftHandConfidence: _latchedLeftHandConfidence,
       leftHandDepthMeters: _latchedLeftHandDepthMeters,
       leftHandPinchStrength: _latchedLeftHandPinchStrength,
       leftHandPinchFinger: _latchedLeftHandPinchFinger,
+      leftHandGesture: _latchedLeftHandGesture,
+      leftHandOpenness: _latchedLeftHandOpenness,
       handTrackingSource: _latchedHandTrackingSource,
       visorU: _latchedVisorU,
       visorV: _latchedVisorV,
@@ -2084,12 +2118,16 @@ class VrRemoteControllerService {
       rightHandDepthMeters: _latchedRightHandDepthMeters,
       rightHandPinchStrength: _latchedRightHandPinchStrength,
       rightHandPinchFinger: _latchedRightHandPinchFinger,
+      rightHandGesture: _latchedRightHandGesture,
+      rightHandOpenness: _latchedRightHandOpenness,
       leftHandU: _latchedLeftHandU,
       leftHandV: _latchedLeftHandV,
       leftHandConfidence: _latchedLeftHandConfidence,
       leftHandDepthMeters: _latchedLeftHandDepthMeters,
       leftHandPinchStrength: _latchedLeftHandPinchStrength,
       leftHandPinchFinger: _latchedLeftHandPinchFinger,
+      leftHandGesture: _latchedLeftHandGesture,
+      leftHandOpenness: _latchedLeftHandOpenness,
       handTrackingSource: _latchedHandTrackingSource,
       visorU: _latchedVisorU,
       visorV: _latchedVisorV,
@@ -2235,12 +2273,16 @@ class VrRemoteControllerService {
       rightHandDepthMeters: _latchedRightHandDepthMeters,
       rightHandPinchStrength: _latchedRightHandPinchStrength,
       rightHandPinchFinger: _latchedRightHandPinchFinger,
+      rightHandGesture: _latchedRightHandGesture,
+      rightHandOpenness: _latchedRightHandOpenness,
       leftHandU: _latchedLeftHandU,
       leftHandV: _latchedLeftHandV,
       leftHandConfidence: _latchedLeftHandConfidence,
       leftHandDepthMeters: _latchedLeftHandDepthMeters,
       leftHandPinchStrength: _latchedLeftHandPinchStrength,
       leftHandPinchFinger: _latchedLeftHandPinchFinger,
+      leftHandGesture: _latchedLeftHandGesture,
+      leftHandOpenness: _latchedLeftHandOpenness,
       handTrackingSource: _latchedHandTrackingSource,
       visorU: _latchedVisorU,
       visorV: _latchedVisorV,

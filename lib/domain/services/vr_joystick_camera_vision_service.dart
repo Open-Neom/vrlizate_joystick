@@ -9,7 +9,12 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:vrlizate/vrlizate.dart'
-    show ControllerHand, VrHandLandmarks21, VrPinchFinger;
+    show
+        ControllerHand,
+        VrHandLandmarks21,
+        VrHandLandmarks21GestureExt,
+        VrHandPosture,
+        VrPinchFinger;
 
 import '../../utils/constants/vr_joystick_constants.dart';
 import 'vr_body_pose_gate.dart';
@@ -98,12 +103,16 @@ class VrJoystickCameraVisionService extends ChangeNotifier
   double? _mlLeftHandDepthMeters;
   double _mlLeftHandPinch = 0.0;
   VrPinchFinger? _mlLeftHandPinchFinger;
+  VrHandPosture _mlLeftHandPosture = VrHandPosture.unknown;
+  double _mlLeftHandOpenness = 0.0;
   double? _mlRightHandU;
   double? _mlRightHandV;
   double _mlRightHandConfidence = 0.0;
   double? _mlRightHandDepthMeters;
   double _mlRightHandPinch = 0.0;
   VrPinchFinger? _mlRightHandPinchFinger;
+  VrHandPosture _mlRightHandPosture = VrHandPosture.unknown;
+  double _mlRightHandOpenness = 0.0;
   double? _handInferenceMs;
   int _inferenceSequence = 0;
   int _inferenceFramesDropped = 0;
@@ -285,12 +294,67 @@ class VrJoystickCameraVisionService extends ChangeNotifier
     _mlLeftHandDepthMeters = null;
     _mlLeftHandPinch = 0.0;
     _mlLeftHandPinchFinger = null;
+    _mlLeftHandPosture = VrHandPosture.unknown;
+    _mlLeftHandOpenness = 0.0;
     _mlRightHandU = null;
     _mlRightHandV = null;
     _mlRightHandConfidence = 0.0;
     _mlRightHandDepthMeters = null;
     _mlRightHandPinch = 0.0;
     _mlRightHandPinchFinger = null;
+    _mlRightHandPosture = VrHandPosture.unknown;
+    _mlRightHandOpenness = 0.0;
+  }
+
+  /// One-tap activation of the Joystick phone's 21-pt MediaPipe hand & ademán
+  /// analyzer (defaults to the upward-facing front camera so hands above the
+  /// controller are tracked cleanly and streamed to the Visor at ~15 Hz).
+  Future<bool> enableHandsSensing({bool preferFrontCamera = true}) async {
+    if (_disposed) return false;
+    _enableHardwareCameraStream = true;
+    if (preferFrontCamera) {
+      _autoMultiplexLenses = false;
+      _activeRole = VrJoystickConstants.cameraRoleFront;
+    }
+    await setHandDetectionEnabled(true);
+    await start();
+    if (preferFrontCamera && isCameraStreaming) {
+      await switchLens(VrJoystickConstants.cameraRoleFront);
+    }
+    if (!_disposed) notifyListeners();
+    return isCameraStreaming && _handDetectionEnabled;
+  }
+
+  /// Disables 21-pt hand sensing on the Joystick phone and stops its camera if
+  /// body detection isn't actively using it.
+  Future<void> disableHandsSensing() async {
+    if (_disposed) return;
+    await setHandDetectionEnabled(false);
+    if (!_bodyDetectionEnabled) {
+      _enableHardwareCameraStream = false;
+      await stop();
+    }
+    if (!_disposed) notifyListeners();
+  }
+
+  /// Auto-starts Joystick 21-pt hand & ademán sensing when camera permission
+  /// was already granted earlier (never pops an unrequested permission dialog).
+  Future<bool> autoStartHandsIfPermitted() async {
+    if (_disposed ||
+        _isFlutterTestEnvironment ||
+        _desktopOffloadPaused ||
+        kIsWeb ||
+        !(Platform.isAndroid || Platform.isIOS)) {
+      return false;
+    }
+    if (_handDetectionEnabled && isCameraStreaming) return true;
+    try {
+      final status = await Permission.camera.status;
+      if (!status.isGranted || _disposed) return false;
+      return await enableHandsSensing(preferFrontCamera: true);
+    } catch (_) {
+      return false;
+    }
   }
 
   bool get handDetectionEnabled => _handDetectionEnabled;
@@ -307,6 +371,10 @@ class VrJoystickCameraVisionService extends ChangeNotifier
       hasFreshMlHandSample ? _mlLeftHandPinch : 0.0;
   VrPinchFinger? get mlLeftHandPinchFinger =>
       hasFreshMlHandSample ? _mlLeftHandPinchFinger : null;
+  VrHandPosture get mlLeftHandPosture =>
+      hasFreshMlHandSample ? _mlLeftHandPosture : VrHandPosture.unknown;
+  double get mlLeftHandOpenness =>
+      hasFreshMlHandSample ? _mlLeftHandOpenness : 0.0;
   double? get mlRightHandU => hasFreshMlHandSample ? _mlRightHandU : null;
   double? get mlRightHandV => hasFreshMlHandSample ? _mlRightHandV : null;
   double get mlRightHandConfidence =>
@@ -317,6 +385,43 @@ class VrJoystickCameraVisionService extends ChangeNotifier
       hasFreshMlHandSample ? _mlRightHandPinch : 0.0;
   VrPinchFinger? get mlRightHandPinchFinger =>
       hasFreshMlHandSample ? _mlRightHandPinchFinger : null;
+  VrHandPosture get mlRightHandPosture =>
+      hasFreshMlHandSample ? _mlRightHandPosture : VrHandPosture.unknown;
+  double get mlRightHandOpenness =>
+      hasFreshMlHandSample ? _mlRightHandOpenness : 0.0;
+
+  /// Compact real-time summary shown on the Joystick center panel so the user
+  /// can verify live hand/ademán calculations being streamed to the Visor.
+  String? get liveHandsStatusSummary {
+    if (!_handDetectionEnabled) return null;
+    if (hasFreshMlHandSample &&
+        (_mlLeftHandConfidence > 0 || _mlRightHandConfidence > 0)) {
+      final parts = <String>[];
+      if (_mlLeftHandConfidence > 0) {
+        final d = _mlLeftHandDepthMeters != null
+            ? ' ${_mlLeftHandDepthMeters!.toStringAsFixed(2)}m'
+            : '';
+        parts.add('I:${_mlLeftHandPosture.emoji}$d');
+      }
+      if (_mlRightHandConfidence > 0) {
+        final d = _mlRightHandDepthMeters != null
+            ? ' ${_mlRightHandDepthMeters!.toStringAsFixed(2)}m'
+            : '';
+        parts.add('D:${_mlRightHandPosture.emoji}$d');
+      }
+      final ms = _handInferenceMs != null
+          ? ' · ${_handInferenceMs!.round()}ms'
+          : '';
+      return '2D→Visor · ${parts.join(' · ')}$ms';
+    }
+    if (isCameraStreaming) {
+      final lens = _activeRole == VrJoystickConstants.cameraRoleFront
+          ? 'Frontal'
+          : 'Trasera';
+      return 'Manos 2D ($lens) · Buscando…';
+    }
+    return 'Manos 2D · Iniciando cámara…';
+  }
 
   void _invalidateBody(String status) {
     _bodyEpoch++;
@@ -917,12 +1022,15 @@ class VrJoystickCameraVisionService extends ChangeNotifier
     _lastMlHandSampleUs = capturedAtUs;
     if (left != null) {
       final uv = left.palmCenterUv;
+      final gesture = left.classifyPosture();
       _mlLeftHandU = uv.x.clamp(0.0, 1.0);
       _mlLeftHandV = uv.y.clamp(0.0, 1.0);
       _mlLeftHandConfidence = left.confidence.clamp(0.35, 1.0);
       _mlLeftHandDepthMeters = estimateDepth(left);
       _mlLeftHandPinch = left.maxPinchStrength;
       _mlLeftHandPinchFinger = left.dominantPinchFinger;
+      _mlLeftHandPosture = gesture.posture;
+      _mlLeftHandOpenness = gesture.openness;
     } else {
       _mlLeftHandU = null;
       _mlLeftHandV = null;
@@ -930,16 +1038,21 @@ class VrJoystickCameraVisionService extends ChangeNotifier
       _mlLeftHandDepthMeters = null;
       _mlLeftHandPinch = 0.0;
       _mlLeftHandPinchFinger = null;
+      _mlLeftHandPosture = VrHandPosture.unknown;
+      _mlLeftHandOpenness = 0.0;
     }
 
     if (right != null) {
       final uv = right.palmCenterUv;
+      final gesture = right.classifyPosture();
       _mlRightHandU = uv.x.clamp(0.0, 1.0);
       _mlRightHandV = uv.y.clamp(0.0, 1.0);
       _mlRightHandConfidence = right.confidence.clamp(0.35, 1.0);
       _mlRightHandDepthMeters = estimateDepth(right);
       _mlRightHandPinch = right.maxPinchStrength;
       _mlRightHandPinchFinger = right.dominantPinchFinger;
+      _mlRightHandPosture = gesture.posture;
+      _mlRightHandOpenness = gesture.openness;
     } else {
       _mlRightHandU = null;
       _mlRightHandV = null;
@@ -947,6 +1060,8 @@ class VrJoystickCameraVisionService extends ChangeNotifier
       _mlRightHandDepthMeters = null;
       _mlRightHandPinch = 0.0;
       _mlRightHandPinchFinger = null;
+      _mlRightHandPosture = VrHandPosture.unknown;
+      _mlRightHandOpenness = 0.0;
     }
   }
 
@@ -1493,6 +1608,11 @@ class VrJoystickCameraVisionService extends ChangeNotifier
         VrJoystickConstants.fieldRightHandPinch: _round3(_mlRightHandPinch),
         VrJoystickConstants.fieldRightHandPinchFinger:
             _mlRightHandPinchFinger?.name,
+        VrJoystickConstants.fieldRightHandGesture:
+            _mlRightHandPosture.wireName,
+        VrJoystickConstants.fieldRightHandOpenness: _round3(
+          _mlRightHandOpenness,
+        ),
         VrJoystickConstants.fieldLeftHandU: _mlLeftHandU == null
             ? null
             : _round3(_mlLeftHandU!),
@@ -1508,6 +1628,10 @@ class VrJoystickCameraVisionService extends ChangeNotifier
         VrJoystickConstants.fieldLeftHandPinch: _round3(_mlLeftHandPinch),
         VrJoystickConstants.fieldLeftHandPinchFinger:
             _mlLeftHandPinchFinger?.name,
+        VrJoystickConstants.fieldLeftHandGesture: _mlLeftHandPosture.wireName,
+        VrJoystickConstants.fieldLeftHandOpenness: _round3(
+          _mlLeftHandOpenness,
+        ),
       },
       VrJoystickConstants.fieldVisorU: _round3(_visorU),
       VrJoystickConstants.fieldVisorV: _round3(_visorV),

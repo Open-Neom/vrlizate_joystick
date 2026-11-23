@@ -4,24 +4,53 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+/// Concave circular cradle edge sculpted onto a [VrYinYangButtonPair] so upper
+/// (`X/Y`) and lower (`A/B`) buttons curve gracefully around the giant central
+/// `MOVER` / `MIRAR` thumbstick.
+enum VrYinYangCradleEdge { none, bottom, top }
+
 /// Exact sculptural Yin-Yang S-curve geometry shared between VRlizate's 1D
 /// handheld console and 2D dedicated smartphone joystick decks.
 abstract final class VrYinYangGeometry {
   static const double _seamHalfGap = 2.0;
 
   /// Builds the disjoint interlocking [lowerLeft] (`X` / `A`) and [upperRight]
-  /// (`Y` / `B`) lobe paths inside [size].
-  static ({Path lowerLeft, Path upperRight}) buildPaths(Size size) {
+  /// (`Y` / `B`) lobe paths inside [size], optionally sculpting a concave
+  /// circular cradle along [cradleEdge] to hug an adjacent oversized stick.
+  static ({Path lowerLeft, Path upperRight}) buildPaths(
+    Size size, {
+    VrYinYangCradleEdge cradleEdge = VrYinYangCradleEdge.none,
+  }) {
     final w = math.max(4.0, size.width);
     final h = math.max(4.0, size.height);
     final radius = math.min(h * 0.48, 42.0);
-    final outer = Path()
+    var outer = Path()
       ..addRRect(
         RRect.fromRectAndRadius(
           Rect.fromLTWH(1.0, 1.0, math.max(2.0, w - 2.0), math.max(2.0, h - 2.0)),
           Radius.circular(radius),
         ),
       );
+
+    if (cradleEdge != VrYinYangCradleEdge.none && w >= 60.0 && h >= 28.0) {
+      // Sculpt a smooth concave cradle arc at the center of the stick-facing
+      // edge while keeping both outer wing lobes lush and deep.
+      final archDepth = (h * 0.22).clamp(4.0, 18.0);
+      final archHalfW = w * 0.30;
+      final circleRadius =
+          (archHalfW * archHalfW + archDepth * archDepth) / (2.0 * archDepth);
+      final centerY = cradleEdge == VrYinYangCradleEdge.bottom
+          ? (h - archDepth + circleRadius)
+          : (archDepth - circleRadius);
+      final cradleCutout = Path()
+        ..addOval(
+          Rect.fromCircle(
+            center: Offset(w * 0.5, centerY),
+            radius: circleRadius,
+          ),
+        );
+      outer = Path.combine(PathOperation.difference, outer, cradleCutout);
+    }
 
     final p0x = w * 0.45;
     final c1x = w * 0.36;
@@ -96,8 +125,12 @@ abstract final class VrYinYangGeometry {
 
   /// Returns `true` when [local] hits the lower-left lobe (`X` / `A`), or
   /// `false` when it hits the upper-right lobe (`Y` / `B`).
-  static bool hitsLowerLeft(Offset local, Size size) {
-    final paths = buildPaths(size);
+  static bool hitsLowerLeft(
+    Offset local,
+    Size size, {
+    VrYinYangCradleEdge cradleEdge = VrYinYangCradleEdge.none,
+  }) {
+    final paths = buildPaths(size, cradleEdge: cradleEdge);
     if (paths.lowerLeft.contains(local)) return true;
     if (paths.upperRight.contains(local)) return false;
     return local.dy >= seamYAt(local.dx, size);
@@ -133,6 +166,7 @@ class VrYinYangButtonPair extends StatefulWidget {
     required this.width,
     required this.height,
     this.emphasized = false,
+    this.cradleEdge = VrYinYangCradleEdge.none,
     required this.firstKey,
     required this.firstPrimary,
     required this.firstCaption,
@@ -153,6 +187,7 @@ class VrYinYangButtonPair extends StatefulWidget {
   final double width;
   final double height;
   final bool emphasized;
+  final VrYinYangCradleEdge cradleEdge;
 
   final Key firstKey;
   final String firstPrimary;
@@ -281,6 +316,7 @@ class _VrYinYangButtonPairState extends State<VrYinYangButtonPair> {
           final isFirst = VrYinYangGeometry.hitsLowerLeft(
             event.localPosition,
             size,
+            cradleEdge: widget.cradleEdge,
           );
           if (_usesIntercept) {
             _pointerLobe[event.pointer] = isFirst;
@@ -359,6 +395,7 @@ class _VrYinYangButtonPairState extends State<VrYinYangButtonPair> {
                   firstActive: widget.firstActive,
                   secondActive: widget.secondActive,
                   emphasized: widget.emphasized,
+                  cradleEdge: widget.cradleEdge,
                   firstColor: widget.firstColor,
                   secondColor: widget.secondColor,
                 ),
@@ -392,7 +429,7 @@ class _VrYinYangButtonPairState extends State<VrYinYangButtonPair> {
                             color: widget.firstActive
                                 ? Colors.white
                                 : widget.firstColor,
-                            fontSize: xlarge ? 21.0 : (lush ? 18.0 : 14.0),
+                            fontSize: xlarge ? 23.0 : (lush ? 19.5 : 15.0),
                             fontWeight: FontWeight.w900,
                             height: 1.0,
                             decoration: TextDecoration.none,
@@ -447,7 +484,7 @@ class _VrYinYangButtonPairState extends State<VrYinYangButtonPair> {
                             color: widget.secondActive
                                 ? Colors.white
                                 : widget.secondColor,
-                            fontSize: xlarge ? 21.0 : (lush ? 18.0 : 14.0),
+                            fontSize: xlarge ? 23.0 : (lush ? 19.5 : 15.0),
                             fontWeight: FontWeight.w900,
                             height: 1.0,
                             decoration: TextDecoration.none,
@@ -486,6 +523,7 @@ class _VrYinYangButtonPairPainter extends CustomPainter {
     required this.firstActive,
     required this.secondActive,
     required this.emphasized,
+    required this.cradleEdge,
     required this.firstColor,
     required this.secondColor,
   });
@@ -493,6 +531,7 @@ class _VrYinYangButtonPairPainter extends CustomPainter {
   final bool firstActive;
   final bool secondActive;
   final bool emphasized;
+  final VrYinYangCradleEdge cradleEdge;
   final Color firstColor;
   final Color secondColor;
 
@@ -552,14 +591,16 @@ class _VrYinYangButtonPairPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paths = VrYinYangGeometry.buildPaths(size);
+    final paths = VrYinYangGeometry.buildPaths(size, cradleEdge: cradleEdge);
+    final dotLowerY = cradleEdge == VrYinYangCradleEdge.bottom ? 0.78 : 0.87;
+    final dotUpperY = cradleEdge == VrYinYangCradleEdge.top ? 0.30 : 0.22;
     _paintLobe(
       canvas,
       size,
       paths.lowerLeft,
       color: firstColor,
       active: firstActive,
-      accentDot: Offset(size.width * 0.80, size.height * 0.87),
+      accentDot: Offset(size.width * 0.86, size.height * dotLowerY),
     );
     _paintLobe(
       canvas,
@@ -567,7 +608,7 @@ class _VrYinYangButtonPairPainter extends CustomPainter {
       paths.upperRight,
       color: secondColor,
       active: secondActive,
-      accentDot: Offset(size.width * 0.52, size.height * 0.22),
+      accentDot: Offset(size.width * 0.56, size.height * dotUpperY),
     );
   }
 
@@ -576,6 +617,7 @@ class _VrYinYangButtonPairPainter extends CustomPainter {
       oldDelegate.firstActive != firstActive ||
       oldDelegate.secondActive != secondActive ||
       oldDelegate.emphasized != emphasized ||
+      oldDelegate.cradleEdge != cradleEdge ||
       oldDelegate.firstColor != firstColor ||
       oldDelegate.secondColor != secondColor;
 }
@@ -838,23 +880,26 @@ class Vr2dYinYangDeckLayout {
   }) {
     final w = size.width;
     final h = size.height;
-    final padL = math.max(6.0, leftInset);
-    final padR = math.max(6.0, rightInset);
-    final padT = math.max(6.0, topInset);
-    final padB = math.max(6.0, bottomInset);
+    // Use full vertical screen height (minimal 2 dp edge trim) and keep
+    // horizontal safe insets only for camera punch-holes so BOTH decks and all
+    // buttons + joysticks fill the full screen cleanly.
+    final padL = math.max(2.0, leftInset);
+    final padR = math.max(2.0, rightInset);
+    final padT = math.max(2.0, topInset);
+    final padB = math.max(2.0, bottomInset);
     final safeW = math.max(120.0, w - padL - padR);
     final safeH = math.max(100.0, h - padT - padB);
 
-    final spacious = safeW >= 740 && safeH >= 360;
-    final deckPad = spacious ? 8.0 : 5.0;
-    final gap = spacious ? 7.0 : 4.5;
-    final deckGap = spacious ? 10.0 : 6.0;
+    final spacious = safeW >= 720 && safeH >= 340;
+    final deckPad = spacious ? 4.0 : 3.0;
+    final gap = spacious ? 3.5 : 2.5;
+    final deckGap = spacious ? 6.0 : 4.0;
 
-    // Reserve clean center column (~29–34% width) and give BOTH Left & Right
-    // decks symmetrical, generous width (~33–35% each).
-    final centerW = (safeW * 0.31).clamp(
-      math.min(136.0, safeW * 0.34),
-      math.min(300.0, safeW * 0.38),
+    // Tighten center column (~26.5% width) so Left & Right decks get lush,
+    // full-size width (~36% each) for giant sticks and large sculpted buttons.
+    final centerW = (safeW * 0.265).clamp(
+      math.min(132.0, safeW * 0.32),
+      math.min(256.0, safeW * 0.34),
     );
     final deckW = math.max(88.0, (safeW - centerW - deckGap * 2) / 2.0);
     final innerW = math.max(64.0, deckW - deckPad * 2);
@@ -865,18 +910,17 @@ class Vr2dYinYangDeckLayout {
     final centerWidth = math.max(60.0, rightDeck.left - deckGap - centerLeft);
     final centerPanel = Rect.fromLTWH(centerLeft, 0, centerWidth, h);
 
-    // 4-row symmetrical 1D stack inside each deck:
-    // Top L/R Shoulder Pill + Upper X/Y Yin-Yang + Large Equal Center Stick + Lower A/B Yin-Yang
+    // Full-height 4-row sculpted stack inside each deck:
+    // Top L/R Shoulder Pill -> Upper X/Y Curved Yin-Yang -> Giant MOVER/MIRAR Stick
+    // -> Lower A/B Curved Yin-Yang, stretching edge-to-edge with zero wasted margin!
     final availH = math.max(84.0, safeH - deckPad * 2 - gap * 3);
-    final shoulderH = (safeH * 0.105).clamp(24.0, spacious ? 36.0 : 30.0);
+    final shoulderH = (safeH * 0.105).clamp(26.0, spacious ? 42.0 : 34.0);
     final bodyH = math.max(60.0, availH - shoulderH);
     final stickSize = math.min(
       innerW,
-      (bodyH * 0.49).clamp(48.0, spacious ? 196.0 : 154.0),
+      (bodyH * 0.56).clamp(56.0, spacious ? 248.0 : 196.0),
     );
-    final yinYangH = math
-        .max(26.0, (bodyH - stickSize) / 2.0)
-        .clamp(26.0, spacious ? 96.0 : 76.0);
+    final yinYangH = math.max(26.0, (bodyH - stickSize) / 2.0);
 
     final stackH = shoulderH + yinYangH * 2 + stickSize + gap * 3;
     final yStart = padT + math.max(deckPad, (safeH - stackH) / 2.0);

@@ -237,12 +237,16 @@ abstract final class VrJoystickConstants {
   static const String fieldRightHandDepth = 'rhD';
   static const String fieldRightHandPinch = 'rhP';
   static const String fieldRightHandPinchFinger = 'rhF';
+  static const String fieldRightHandGesture = 'rhG';
+  static const String fieldRightHandOpenness = 'rhO';
   static const String fieldLeftHandU = 'lhU';
   static const String fieldLeftHandV = 'lhV';
   static const String fieldLeftHandConfidence = 'lhC';
   static const String fieldLeftHandDepth = 'lhD';
   static const String fieldLeftHandPinch = 'lhP';
   static const String fieldLeftHandPinchFinger = 'lhF';
+  static const String fieldLeftHandGesture = 'lhG';
+  static const String fieldLeftHandOpenness = 'lhO';
   static const String fieldHandSource = 'handSrc';
   static const String fieldVisorU = 'visorU';
   static const String fieldVisorV = 'visorV';
@@ -253,6 +257,7 @@ abstract final class VrJoystickConstants {
       'passthrough_curtain_overlay';
   static const String keyBreakthroughCenterBar = 'breakthrough_center_bar';
   static const String keySpatialHudToggle = 'spatial_hud_toggle';
+  static const String keyJoystickHandsToggle = 'joystick_hands_toggle';
 
   // Joystick Camera Vision (Cám 2 Piso + Cám 3 Manos/Visor) & Ultrasonic Sonar Constants
   static const String ultrasonicSonarChannelName = 'vrlizate/ultrasonic_sonar';
