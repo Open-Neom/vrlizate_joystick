@@ -265,7 +265,12 @@ void main() {
           matching: find.byType(VrYinYangButtonPair),
         );
         final xyPairRect = tester.getRect(xyPairFinder);
-        final collarPoint = Offset(moveStickRect.center.dx, xyPairRect.top + 4);
+        // X/Y now sits directly ABOVE moveStick (matching 1D deck layout), so
+        // its bottom rim hugs moveStick.top.
+        final collarPoint = Offset(
+          moveStickRect.center.dx,
+          xyPairRect.bottom - 4,
+        );
         expect(xyPairRect.contains(collarPoint), isTrue);
 
         final beforeCount = link.packets.length;
@@ -275,8 +280,8 @@ void main() {
         expect(link.packets.last['btnX'], isFalse);
         expect(link.packets.last['btnY'], isFalse);
 
-        // Drag up-right smoothly into the stick -> hands off to moveStick!
-        await gesture.moveBy(const Offset(48, -32));
+        // Drag down-right smoothly into the stick -> hands off to moveStick!
+        await gesture.moveBy(const Offset(48, 32));
         await tester.pump(const Duration(milliseconds: 40));
 
         final handedPackets = link.packets.sublist(beforeCount);

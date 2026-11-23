@@ -425,7 +425,9 @@ void main() {
     await tester.pump();
     expect(attempts, 1);
     expect(find.textContaining('La IP sola'), findsNothing);
-    final a = await tester.startGesture(tester.getCenter(find.text('A')));
+    final a = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('joystick_button_A'))),
+    );
     await tester.pump(const Duration(milliseconds: 110));
     await _pumpUntil(tester, () => service.latestState.btnA);
     expect(
@@ -433,7 +435,9 @@ void main() {
       isFalse,
     );
     await a.up();
-    final b = await tester.startGesture(tester.getCenter(find.text('B')));
+    final b = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('joystick_button_B'))),
+    );
     await tester.pump(const Duration(milliseconds: 110));
     await _pumpUntil(tester, () => service.latestState.btnB);
     await b.up();
@@ -588,7 +592,9 @@ void main() {
       ),
     );
     await tester.pump();
-    final held = await tester.startGesture(tester.getCenter(find.text('A')));
+    final held = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('joystick_button_A'))),
+    );
     await tester.pump(const Duration(milliseconds: 110));
     expect(
       links.single.sent
@@ -598,7 +604,7 @@ void main() {
     );
     await links.single.close();
     await tester.pump();
-    await tester.pump(const Duration(milliseconds: 499));
+    await tester.pump(const Duration(milliseconds: 349));
     expect(links, hasLength(1));
     await tester.pump(const Duration(milliseconds: 1));
     await tester.pump();
@@ -672,7 +678,9 @@ void main() {
       ),
     );
     await tester.pump();
-    final held = await tester.startGesture(tester.getCenter(find.text('A')));
+    final held = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('joystick_button_A'))),
+    );
     await tester.pump(const Duration(milliseconds: 110));
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
     await tester.pump();
@@ -713,7 +721,7 @@ void main() {
     );
     await tester.pump();
     expect(attempts, 1);
-    for (final delay in [500, 1000, 2000, 4000, 8000, 10000]) {
+    for (final delay in [350, 900, 1800, 3000, 5000]) {
       final before = attempts;
       await tester.pump(Duration(milliseconds: delay - 1));
       expect(attempts, before);
@@ -723,22 +731,22 @@ void main() {
     // A headset may be unavailable for longer than the old six-retry window.
     for (var i = 0; i < 6; i++) {
       final before = attempts;
-      await tester.pump(const Duration(milliseconds: 9999));
+      await tester.pump(const Duration(milliseconds: 4999));
       expect(attempts, before);
       await tester.pump(const Duration(milliseconds: 1));
       expect(attempts, before + 1);
     }
-    expect(attempts, 13);
+    expect(attempts, 12);
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
     await tester.pump();
     await tester.pump(const Duration(minutes: 1));
-    expect(attempts, 13, reason: 'Suspension cancels automatic attempts');
+    expect(attempts, 12, reason: 'Suspension cancels automatic attempts');
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await tester.pump(const Duration(milliseconds: 1));
-    expect(attempts, 14);
+    expect(attempts, 13);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(minutes: 1));
-    expect(attempts, 14, reason: 'Leaving the controller cancels recovery');
+    expect(attempts, 13, reason: 'Leaving the controller cancels recovery');
     expect(tester.takeException(), isNull);
   });
 

@@ -483,18 +483,21 @@ void main() {
         expect(leftDeck.right, lessThan(rightDeck.left));
         expect(leftDeck.width, closeTo(rightDeck.width, 0.5));
 
+        expect(find.byType(VrDeckShoulderPill), findsNWidgets(2));
         expect(find.byType(VrYinYangButtonPair), findsNWidgets(4));
 
         final regions = <String, Rect>{};
         for (final key in [
           'joystick_button_L',
           'joystick_button_R',
-          'joystick_button_ZL',
-          'joystick_button_ZR',
           'joystick_button_Y',
           'joystick_button_X',
           'joystick_button_B',
           'joystick_button_A',
+          'joystick_button_left_A',
+          'joystick_button_left_B',
+          'joystick_button_right_X',
+          'joystick_button_right_Y',
           'joystick_move_stick',
           'joystick_look_stick',
           'joystick_recenter',
@@ -562,30 +565,38 @@ void main() {
           pairRects.add(pairRect);
         }
 
-        // Left deck vertical order: Top Yin-Yang (L/ZL) -> MOVER -> Bottom Yin-Yang (X/Y)
+        // Left deck vertical order (matches 1D): Top L -> X/Y above -> MOVER -> A/B below
         expect(
           regions['joystick_button_L']!.bottom,
+          lessThanOrEqualTo(regions['joystick_button_X']!.top),
+        );
+        expect(
+          regions['joystick_button_X']!.bottom,
           lessThanOrEqualTo(moveStick.top),
         );
         expect(
-          regions['joystick_button_ZL']!.bottom,
+          regions['joystick_button_Y']!.bottom,
           lessThanOrEqualTo(moveStick.top),
         );
         expect(
-          regions['joystick_button_X']!.top,
+          regions['joystick_button_left_A']!.top,
           greaterThanOrEqualTo(moveStick.bottom),
         );
         expect(
-          regions['joystick_button_Y']!.top,
+          regions['joystick_button_left_B']!.top,
           greaterThanOrEqualTo(moveStick.bottom),
         );
-        // Right deck vertical order: Top Yin-Yang (ZR/R) -> MIRAR -> Bottom Yin-Yang (A/B)
+        // Right deck vertical order (matches 1D): Top R -> X/Y above -> MIRAR -> A/B below
         expect(
-          regions['joystick_button_ZR']!.bottom,
+          regions['joystick_button_R']!.bottom,
+          lessThanOrEqualTo(regions['joystick_button_right_X']!.top),
+        );
+        expect(
+          regions['joystick_button_right_X']!.bottom,
           lessThanOrEqualTo(lookStick.top),
         );
         expect(
-          regions['joystick_button_R']!.bottom,
+          regions['joystick_button_right_Y']!.bottom,
           lessThanOrEqualTo(lookStick.top),
         );
         expect(
@@ -974,7 +985,7 @@ void main() {
       if (service.latestState.btnB) 'B',
     };
     for (final (key, point) in [
-      for (final key in ['L', 'R', 'ZL', 'ZR', 'Y', 'B'])
+      for (final key in ['L', 'R', 'Y', 'B'])
         (key, _buttonPoint(tester, key)),
     ]) {
       final finger = await tester.startGesture(point);
@@ -984,22 +995,19 @@ void main() {
         reason: '$key at $point',
       );
       expect(active(), {key}, reason: 'the region must emit exactly its owner');
-      if (key.startsWith('Z')) {
-        expect(service.latestState.isTriggerPressed, isFalse);
-      }
       await finger.up();
       await _pumpUntil(tester, () => active().isEmpty);
     }
     final movement = await tester.startGesture(leftStick.center);
     await movement.moveBy(Offset(0, -leftStick.height / 3));
-    final leftTrigger = await tester.startGesture(_buttonPoint(tester, 'ZL'));
-    final rightTrigger = await tester.startGesture(_buttonPoint(tester, 'ZR'));
+    final leftTrigger = await tester.startGesture(_buttonPoint(tester, 'L'));
+    final rightTrigger = await tester.startGesture(_buttonPoint(tester, 'R'));
     await _pumpUntil(tester, () => active().length == 2);
-    expect(active(), {'ZL', 'ZR'});
+    expect(active(), {'L', 'R'});
     await _pumpUntil(tester, () => service.latestState.stickY > 0);
     await rightTrigger.cancel();
     await _pumpUntil(tester, () => active().length == 1);
-    expect(active(), {'ZL'});
+    expect(active(), {'L'});
     await leftTrigger.up();
     await _pumpUntil(tester, () => active().isEmpty);
     await movement.up();
@@ -1047,7 +1055,7 @@ void main() {
         expect(authenticatedTarget?.secure, isFalse);
 
         final gesture = await tester.startGesture(
-          tester.getCenter(find.text('A')),
+          tester.getCenter(find.byKey(const ValueKey('joystick_button_A'))),
         );
         await tester.pump(const Duration(milliseconds: 100));
         await _pumpUntil(
@@ -1494,7 +1502,7 @@ void main() {
     );
     await tester.pump();
     expect(find.byType(VirtualThumbstick), findsNWidgets(2));
-    expect(find.text('A'), findsOneWidget);
+    expect(find.byKey(const ValueKey('joystick_button_A')), findsOneWidget);
     expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
     expect(find.byKey(const ValueKey('right_mode_laser')), findsOneWidget);
     expect(find.text('GATILLO (CLIC)'), findsNothing);
@@ -1732,7 +1740,7 @@ void main() {
       await tester.pump(const Duration(milliseconds: 350));
       await _pumpUntil(tester, () => service.latestState.btnGrip);
       final oldButtonGesture = await tester.startGesture(
-        tester.getCenter(find.text('A')),
+        tester.getCenter(find.byKey(const ValueKey('joystick_button_A'))),
         pointer: 2,
       );
       await tester.pump(const Duration(milliseconds: 110));
@@ -1811,7 +1819,7 @@ void main() {
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       await tester.pump();
       expect(service.latestState.drivingPaused, isTrue);
-      expect(find.text('A'), findsOneWidget);
+      expect(find.byKey(const ValueKey('joystick_button_A')), findsOneWidget);
       await tester.pumpWidget(const SizedBox.shrink());
       await _pumpUntil(tester, () => !service.isConnected);
       expect(tester.takeException(), isNull);
@@ -1865,10 +1873,10 @@ void main() {
       );
       await tester.pump();
 
-      // Verify left column: L, Y, stick, X
+      // Verify 1D-matching left & right decks: top L/R, X/Y above sticks, A/B below sticks
       expect(find.text('L'), findsOneWidget);
-      expect(find.text('Y'), findsOneWidget);
-      expect(find.text('X'), findsOneWidget);
+      expect(find.text('Y'), findsNWidgets(2));
+      expect(find.text('X'), findsNWidgets(2));
       expect(find.byKey(const ValueKey('joystick_move_stick')), findsOneWidget);
 
       // The center stays available for experience information. The right
@@ -1882,10 +1890,10 @@ void main() {
       expect(find.byKey(const ValueKey('right_mode_laser')), findsOneWidget);
       expect(find.byKey(const ValueKey('laser_slide_pad')), findsNothing);
 
-      // Verify right column: R, B, stick, A
+      // Verify right deck: top R, X/Y above, MIRAR stick, A/B below
       expect(find.text('R'), findsOneWidget);
-      expect(find.text('B'), findsOneWidget);
-      expect(find.text('A'), findsOneWidget);
+      expect(find.text('B'), findsNWidgets(2));
+      expect(find.byKey(const ValueKey('joystick_button_A')), findsOneWidget);
       expect(find.byKey(const ValueKey('joystick_look_stick')), findsOneWidget);
 
       // Open settings modal via gear icon
@@ -2060,7 +2068,7 @@ void main() {
     await left.up();
 
     final a = await tester.startGesture(
-      tester.getCenter(find.text('A')),
+      tester.getCenter(find.byKey(const ValueKey('joystick_button_A'))),
       pointer: 3,
     );
     await tester.pump(const Duration(milliseconds: 110));

@@ -655,9 +655,6 @@ class _VrDeckShoulderPillState extends State<VrDeckShoulderPill> {
 
   @override
   Widget build(BuildContext context) {
-    final labelText = widget.subtitle.isEmpty
-        ? widget.title
-        : '${widget.title} · ${widget.subtitle}';
     return Listener(
       key: widget.buttonKey,
       behavior: HitTestBehavior.opaque,
@@ -745,16 +742,30 @@ class _VrDeckShoulderPillState extends State<VrDeckShoulderPill> {
                 const SizedBox(width: 4),
               ],
               Text(
-                labelText,
+                widget.title,
                 maxLines: 1,
                 style: TextStyle(
-                  color: widget.active ? Colors.white : const Color(0xFFE2E8F0),
+                  color: widget.active ? Colors.white : const Color(0xFFF8FAFC),
                   fontSize: 12.5,
-                  fontWeight: FontWeight.w800,
+                  fontWeight: FontWeight.w900,
                   letterSpacing: 0.2,
                   decoration: TextDecoration.none,
                 ),
               ),
+              if (widget.subtitle.isNotEmpty)
+                Text(
+                  ' · ${widget.subtitle}',
+                  maxLines: 1,
+                  style: TextStyle(
+                    color: widget.active
+                        ? Colors.white.withValues(alpha: 0.92)
+                        : const Color(0xFFCBD5E1),
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.15,
+                    decoration: TextDecoration.none,
+                  ),
+                ),
             ],
           ),
         ),
@@ -763,15 +774,16 @@ class _VrDeckShoulderPillState extends State<VrDeckShoulderPill> {
   }
 }
 
-/// Deterministic responsive layout for VRlizate's **1D-Inspired Symmetrical
+/// Deterministic responsive layout for VRlizate's **1D-Matching Symmetrical
 /// Yin-Yang 2D Gamepad** (`PhoneControllerPage`).
 ///
-/// Gives both wings the exact iconic 1D sculptural Yin-Yang deck design,
-/// upscaled for dedicated 2D smartphone controllers:
-/// - **Left Deck:** Top Yin-Yang (`L` / `ZL`) → Large `MOVER` Stick → Bottom
-///   Yin-Yang (`X` / `Y`).
-/// - **Right Deck:** Top Yin-Yang (`ZR` / `R`) → Large Equal-Size `MIRAR` Stick
-///   → Bottom Yin-Yang (`A` / `B`).
+/// Gives both wings the exact 1D deck layout upscaled for dedicated 2D
+/// smartphone controllers:
+/// - **Left Deck:** Top `L` Shoulder Pill → Upper Yin-Yang (`X` / `Y`) →
+///   Center `MOVER` Stick (Double-Tap = Turbo) → Lower Yin-Yang (`A` / `B`).
+/// - **Right Deck:** Top `R` Shoulder Pill → Upper Yin-Yang (`X` / `Y`) →
+///   Center Equal-Size `MIRAR` Stick (Double-Tap = Láser) → Lower Yin-Yang
+///   (`A` / `B`).
 /// - **Center Column:** Chrome bar, `Recenter`, `Vista / Láser` + Preview, and
 ///   status footer.
 class Vr2dYinYangDeckLayout {
@@ -784,8 +796,11 @@ class Vr2dYinYangDeckLayout {
     required this.footerHeight,
     required this.deckPadding,
     required this.gap,
+    required this.shoulderHeight,
     required this.yinYangHeight,
     required this.stickSize,
+    required this.leftShoulderRect,
+    required this.rightShoulderRect,
     required this.leftStickRect,
     required this.rightStickRect,
     required this.leftTopPairRect,
@@ -802,8 +817,11 @@ class Vr2dYinYangDeckLayout {
   final double footerHeight;
   final double deckPadding;
   final double gap;
+  final double shoulderHeight;
   final double yinYangHeight;
   final double stickSize;
+  final Rect leftShoulderRect;
+  final Rect rightShoulderRect;
   final Rect leftStickRect;
   final Rect rightStickRect;
   final Rect leftTopPairRect;
@@ -829,7 +847,7 @@ class Vr2dYinYangDeckLayout {
 
     final spacious = safeW >= 740 && safeH >= 360;
     final deckPad = spacious ? 8.0 : 5.0;
-    final gap = spacious ? 8.0 : 5.0;
+    final gap = spacious ? 7.0 : 4.5;
     final deckGap = spacious ? 10.0 : 6.0;
 
     // Reserve clean center column (~29–34% width) and give BOTH Left & Right
@@ -847,27 +865,32 @@ class Vr2dYinYangDeckLayout {
     final centerWidth = math.max(60.0, rightDeck.left - deckGap - centerLeft);
     final centerPanel = Rect.fromLTWH(centerLeft, 0, centerWidth, h);
 
-    // 3-row symmetrical stack inside each deck:
-    // Top Yin-Yang (~23%) + HUGE Long-Throw Equal Stick (~54%) + Bottom Yin-Yang (~23%)
-    final innerH = math.max(60.0, safeH - deckPad * 2 - gap * 2);
+    // 4-row symmetrical 1D stack inside each deck:
+    // Top L/R Shoulder Pill + Upper X/Y Yin-Yang + Large Equal Center Stick + Lower A/B Yin-Yang
+    final availH = math.max(84.0, safeH - deckPad * 2 - gap * 3);
+    final shoulderH = (safeH * 0.105).clamp(24.0, spacious ? 36.0 : 30.0);
+    final bodyH = math.max(60.0, availH - shoulderH);
     final stickSize = math.min(
       innerW,
-      (innerH * 0.54).clamp(52.0, spacious ? 216.0 : 178.0),
+      (bodyH * 0.49).clamp(48.0, spacious ? 196.0 : 154.0),
     );
     final yinYangH = math
-        .max(28.0, (innerH - stickSize) / 2.0)
-        .clamp(28.0, spacious ? 108.0 : 86.0);
+        .max(26.0, (bodyH - stickSize) / 2.0)
+        .clamp(26.0, spacious ? 96.0 : 76.0);
 
-    final stackH = yinYangH * 2 + stickSize + gap * 2;
+    final stackH = shoulderH + yinYangH * 2 + stickSize + gap * 3;
     final yStart = padT + math.max(deckPad, (safeH - stackH) / 2.0);
 
     Rect makeDeckRow(Rect deck, double y, double rowH) =>
         Rect.fromLTWH(deck.left + deckPad, y, innerW, rowH);
 
-    final topPairY = yStart;
+    final shoulderY = yStart;
+    final topPairY = shoulderY + shoulderH + gap;
     final stickY = topPairY + yinYangH + gap;
     final bottomPairY = stickY + stickSize + gap;
 
+    final leftShoulder = makeDeckRow(leftDeck, shoulderY, shoulderH);
+    final rightShoulder = makeDeckRow(rightDeck, shoulderY, shoulderH);
     final leftTopPair = makeDeckRow(leftDeck, topPairY, yinYangH);
     final rightTopPair = makeDeckRow(rightDeck, topPairY, yinYangH);
     final leftBottomPair = makeDeckRow(leftDeck, bottomPairY, yinYangH);
@@ -912,8 +935,11 @@ class Vr2dYinYangDeckLayout {
       footerHeight: footerH,
       deckPadding: deckPad,
       gap: gap,
+      shoulderHeight: shoulderH,
       yinYangHeight: yinYangH,
       stickSize: stickSize,
+      leftShoulderRect: leftShoulder,
+      rightShoulderRect: rightShoulder,
       leftStickRect: leftStick,
       rightStickRect: rightStick,
       leftTopPairRect: leftTopPair,

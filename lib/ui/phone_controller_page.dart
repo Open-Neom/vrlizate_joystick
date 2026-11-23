@@ -234,12 +234,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   bool _reconnectEnabled = false;
   int _reconnectAttempt = 0;
   static const _reconnectDelays = [
-    Duration(milliseconds: 500),
-    Duration(seconds: 1),
-    Duration(seconds: 2),
-    Duration(seconds: 4),
-    Duration(seconds: 8),
-    Duration(seconds: 10),
+    Duration(milliseconds: 350),
+    Duration(milliseconds: 900),
+    Duration(milliseconds: 1800),
+    Duration(seconds: 3),
+    Duration(seconds: 5),
   ];
   int _socketGeneration = 0;
   int _effectivePassthroughRevision = -1;
@@ -435,6 +434,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   bool _btnLActive = false;
   bool _btnRActive = false;
   bool _btnZLActive = false;
+  bool _turboLocked = false;
   bool _btnZRActive = false;
   bool _btnGripActive = false;
   bool _stickClickActive = false;
@@ -579,6 +579,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
       _btnLActive ||
       _btnRActive ||
       _btnZLActive ||
+      _turboLocked ||
       _btnZRActive ||
       _btnGripActive;
 
@@ -833,9 +834,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               datagram != null &&
               datagram.data.length <= 2048 &&
               !_isConnected &&
-              !_isConnecting &&
-              !_targetEdited &&
-              _discoveredHost == null) {
+              !_isConnecting) {
             try {
               final msg = utf8.decode(datagram.data);
               final json = jsonDecode(msg);
@@ -847,13 +846,24 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 // Discovery is an unauthenticated hint. Trust the datagram's
                 // actual source for display, never its advertised IP/token.
                 final hostIp = datagram.address.address;
-                setState(() {
-                  _discoveredHost = hostIp;
-                  _targetPort = port;
-                  _ipController.text = hostIp;
-                  _status =
-                      '${VrJoystickTranslationConstants.statusVisorDetectedPrefix}$hostIp${VrJoystickConstants.colonSeparator}$port${VrJoystickTranslationConstants.statusVisorDetectedSuffix}';
-                });
+                if (_reconnectEnabled &&
+                    _lastTarget != null &&
+                    hostIp == _lastTarget!.host) {
+                  // The paired visor just announced itself back on LAN —
+                  // cancel any backoff delay and reconnect immediately!
+                  _reconnectTimer?.cancel();
+                  _reconnectTimer = null;
+                  _reconnectAttempt = 0;
+                  _scheduleReconnect(immediately: true);
+                } else if (!_targetEdited && _discoveredHost == null) {
+                  setState(() {
+                    _discoveredHost = hostIp;
+                    _targetPort = port;
+                    _ipController.text = hostIp;
+                    _status =
+                        '${VrJoystickTranslationConstants.statusVisorDetectedPrefix}$hostIp${VrJoystickConstants.colonSeparator}$port${VrJoystickTranslationConstants.statusVisorDetectedSuffix}';
+                  });
+                }
               }
             } catch (_) {}
           }
@@ -1083,6 +1093,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _streamTimer?.cancel();
     _streamTimer = Timer.periodic(Duration(milliseconds: clamped), (_) {
       if (!mounted || !_isForeground) return;
+      final activeSocket = _socket;
+      if (_isConnected && activeSocket != null && !activeSocket.isOpen) {
+        _onDisconnected(activeSocket);
+        return;
+      }
       final now = _nowUs;
       final dtSeconds = (now - _lastDrivingTickUs) / 1e6;
       final pointerReady = _laserInteractionReady;
@@ -1570,7 +1585,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
   static bool _canRetryConnection(Object error) {
     if (_isSessionExpired(error)) return false;
     if (error is VrControllerConnectionException) return error.canRetry;
-    if (error is TimeoutException || error is SocketException) return true;
+    if (error is TimeoutException ||
+        error is SocketException ||
+        error is HttpException ||
+        error is HandshakeException) {
+      return true;
+    }
     if (error is WebSocketException) {
       final status = error.httpStatusCode;
       return status == null ||
@@ -2317,6 +2337,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
     _btnLActive = false;
     _btnRActive = false;
     _btnZLActive = false;
+    _turboLocked = false;
     _btnZRActive = false;
     _btnGripActive = false;
     _stickClickActive = false;
@@ -2566,7 +2587,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           btnY: _btnYActive,
           btnL: _btnLActive,
           btnR: _btnRActive,
-          btnZL: _btnZLActive,
+          btnZL: _btnZLActive || _turboLocked,
           btnZR: _btnZRActive,
           btnGrip: _btnGripActive,
           stickClick: _stickClickActive,
@@ -2646,7 +2667,7 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
         VrJoystickConstants.fieldBtnY: _btnYActive,
         VrJoystickConstants.fieldBtnL: _btnLActive,
         VrJoystickConstants.fieldBtnR: _btnRActive,
-        VrJoystickConstants.fieldBtnZL: _btnZLActive,
+        VrJoystickConstants.fieldBtnZL: _btnZLActive || _turboLocked,
         VrJoystickConstants.fieldBtnZR: _btnZRActive,
         VrJoystickConstants.fieldBtnGrip: _btnGripActive,
         VrJoystickConstants.fieldStickClick: _stickClickActive,
@@ -4906,12 +4927,14 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
           required Rect rect,
           required bool isLeftWing,
           required bool emphasized,
+          Key? firstKey,
           required String firstTitle,
           required String firstSubtitle,
           required bool firstActive,
           required Color firstColor,
           required VoidCallback onFirstDown,
           required VoidCallback onFirstUp,
+          Key? secondKey,
           required String secondTitle,
           required String secondSubtitle,
           required bool secondActive,
@@ -4952,9 +4975,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 width: rect.width,
                 height: rect.height,
                 emphasized: emphasized,
-                firstKey: ValueKey(
-                  '${VrJoystickConstants.keyJoystickButtonPrefix}$firstTitle',
-                ),
+                firstKey:
+                    firstKey ??
+                    ValueKey(
+                      '${VrJoystickConstants.keyJoystickButtonPrefix}$firstTitle',
+                    ),
                 firstPrimary: firstTitle,
                 firstCaption: firstSubtitle,
                 firstActive: firstActive,
@@ -4970,9 +4995,11 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                   }
                   _sendState();
                 },
-                secondKey: ValueKey(
-                  '${VrJoystickConstants.keyJoystickButtonPrefix}$secondTitle',
-                ),
+                secondKey:
+                    secondKey ??
+                    ValueKey(
+                      '${VrJoystickConstants.keyJoystickButtonPrefix}$secondTitle',
+                    ),
                 secondPrimary: secondTitle,
                 secondCaption: secondSubtitle,
                 secondActive: secondActive,
@@ -5204,12 +5231,16 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                     : _lookStickController,
                 size: rect.width,
                 knobRadius: rect.width * .195,
-                centerLabel: movement ? 'MOVER' : 'MIRAR',
+                centerLabel: movement
+                    ? (_turboLocked ? 'TURBO ⚡' : 'MOVER')
+                    : 'MIRAR',
                 // The radial response applies one continuous deadzone.
                 deadzone: 0,
                 horizontalEnabled: movement || _horizontalLookEnabled,
                 accentColor: movement
-                    ? const Color(0xFF00E5FF)
+                    ? (_turboLocked
+                          ? const Color(0xFFF59E0B)
+                          : const Color(0xFF00E5FF))
                     : const Color(0xFF818CF8),
                 hapticsEnabled: _hapticsEnabled,
                 dynamicTouchOrigin: _dynamicTouchOriginEnabled,
@@ -5233,6 +5264,10 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       final doubleTapped = _leftAutoWalkController
                           .onPointerDown(nowUs);
                       if (doubleTapped) {
+                        // Double-tap on MOVER toggles Turbo (ZL) ON/OFF so
+                        // shoulder/face buttons stay free for richer actions.
+                        setState(() => _turboLocked = !_turboLocked);
+                        _hapticDoublePulse();
                         _pulseStickClick();
                       }
                       if (!_leftAutoWalkController.isAutoWalkLocked) {
@@ -5249,6 +5284,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                       final doubleTapped = _rightStickClickDetector
                           .onPointerDown(nowUs);
                       if (doubleTapped) {
+                        if (!driving) {
+                          // Double-tap on MIRAR toggles straight into Laser mode.
+                          _hapticDoublePulse();
+                          _selectRightControl(true);
+                          return;
+                        }
                         _pulseStickClick();
                       }
                     }
@@ -5492,28 +5533,66 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               if (!driving) stickCaptureHalo(deck.leftStickRect, true),
               if (!driving && !_rightLaser)
                 stickCaptureHalo(deck.rightStickRect, false),
-              // LEFT DECK: Top Yin-Yang (L / ZL) -> HUGE MOVER Stick -> Bottom Yin-Yang (X / Y)
+              // TOP SHOULDERS (1D symmetry): L on Left Deck, R on Right Deck
+              Positioned.fromRect(
+                rect: deck.leftShoulderRect,
+                child: _exclusivePassthroughControl(
+                  VrDeckShoulderPill(
+                    buttonKey: const ValueKey(
+                      '${VrJoystickConstants.keyJoystickButtonPrefix}${VrJoystickConstants.actionKeyL}',
+                    ),
+                    title: VrJoystickConstants.actionKeyL,
+                    subtitle: _actionLabel(VrJoystickConstants.actionKeyL),
+                    leadingIcon: Icons.keyboard_alt_outlined,
+                    active: _btnLActive,
+                    accent: const Color(0xFF38BDF8),
+                    onChanged: (down) {
+                      if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                      setState(
+                        () => _btnLActive =
+                            down && (!driving || !_steering.state.paused),
+                      );
+                      if (down) {
+                        _hapticMedium();
+                      } else {
+                        _hapticLight();
+                      }
+                      _sendState();
+                    },
+                  ),
+                ),
+              ),
+              Positioned.fromRect(
+                rect: deck.rightShoulderRect,
+                child: _exclusivePassthroughControl(
+                  VrDeckShoulderPill(
+                    buttonKey: const ValueKey(
+                      '${VrJoystickConstants.keyJoystickButtonPrefix}${VrJoystickConstants.actionKeyR}',
+                    ),
+                    title: VrJoystickConstants.actionKeyR,
+                    subtitle: _actionLabel(VrJoystickConstants.actionKeyR),
+                    leadingIcon: Icons.menu_rounded,
+                    active: _btnRActive,
+                    accent: const Color(0xFF818CF8),
+                    onChanged: (down) {
+                      if (!_acceptsSurfaceInput(surfaceEpoch)) return;
+                      setState(
+                        () => _btnRActive =
+                            down && (!driving || !_steering.state.paused),
+                      );
+                      if (down) {
+                        _hapticMedium();
+                      } else {
+                        _hapticLight();
+                      }
+                      _sendState();
+                    },
+                  ),
+                ),
+              ),
+              // LEFT DECK (1D layout): Top L -> X/Y above -> MOVER Stick -> A/B below
               yinYangPair(
                 rect: deck.leftTopPairRect,
-                isLeftWing: true,
-                emphasized: lookActive && !moveActive,
-                firstTitle: VrJoystickConstants.actionKeyL,
-                firstSubtitle: _actionLabel(VrJoystickConstants.actionKeyL),
-                firstActive: _btnLActive,
-                firstColor: const Color(0xFF38BDF8),
-                onFirstDown: () => setState(
-                  () => _btnLActive = !driving || !_steering.state.paused,
-                ),
-                onFirstUp: () => setState(() => _btnLActive = false),
-                secondTitle: VrJoystickConstants.actionKeyZL,
-                secondSubtitle: _actionLabel(VrJoystickConstants.actionKeyZL),
-                secondActive: _btnZLActive,
-                secondColor: const Color(0xFF00E5FF),
-                onSecondDown: () => setState(() => _btnZLActive = true),
-                onSecondUp: () => setState(() => _btnZLActive = false),
-              ),
-              yinYangPair(
-                rect: deck.leftBottomPairRect,
                 isLeftWing: true,
                 emphasized: lookActive && !moveActive,
                 firstTitle: VrJoystickConstants.actionKeyX,
@@ -5540,25 +5619,71 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
                 onSecondDown: () => setState(() => _btnYActive = true),
                 onSecondUp: () => setState(() => _btnYActive = false),
               ),
-              // RIGHT DECK: Top Yin-Yang (ZR / R) -> HUGE Equal MIRAR Stick -> Bottom Yin-Yang (A / B)
+              yinYangPair(
+                rect: deck.leftBottomPairRect,
+                isLeftWing: true,
+                emphasized: lookActive && !moveActive,
+                firstKey: const ValueKey(
+                  '${VrJoystickConstants.keyJoystickButtonPrefix}left_${VrJoystickConstants.actionKeyA}',
+                ),
+                firstTitle: VrJoystickConstants.actionKeyA,
+                firstSubtitle: _actionLabel(VrJoystickConstants.actionKeyA),
+                firstActive: _btnAActive,
+                firstColor: const Color(0xFF34D399),
+                onFirstDown: driving
+                    ? _selectDrivingMenu
+                    : () => setState(() => _btnAActive = true),
+                onFirstUp: () => setState(() => _btnAActive = false),
+                secondKey: const ValueKey(
+                  '${VrJoystickConstants.keyJoystickButtonPrefix}left_${VrJoystickConstants.actionKeyB}',
+                ),
+                secondTitle: VrJoystickConstants.actionKeyB,
+                secondSubtitle: _actionLabel(VrJoystickConstants.actionKeyB),
+                secondActive: _btnBActive,
+                secondColor: const Color(0xFFF87171),
+                onSecondDown: () => setState(() {
+                  if (driving) {
+                    _steering.setPaused(true);
+                    _releaseInputs();
+                  }
+                  _btnBActive = true;
+                }),
+                onSecondUp: () => setState(() => _btnBActive = false),
+              ),
+              // RIGHT DECK (1D layout): Top R -> X/Y above -> MIRAR/Láser Stick -> A/B below
               yinYangPair(
                 rect: deck.rightTopPairRect,
                 isLeftWing: false,
                 emphasized: moveActive && !lookActive,
-                firstTitle: VrJoystickConstants.actionKeyZR,
-                firstSubtitle: _actionLabel(VrJoystickConstants.actionKeyZR),
-                firstActive: _btnZRActive,
-                firstColor: const Color(0xFFA78BFA),
-                onFirstDown: () => setState(() => _btnZRActive = true),
-                onFirstUp: () => setState(() => _btnZRActive = false),
-                secondTitle: VrJoystickConstants.actionKeyR,
-                secondSubtitle: _actionLabel(VrJoystickConstants.actionKeyR),
-                secondActive: _btnRActive,
-                secondColor: const Color(0xFF818CF8),
-                onSecondDown: () => setState(
-                  () => _btnRActive = !driving || !_steering.state.paused,
+                firstKey: const ValueKey(
+                  '${VrJoystickConstants.keyJoystickButtonPrefix}right_${VrJoystickConstants.actionKeyX}',
                 ),
-                onSecondUp: () => setState(() => _btnRActive = false),
+                firstTitle: VrJoystickConstants.actionKeyX,
+                firstSubtitle: _actionLabel(VrJoystickConstants.actionKeyX),
+                firstActive: _btnXActive,
+                firstColor: const Color(0xFF60A5FA),
+                onFirstDown: () {
+                  if (driving) {
+                    setState(() {
+                      _steering.setPaused(true);
+                      _releaseInputs();
+                      _surfaceEpoch++;
+                    });
+                    _pulseDrivingAction(reset: true);
+                  } else {
+                    setState(() => _btnXActive = true);
+                  }
+                },
+                onFirstUp: () => setState(() => _btnXActive = false),
+                secondKey: const ValueKey(
+                  '${VrJoystickConstants.keyJoystickButtonPrefix}right_${VrJoystickConstants.actionKeyY}',
+                ),
+                secondTitle: VrJoystickConstants.actionKeyY,
+                secondSubtitle: _actionLabel(VrJoystickConstants.actionKeyY),
+                secondActive: _btnYActive,
+                secondColor: const Color(0xFFFBBF24),
+                onSecondDown: () => setState(() => _btnYActive = true),
+                onSecondUp: () => setState(() => _btnYActive = false),
               ),
               yinYangPair(
                 rect: deck.rightBottomPairRect,
@@ -6256,6 +6381,12 @@ class _PhoneControllerPageState extends State<PhoneControllerPage>
               _gripHoldTimer?.cancel();
               _gripHoldTimer = null;
               _btnGripActive = false;
+              if (_activeMode == RemoteControllerMode.joystick && _rightLaser) {
+                // Double-tap on the embedded Laser pad toggles cleanly back to MIRAR.
+                _hapticDoublePulse();
+                _selectRightControl(false);
+                return;
+              }
               _updateLaserSlide(0.0, 0.0);
               if (_hapticsEnabled) HapticFeedback.mediumImpact();
             },
