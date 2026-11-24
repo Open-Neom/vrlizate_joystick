@@ -1042,6 +1042,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
         hand: ControllerHand.left,
         cameraRole: VrEMudraCameraRole.joystickUpward,
         landmarks21Normalized: left.landmarks,
+        worldLandmarks21: left.worldLandmarks,
         confidence: _mlLeftHandConfidence,
         palmDepthMeters: depth,
       ).toWireString();
@@ -1073,6 +1074,7 @@ class VrJoystickCameraVisionService extends ChangeNotifier
         hand: ControllerHand.right,
         cameraRole: VrEMudraCameraRole.joystickUpward,
         landmarks21Normalized: right.landmarks,
+        worldLandmarks21: right.worldLandmarks,
         confidence: _mlRightHandConfidence,
         palmDepthMeters: depth,
       ).toWireString();
