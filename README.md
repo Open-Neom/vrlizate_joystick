@@ -6,7 +6,8 @@ Mando dual-analógico en segundo smartphone, perfiles de control especializados 
 
 ## Características principales
 
-- **Controles ergonómicos en bordes (horizontal):** franjas laterales/superiores para `L/R`, `Y/B` y `X/A` alrededor de los sticks circulares, dejando el panel central para acciones contextuales, selector `Vista`/`Láser` y vista previa del visor.
+- **Controles ergonómicos Yin-Yang OLED (horizontal):** decks simétricos izquierdo y derecho con sticks sobredimensionados, pares cóncavos `X/Y` y `A/B` en ambas alas, gatillos `L/R`, doble toque Turbo/Láser y panel central con acciones contextuales, selector `Vista`/`Láser` y vista previa del visor.
+- **Visión de manos y eMudras en segundo smartphone (`15–30 Hz`):** telemetría nativa MediaPipe de 21 puntos, pinches de 4 dedos, ademanes y streaming compacto de eMudras (`lM`/`rM` con `worldLandmarks21`) para fusión bimanual 2D/3D con el visor.
 - **Doble stick virtual progresivo (`VirtualThumbstick`):**
   - **Stick izquierdo:** locomoción 3D con zona muerta radial (10%), rampa progresiva de velocidad (1.8 s) y detección de intención de giro en el borde (`moveAtEdge` al 92%, liberación al 84%).
   - **Control derecho (`Vista` / `Láser`):** inclinación vertical (o dos ejes si la experiencia solicita `horizontalLook: true`), giro de vista por inclinación del teléfono (`VrMotionLookController`) al mantener presionado el stick, o pad táctil de puntero láser con agarre por pulsación sostenida (`Láser`).

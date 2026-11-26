@@ -1,7 +1,10 @@
 # Changelog
 
-## 1.0.0 - 2026-11-06
+## 1.0.0 - 2026-11-25
 
+- Redesign the 2D controller into full-screen symmetrical Yin-Yang OLED dual decks aligned to the 1D layout with oversized sticks, concave Yin-Yang button clusters, halo capture, touch-intent arbiter, double-tap Turbo/Laser, and hardened auto-reconnect.
+- Add native 21-point MediaPipe hand & 4-finger pinch telemetry (30 Hz `handTracking` budget preset), 15 Hz 2nd-phone hand/ademán analysis, and compact edge-computed eMudra wire streaming (`lM`/`rM`) carrying isotropic 3D `worldLandmarks21`.
+- Add embedded responsive mode to `VrControllerPairingPage` for tabbed QR camera scanning, sync dynamic contextual `A/B/X/Y` captions for host controller mode, and disable unsupported `reusePort` on Android UDP auto-discovery with safe fallback.
 - Require `vrlizate ^1.13.0` for the `edgeTurnEnabled` gamepad input API used by
   digital controller adapters, and isolate optional radial gesture keyboard adapters so `vrlizate_joystick` builds standalone without private packages.
 
